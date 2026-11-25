@@ -4,8 +4,8 @@
 |---|---|
 | 交接日期 | 2026-11-25 |
 | 交接对象 | 任意接手实际开发的 agent 会话（MiniMax Code / 其他） |
-| 项目阶段 | **纯规划完成，代码 0 行**，等待按任务卡开工 |
-| 本文件改动范围 | 仅新建文档，未改动任何代码或配置 |
+| 项目阶段 | **T0 已完成（工程骨架可跑），进入 M1 开发**；进度账本见 §8 |
+| 本文件改动范围 | 本次仅更新阶段与账本；T0 代码在提交 `c98bd69` |
 
 ---
 
@@ -33,6 +33,7 @@
 | 2026-11-24 | 技术栈 = Tauri 2 + Rust + React；v1 含全部 5 模块（网关/保险库/签到/反代/用量）；密钥加密 = OS 原生 + 可选主密码；模型命名 = 别名制（用户自定义，支持 route_group 编排） |
 | 2026-11-24 | 与开源竞品关系 = 自研替代（非编排层）；不做配置文件注入 |
 | 2026-11-25 | Harness 反代 v1 仅 **GitHub Copilot + WorkBuddy**；**Anthropic 入站不进 v1**（pi 已验证支持 OpenAI 兼容，前提成立）；MiniMax 需处理 group_id（见 02 §4.2 口径） |
+| 2026-11-25 | FreeLLMAPI（58k★，MIT）调研：路线定为 **B 保持 Tauri 自研**，将其列为头号参考实现（`docs/reviews/freellmapi-analysis.md`）；X-Routed-Via / 限额自学习 / sticky_session 三处设计已回填 02（v0.2）；**维持"永不修改 harness 配置文件"红线**，不做一键配置向导 |
 
 ## 3. 文档索引
 
@@ -47,8 +48,8 @@
 ## 4. 执行入口
 
 ```
-第 1 步：T0 仓库初始化（03 §2，含 .gitignore：vault.bin / *.db / .env）
-第 2 步：按 03 §3 依赖图推进，关键路径 T0→T1→T2→T4→T6→T7→T10
+第 1 步：~~T0 仓库初始化~~ ✅（提交 `c98bd69`，验收留档 `docs/reviews/T0-scaffold-verification.md`）
+第 2 步：从 T1 数据层开工，按 03 §3 依赖图推进，关键路径 T1→T2→T4→T6→T7→T10
 第 3 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
 第 4 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
 ```
@@ -73,6 +74,7 @@
 4. **流式 usage**：不注入 `stream_options.include_usage` 就拿不到 usage，统计模块会瞎（MiniMax 例外，其流式自带，注入多余字段有 400 风险——P-4 学习式兼容）。
 5. **重试边界**：已向客户端写出首字节后严禁重试（会产生重复内容），只在首字节前重试（02 §2.1 ⑧）。
 6. **竞品迭代快**：CCR/OmniRoute 日更。不要回头去"参考它们的最新功能"扩 v1 范围——范围变更必须走提案流程（AGENT.md §6-3）。
+7. **参考实现纪律**：实现路由（T5/T6）与用量（T7/T13）前，先读 FreeLLMAPI 对应源码（`server/src/providers/openai-compat.ts`、路由与 analytics 文档见其 `docs/en/architecture/`）。**抄设计不抄代码**（它是 Node，我们是 Rust）。02 v0.2 的 P-7 / 限额自学习 / sticky_session 三处即为已验证收益。
 
 ## 7. 上报规则（何时必须停下问头头）
 
@@ -85,11 +87,24 @@
 
 ---
 
-## 8. 交接清单（本轮已交付）
+## 8. 交接清单与待办账本
+
+**规划阶段已交付**
 
 - [x] `AGENT.md` — agent 规范（角色/红线/流程/文档/Git/安全验收）
 - [x] `HANDOFF.md` — 本文件
-- [x] `docs/planning/01-architecture-and-feasibility.md` — 可行性与竞品（v0.1）
-- [x] `docs/planning/02-technical-design.md` — 技术设计（v0.1）
-- [x] `docs/planning/03-delivery-plan.md` — 开发计划 T0–T24（v0.1）
-- [ ] T0 仓库初始化 — **待接手 agent 执行（起点）**
+- [x] `docs/planning/01-architecture-and-feasibility.md` — 可行性与竞品
+- [x] `docs/planning/02-technical-design.md` — 技术设计（版本与变更记录见其 §13）
+- [x] `docs/planning/03-delivery-plan.md` — 开发计划 T0–T24
+
+**开发账本（唯一；状态词：✅完成 / 🔴待办 / 🟡挂起 / ⏳验证点）**
+
+| 状态 | 事项 | 依据 / 指针 |
+|---|---|---|
+| ✅ | T0 仓库初始化 | 提交 `c98bd69`（分支 `dev`）；留档 `docs/reviews/T0-scaffold-verification.md` |
+| 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
+| 🔴 | 分支命名：仓库实为 `master` + `origin/master`，AGENT.md §8 要求 `main` + `dev`（已建 `dev`） | 待头头裁决是否重命名 `master` → `main` |
+| 🔴 | T18 签到站点清单待指定 | `docs/planning/03-delivery-plan.md` §2 T18 |
+| ⏳ | HANDOFF §5 五项未验证项 | 验证方法见 §5；命中对应任务前必须先实测再实现 |
+
+> 未列入本表的待办视为丢失：任何新待办必须入表。
