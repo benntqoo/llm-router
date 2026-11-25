@@ -15,6 +15,7 @@ type CircuitStatusRow = {
 
 type CircuitSettings = {
   open_duration_secs: number;
+  rate_limit_cooldown_cap_secs: number;
 };
 
 /** 刷新间隔（毫秒）。熔断冷却最长 60s，5s 一次足够看清变化。 */
@@ -34,13 +35,14 @@ function reasonLabel(reason: string | null): string {
  * 熔断状态面板（02 §2.3）。
  *
  * 展示当前正在冷却的 `(渠道, 上游模型)`：状态、原因、剩余秒数；
- * 可手动解除熔断，也可调整熔断时长（默认 60s，最小 1 秒）。
+ * 可手动解除熔断，也可调整熔断时长与 429 冷却上限（默认 60s，最小 1 秒）。
  * 熔断状态落库（`circuit_state` 表），重启后恢复，这里读的是运行中的熔断器。
  */
 export default function CircuitPanel() {
   const [rows, setRows] = useState<CircuitStatusRow[]>([]);
   const [settings, setSettings] = useState<CircuitSettings | null>(null);
   const [durationInput, setDurationInput] = useState("60");
+  const [capInput, setCapInput] = useState("60");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -54,6 +56,7 @@ export default function CircuitPanel() {
       setRows(status);
       setSettings(current);
       setDurationInput(String(current.open_duration_secs));
+      setCapInput(String(current.rate_limit_cooldown_cap_secs));
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -70,20 +73,29 @@ export default function CircuitPanel() {
     return () => clearInterval(timer);
   }, [refresh]);
 
-  const handleSaveDuration = async () => {
-    const seconds = Number.parseInt(durationInput.trim(), 10);
-    if (!Number.isFinite(seconds) || seconds < 1) {
+  const handleSaveSettings = async () => {
+    const openSeconds = Number.parseInt(durationInput.trim(), 10);
+    const capSeconds = Number.parseInt(capInput.trim(), 10);
+    if (!Number.isFinite(openSeconds) || openSeconds < 1) {
       setError("熔断时长必须是大于等于 1 的整数秒");
+      return;
+    }
+    if (!Number.isFinite(capSeconds) || capSeconds < 1) {
+      setError("429 冷却上限必须是大于等于 1 的整数秒");
       return;
     }
     try {
       const saved = await invoke<CircuitSettings>("circuit_settings_set", {
-        openDurationSecs: seconds,
+        openDurationSecs: openSeconds,
+        rateLimitCooldownCapSecs: capSeconds,
       });
       setSettings(saved);
       setDurationInput(String(saved.open_duration_secs));
+      setCapInput(String(saved.rate_limit_cooldown_cap_secs));
       setError(null);
-      setMessage(`熔断时长已设为 ${saved.open_duration_secs} 秒（对之后新打开的熔断生效）`);
+      setMessage(
+        `已保存：熔断时长 ${saved.open_duration_secs} 秒，429 冷却上限 ${saved.rate_limit_cooldown_cap_secs} 秒（对之后新打开的熔断/冷却生效）`,
+      );
     } catch (e) {
       setError(String(e));
     }
@@ -111,7 +123,8 @@ export default function CircuitPanel() {
     <section className="card">
       <h2>熔断状态</h2>
       <p className="muted">
-        连续 3 次失败 → 熔断；上游 429 → 按 Retry-After 冷却。冷却期间该渠道会被跳过。
+        连续 3 次失败 → 熔断；上游 429 → 按 Retry-After 冷却（不超过冷却上限）。
+        冷却期间该渠道会被跳过。
       </p>
 
       {error && <p className="error">读取熔断状态失败：{error}</p>}
@@ -146,9 +159,9 @@ export default function CircuitPanel() {
 
       <h3>熔断设置</h3>
       <p className="muted">
-        连续失败触发的熔断时长（秒），最小 1 秒，默认 60 秒。保存后立即生效，
-        但只作用于之后新打开的熔断；已在冷却中的不受影响。429 冷却仍以上游的
-        Retry-After 为准。
+        连续失败触发的熔断时长（秒），最小 1 秒，默认 60 秒。上游 429 触发的冷却上限
+        （秒），同样最小 1 秒、默认 60 秒。保存后立即生效，但只作用于之后新打开的
+        熔断/冷却；已在冷却中的不受影响。
       </p>
       <div className="row-inline">
         <input
@@ -159,13 +172,27 @@ export default function CircuitPanel() {
           onChange={(e) => setDurationInput(e.target.value)}
           placeholder="熔断时长（秒）"
         />
-        <button type="button" onClick={() => void handleSaveDuration()}>
-          保存时长
+        <input
+          type="number"
+          min={1}
+          step={1}
+          value={capInput}
+          onChange={(e) => setCapInput(e.target.value)}
+          placeholder="429 冷却上限（秒）"
+        />
+        <button type="button" onClick={() => void handleSaveSettings()}>
+          保存设置
         </button>
         <span className="muted">
-          {settings ? `当前生效：${settings.open_duration_secs} 秒` : ""}
+          {settings
+            ? `当前生效：熔断 ${settings.open_duration_secs} 秒 / 429 冷却上限 ${settings.rate_limit_cooldown_cap_secs} 秒`
+            : ""}
         </span>
       </div>
+      <p className="muted">
+        429 冷却时长 = min(max(指数退避, 上游 Retry-After), 上限)；
+        上限小于上游要求的等待时间时，会提前重试上游。
+      </p>
 
       <div className="row-inline">
         <button type="button" onClick={() => void refresh()}>

@@ -165,21 +165,16 @@ impl Forwarder {
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     // 429：冷却参数进熔断器（Retry-After / x-ratelimit-*）
                     let info = RateLimitInfo::parse(&response.headers);
-                    let hint = info.cooldown_hint();
-                    self.circuit.on_rate_limited(&key, hint);
+                    // 实际生效的冷却秒数（受用户设置的上限约束）
+                    let cooldown = self.circuit.on_rate_limited(&key, info.cooldown_hint());
                     retried.push(candidate.channel_name.clone());
-                    let mut err = match hint {
-                        Some(hint) => GatewayError::rate_limited(format!(
-                            "上游 {} 限流（429），冷却 {}s",
-                            candidate.channel_name,
-                            hint.as_secs()
-                        )),
-                        None => GatewayError::rate_limited(format!("上游 {} 限流（429）", candidate.channel_name)),
-                    };
-                    if let Some(hint) = hint {
-                        err = err.with_retry_after(hint.as_secs().max(1));
-                    }
-                    last_error = Some(err.with_channel(candidate.channel_name.clone()));
+                    let err = GatewayError::rate_limited(format!(
+                        "上游 {} 限流（429），冷却 {}s",
+                        candidate.channel_name, cooldown
+                    ))
+                    .with_channel(candidate.channel_name.clone())
+                    .with_retry_after(cooldown.max(1) as u64);
+                    last_error = Some(err);
                     break;
                 }
 

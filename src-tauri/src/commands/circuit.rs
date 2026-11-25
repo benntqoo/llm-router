@@ -7,9 +7,12 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::gateway::circuit::{
-    circuit_key, CircuitState, MIN_OPEN_DURATION_SECS, OPEN_DURATION_SECS,
+    circuit_key, CircuitState, MIN_OPEN_DURATION_SECS, MIN_RATE_LIMIT_CAP_SECS, OPEN_DURATION_SECS,
+    RATE_LIMIT_MAX_SECS,
 };
-use crate::store::settings::{get_int_setting, set_int_setting, KEY_CIRCUIT_OPEN_SECS};
+use crate::store::settings::{
+    get_int_setting, set_int_setting, KEY_CIRCUIT_OPEN_SECS, KEY_RATE_LIMIT_CAP_SECS,
+};
 use crate::AppState;
 
 /// 单条熔断状态。
@@ -80,6 +83,8 @@ pub fn circuit_status_of(state: &AppState) -> Result<Vec<CircuitStatusRow>, Stri
 pub struct CircuitSettings {
     /// 连续失败触发的熔断时长（秒；默认 60，最小 1）。
     pub open_duration_secs: i64,
+    /// 429 冷却上限（秒；默认 60，最小 1）。
+    pub rate_limit_cooldown_cap_secs: i64,
 }
 
 /// 读熔断设置。
@@ -93,7 +98,13 @@ pub fn circuit_settings_get_of(state: &AppState) -> Result<CircuitSettings, Stri
     let open_duration_secs = get_int_setting(&state.store, KEY_CIRCUIT_OPEN_SECS)
         .unwrap_or(OPEN_DURATION_SECS)
         .max(MIN_OPEN_DURATION_SECS);
-    Ok(CircuitSettings { open_duration_secs })
+    let rate_limit_cooldown_cap_secs = get_int_setting(&state.store, KEY_RATE_LIMIT_CAP_SECS)
+        .unwrap_or(RATE_LIMIT_MAX_SECS)
+        .max(MIN_RATE_LIMIT_CAP_SECS);
+    Ok(CircuitSettings {
+        open_duration_secs,
+        rate_limit_cooldown_cap_secs,
+    })
 }
 
 /// 写熔断设置（秒；最小 1 秒）。
@@ -101,20 +112,32 @@ pub fn circuit_settings_get_of(state: &AppState) -> Result<CircuitSettings, Stri
 pub fn circuit_settings_set(
     state: State<'_, AppState>,
     open_duration_secs: i64,
+    rate_limit_cooldown_cap_secs: i64,
 ) -> Result<CircuitSettings, String> {
-    circuit_settings_set_of(&state, open_duration_secs)
+    circuit_settings_set_of(&state, open_duration_secs, rate_limit_cooldown_cap_secs)
 }
 
 /// 写熔断设置（可测版本）：落库 + 立即生效。
 pub fn circuit_settings_set_of(
     state: &AppState,
     open_duration_secs: i64,
+    rate_limit_cooldown_cap_secs: i64,
 ) -> Result<CircuitSettings, String> {
     // 先钳到下限再落库，保证库里的值与运行时一致
-    let clamped = state.circuit.set_open_duration_secs(open_duration_secs);
-    set_int_setting(&state.store, KEY_CIRCUIT_OPEN_SECS, clamped).map_err(|e| e.to_string())?;
+    let open_duration_secs = state.circuit.set_open_duration_secs(open_duration_secs);
+    let rate_limit_cooldown_cap_secs =
+        state.circuit.set_rate_limit_cap_secs(rate_limit_cooldown_cap_secs);
+    set_int_setting(&state.store, KEY_CIRCUIT_OPEN_SECS, open_duration_secs)
+        .map_err(|e| e.to_string())?;
+    set_int_setting(
+        &state.store,
+        KEY_RATE_LIMIT_CAP_SECS,
+        rate_limit_cooldown_cap_secs,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(CircuitSettings {
-        open_duration_secs: clamped,
+        open_duration_secs,
+        rate_limit_cooldown_cap_secs,
     })
 }
 
@@ -246,27 +269,56 @@ mod tests {
         let (_dir, state) = app_state();
         let settings = circuit_settings_get_of(&state).expect("读取失败");
         assert_eq!(settings.open_duration_secs, 60);
+        assert_eq!(
+            settings.rate_limit_cooldown_cap_secs, 60,
+            "429 冷却上限默认 60s"
+        );
     }
 
     #[test]
     fn settings_are_persisted_and_applied_immediately() {
         let (_dir, state) = app_state();
-        let saved = circuit_settings_set_of(&state, 180).expect("写入失败");
+        let saved = circuit_settings_set_of(&state, 180, 30).expect("写入失败");
         assert_eq!(saved.open_duration_secs, 180);
+        assert_eq!(saved.rate_limit_cooldown_cap_secs, 30);
         assert_eq!(state.circuit.open_duration_secs(), 180, "运行时立即生效");
+        assert_eq!(
+            state.circuit.rate_limit_cap_secs(),
+            30,
+            "429 冷却上限运行时立即生效"
+        );
 
         // 再读一次应来自落库的值
         let reread = circuit_settings_get_of(&state).expect("读取失败");
         assert_eq!(reread.open_duration_secs, 180);
+        assert_eq!(reread.rate_limit_cooldown_cap_secs, 30);
     }
 
     #[test]
     fn settings_below_one_second_are_clamped() {
         let (_dir, state) = app_state();
-        let saved = circuit_settings_set_of(&state, 0).expect("写入失败");
+        let saved = circuit_settings_set_of(&state, 0, 0).expect("写入失败");
         assert_eq!(saved.open_duration_secs, 1);
-        let saved = circuit_settings_set_of(&state, -5).expect("写入失败");
+        assert_eq!(saved.rate_limit_cooldown_cap_secs, 1);
+        let saved = circuit_settings_set_of(&state, -5, -5).expect("写入失败");
         assert_eq!(saved.open_duration_secs, 1);
+        assert_eq!(saved.rate_limit_cooldown_cap_secs, 1);
+        assert_eq!(state.circuit.rate_limit_cap_secs(), 1);
+    }
+
+    #[test]
+    fn rate_limit_cap_setting_truncates_upstream_retry_after() {
+        let (_dir, state) = app_state();
+        circuit_settings_set_of(&state, 60, 10).expect("写入失败");
+
+        let key = crate::gateway::circuit::circuit_key("c1", "deepseek-chat");
+        let cooldown = state
+            .circuit
+            .on_rate_limited(&key, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(cooldown, 10, "上游 Retry-After=30s 应被 10s 上限截断");
+        let rows = circuit_status_of(&state).expect("查询失败");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].remaining_secs.unwrap_or(0) <= 10);
     }
 
     #[test]

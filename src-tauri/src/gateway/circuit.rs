@@ -8,8 +8,10 @@
 //!                                                     └─失败→ open(60s)
 //! ```
 //!
-//! 429 走另一条冷却通道：**指数退避**（基数 2s，逐次翻倍，上限 60s），
-//! 且**遵守上游的 `Retry-After`**（取两者较大值）。
+//! 429 走另一条冷却通道：**指数退避**（基数 2s，逐次翻倍），
+//! 并参考上游的 `Retry-After`（取两者较大值），
+//! 最终时长再被**用户设置的上限**截断（默认 60s，可调，最小 1s）：
+//! `冷却 = min(max(指数退避, Retry-After), 用户上限)`。
 //!
 //! **持久化**：非 closed 的熔断状态写穿到 `circuit_state` 表（状态变化即落库），
 //! **重启后恢复**——重启清零会让限流保护被绕过（重启网关就能立刻重试被 429 的上游）。
@@ -28,8 +30,10 @@ pub const OPEN_DURATION_SECS: i64 = 60;
 pub const MIN_OPEN_DURATION_SECS: i64 = 1;
 /// 429 冷却的指数退避基数（秒）。
 pub const RATE_LIMIT_BASE_SECS: i64 = 2;
-/// 429 冷却上限（秒）。
+/// 429 冷却上限（秒）——**默认值**，用户可在应用内调整（02 §2.3）。
 pub const RATE_LIMIT_MAX_SECS: i64 = 60;
+/// 429 冷却上限可调的下限（秒）——最小单位 1 秒。
+pub const MIN_RATE_LIMIT_CAP_SECS: i64 = 1;
 
 /// 熔断粒度键中 `channel_id` 与 `upstream_model` 的分隔符。
 pub const KEY_SEPARATOR: char = '\u{1}';
@@ -214,6 +218,8 @@ pub struct CircuitBreaker {
     persistence: Arc<dyn CircuitPersistence>,
     /// 连续失败触发的熔断时长（秒）；运行期可改（02 §2.3）。
     open_duration_secs: Arc<AtomicI64>,
+    /// 429 冷却上限（秒）；运行期可改（02 §2.3）。
+    rate_limit_cap_secs: Arc<AtomicI64>,
 }
 
 impl std::fmt::Debug for CircuitBreaker {
@@ -238,6 +244,7 @@ impl CircuitBreaker {
             now: Arc::new(crate::vault::now_secs),
             persistence: Arc::new(NoopPersistence),
             open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
+            rate_limit_cap_secs: Arc::new(AtomicI64::new(RATE_LIMIT_MAX_SECS)),
         }
     }
 
@@ -248,6 +255,7 @@ impl CircuitBreaker {
             now,
             persistence: Arc::new(NoopPersistence),
             open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
+            rate_limit_cap_secs: Arc::new(AtomicI64::new(RATE_LIMIT_MAX_SECS)),
         }
     }
 
@@ -258,6 +266,7 @@ impl CircuitBreaker {
             now: Arc::new(crate::vault::now_secs),
             persistence,
             open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
+            rate_limit_cap_secs: Arc::new(AtomicI64::new(RATE_LIMIT_MAX_SECS)),
         };
         breaker.restore();
         breaker
@@ -273,6 +282,7 @@ impl CircuitBreaker {
             now,
             persistence,
             open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
+            rate_limit_cap_secs: Arc::new(AtomicI64::new(RATE_LIMIT_MAX_SECS)),
         };
         breaker.restore();
         breaker
@@ -290,6 +300,21 @@ impl CircuitBreaker {
     pub fn set_open_duration_secs(&self, secs: i64) -> i64 {
         let clamped = secs.max(MIN_OPEN_DURATION_SECS);
         self.open_duration_secs.store(clamped, Ordering::SeqCst);
+        clamped
+    }
+
+    /// 当前 429 冷却上限（秒）。
+    pub fn rate_limit_cap_secs(&self) -> i64 {
+        self.rate_limit_cap_secs.load(Ordering::SeqCst)
+    }
+
+    /// 调整 429 冷却上限（秒）。
+    ///
+    /// 小于 `MIN_RATE_LIMIT_CAP_SECS` 的值会被抬到下限（最小单位 1 秒）。
+    /// 上限同时约束指数退避的封顶与最终冷却时长。
+    pub fn set_rate_limit_cap_secs(&self, secs: i64) -> i64 {
+        let clamped = secs.max(MIN_RATE_LIMIT_CAP_SECS);
+        self.rate_limit_cap_secs.store(clamped, Ordering::SeqCst);
         clamped
     }
 
@@ -432,22 +457,26 @@ impl CircuitBreaker {
 
     /// 记录一次 429：进入冷却。
     ///
-    /// 冷却时长 = `max(指数退避, Retry-After)`。
-    pub fn on_rate_limited(&self, key: &str, retry_after: Option<Duration>) {
+    /// 冷却时长 = `min(max(指数退避, Retry-After), 用户上限)`（02 §2.3）。
+    /// 返回**实际生效**的冷却秒数（调用方用它回给客户端的 `Retry-After`）。
+    pub fn on_rate_limited(&self, key: &str, retry_after: Option<Duration>) -> i64 {
         let now = (self.now)();
+        let cap = self.rate_limit_cap_secs();
         let before = self.current_snapshot(key, now);
-        {
+        let cooldown = {
             let mut guard = lock(&self.inner);
             let entry = guard.entry(key.to_string()).or_default();
             entry.rate_limit_hits = entry.rate_limit_hits.saturating_add(1);
             entry.probing = false;
-            let backoff = rate_limit_backoff(entry.rate_limit_hits);
+            let backoff = rate_limit_backoff(entry.rate_limit_hits, cap);
             let retry_secs = retry_after.map(|d| d.as_secs() as i64).unwrap_or(0);
-            let cooldown = backoff.max(retry_secs).max(1);
+            let cooldown = backoff.max(retry_secs).min(cap).max(1);
             entry.open_until = Some(now + cooldown);
             entry.open_reason = Some(OpenReason::RateLimit);
-        }
+            cooldown
+        };
         self.persist_if_changed(key, before);
+        cooldown
     }
 
     /// 当前冷却信息：剩余秒数 + 打开原因。
@@ -499,13 +528,15 @@ impl CircuitBreaker {
     }
 }
 
-/// 429 的指数退避时长（第 n 次命中）。
-pub fn rate_limit_backoff(hits: u32) -> i64 {
+/// 429 的指数退避时长（第 n 次命中），封顶为 `cap` 秒。
+///
+/// `cap` = 用户设置的上限（默认 `RATE_LIMIT_MAX_SECS`），02 §2.3。
+pub fn rate_limit_backoff(hits: u32, cap: i64) -> i64 {
     if hits == 0 {
         return 0;
     }
-    let shift = (hits - 1).min(6);
-    (RATE_LIMIT_BASE_SECS << shift).min(RATE_LIMIT_MAX_SECS)
+    let shift = (hits - 1).min(16);
+    (RATE_LIMIT_BASE_SECS << shift).min(cap.max(1))
 }
 
 /// 取锁（忽略中毒：熔断状态丢失只是重新计数，不该让请求失败）。
@@ -810,13 +841,86 @@ mod tests {
 
     #[test]
     fn rate_limit_uses_exponential_backoff() {
-        assert_eq!(rate_limit_backoff(1), 2);
-        assert_eq!(rate_limit_backoff(2), 4);
-        assert_eq!(rate_limit_backoff(3), 8);
-        assert_eq!(rate_limit_backoff(4), 16);
-        assert_eq!(rate_limit_backoff(5), 32);
-        assert_eq!(rate_limit_backoff(6), 60);
-        assert_eq!(rate_limit_backoff(10), 60, "封顶 60s");
+        let cap = RATE_LIMIT_MAX_SECS;
+        assert_eq!(rate_limit_backoff(1, cap), 2);
+        assert_eq!(rate_limit_backoff(2, cap), 4);
+        assert_eq!(rate_limit_backoff(3, cap), 8);
+        assert_eq!(rate_limit_backoff(4, cap), 16);
+        assert_eq!(rate_limit_backoff(5, cap), 32);
+        assert_eq!(rate_limit_backoff(6, cap), 60);
+        assert_eq!(rate_limit_backoff(10, cap), 60, "封顶为用户上限（默认 60s）");
+    }
+
+    #[test]
+    fn rate_limit_backoff_respects_a_smaller_cap() {
+        assert_eq!(rate_limit_backoff(1, 10), 2);
+        assert_eq!(rate_limit_backoff(3, 10), 8);
+        assert_eq!(rate_limit_backoff(4, 10), 10, "退避封顶取用户上限");
+        assert_eq!(rate_limit_backoff(10, 10), 10);
+    }
+
+    #[test]
+    fn rate_limit_cap_is_configurable_and_clamped() {
+        let (_now, breaker) = fake_clock();
+        assert_eq!(breaker.rate_limit_cap_secs(), RATE_LIMIT_MAX_SECS, "默认 60s");
+
+        assert_eq!(breaker.set_rate_limit_cap_secs(10), 10);
+        assert_eq!(breaker.rate_limit_cap_secs(), 10);
+
+        assert_eq!(breaker.set_rate_limit_cap_secs(0), MIN_RATE_LIMIT_CAP_SECS);
+        assert_eq!(breaker.set_rate_limit_cap_secs(-30), MIN_RATE_LIMIT_CAP_SECS);
+        assert_eq!(breaker.rate_limit_cap_secs(), MIN_RATE_LIMIT_CAP_SECS);
+    }
+
+    #[test]
+    fn rate_limit_cap_truncates_a_longer_retry_after() {
+        let (_now, breaker) = fake_clock();
+        breaker.set_rate_limit_cap_secs(10);
+
+        // 上游要等 30s，但用户上限 10s → 实际只等 10s
+        let cooldown = breaker.on_rate_limited("k1", Some(Duration::from_secs(30)));
+        assert_eq!(cooldown, 10, "上游 Retry-After 应被用户上限截断");
+        assert_eq!(breaker.state("k1"), CircuitState::Open { until: 1_000 + 10 });
+    }
+
+    #[test]
+    fn rate_limit_cap_does_not_extend_a_shorter_retry_after() {
+        let (_now, breaker) = fake_clock();
+        breaker.set_rate_limit_cap_secs(300);
+
+        // 上游只要等 1s，退避 2s → 取 2s（上限很大也不放大）
+        let cooldown = breaker.on_rate_limited("k1", Some(Duration::from_secs(1)));
+        assert_eq!(cooldown, 2);
+    }
+
+    #[test]
+    fn rate_limit_cap_also_bounds_the_exponential_backoff() {
+        let (_now, breaker) = fake_clock();
+        breaker.set_rate_limit_cap_secs(5);
+
+        // 连续 429 → 退避本应涨到 8s/16s，但上限 5s → 停在 5s
+        for _ in 0..4 {
+            breaker.on_rate_limited("k1", None);
+        }
+        let cooldown = breaker.on_rate_limited("k1", None);
+        assert_eq!(cooldown, 5, "退避也受同一上限约束");
+        assert_eq!(breaker.state("k1"), CircuitState::Open { until: 1_000 + 5 });
+    }
+
+    #[test]
+    fn rate_limit_returns_the_effective_cooldown() {
+        let (_now, breaker) = fake_clock();
+        assert_eq!(
+            breaker.on_rate_limited("k1", Some(Duration::from_secs(30))),
+            30,
+            "未设上限时回的是上游的 Retry-After"
+        );
+        breaker.set_rate_limit_cap_secs(10);
+        assert_eq!(
+            breaker.on_rate_limited("k1", Some(Duration::from_secs(30))),
+            10,
+            "设了上限后回的是实际生效的冷却秒数"
+        );
     }
 
     #[test]

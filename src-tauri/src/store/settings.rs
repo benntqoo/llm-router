@@ -8,6 +8,8 @@ use crate::store::{Result, Store};
 
 /// 连续失败熔断时长的设置键（秒；默认 60，最小 1）。
 pub const KEY_CIRCUIT_OPEN_SECS: &str = "circuit_open_secs";
+/// 429 冷却上限的设置键（秒；默认 60，最小 1）。
+pub const KEY_RATE_LIMIT_CAP_SECS: &str = "rate_limit_cooldown_cap_secs";
 
 /// 读设置（不存在返回 `None`）。
 pub fn get_setting(store: &Store, key: &str) -> Result<Option<String>> {

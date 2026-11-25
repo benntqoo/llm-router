@@ -93,6 +93,13 @@ pub fn run() {
             ) {
                 circuit.set_open_duration_secs(secs);
             }
+            // 读回落库的 429 冷却上限（用户可调；默认 60s）
+            if let Some(secs) = store::settings::get_int_setting(
+                &store,
+                store::settings::KEY_RATE_LIMIT_CAP_SECS,
+            ) {
+                circuit.set_rate_limit_cap_secs(secs);
+            }
             let forwarder = Arc::new(Forwarder::new(
                 OutboundClient::new().map_err(std::io::Error::other)?,
                 Arc::clone(&circuit),
