@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.1（草案，待评审） |
-| 日期 | 2026-11-25 |
+| 版本 | v0.3（变更记录见 §13） |
+| 日期 | 2026-11-26 |
 | 上游文档 | `01-architecture-and-feasibility.md`（可行性基线与竞品调研） |
 | 状态 | 待评审后进入开发。**本文档未改动任何代码或配置**。 |
 | 决策依据 | 2026-11-25 头头确认：v1 仅反代 GitHub Copilot + WorkBuddy 两类 harness 内置额度；Anthropic 入站不进 v1；MiniMax 需处理 group_id |
@@ -35,6 +35,7 @@
 | 云端同步 | v1 纯本地 |
 | Gemini / GPT / Claude 等海外付费渠道预设 | v1 聚焦国产模型 + Copilot/WorkBuddy 额度反代（头头确认）。技术上 OpenAI 兼容渠道均可自定义添加，只是不做预设 |
 | Claude / Gemini / GPT 模型族协议适配 | Copilot 上游返回的多为 OpenAI 格式，直接透传；WorkBuddy 同理（待抓包确认） |
+| 一键配置 harness 向导（FreeLLMAPI `setup-claude` 式） | 2026-11-25 决策：**维持"永不修改 harness 配置文件"红线**，不提供任何代写配置能力 |
 
 ### 0.3 客户端接入方式（不变承诺）
 
@@ -148,6 +149,9 @@ harness (pi 等)
    ▼
 ③ router.rs 解析别名
    命中 route_group.alias → 按 strategy 选出 model
+      strategy: priority | round_robin | cost | sticky_session
+      （sticky_session：同一 client_key+模型粘住同一渠道/账号，
+        多账号池场景必需，参考 FreeLLMAPI 与 TraeWorkAssistant 双源实践）
    命中 model.alias       → 直接使用
    未命中                 → 400，响应体附可用别名列表
    输出：(channel, upstream_model, credential_id)
@@ -184,7 +188,16 @@ harness (pi 等)
 
 ### 2.3 熔断
 
-粒度 `(channel_id, upstream_model)`。连续 3 次失败 → open 60s → half_open 放一次探测 → 成功 closed / 失败重开。429 触发连接冷却（指数退避，遵守 `Retry-After`）。冷却状态存内存，重启即清零（不做持久化，避免误伤）。
+粒度 `(channel_id, upstream_model)`。连续 3 次失败 → open 60s → half_open 放一次探测 → 成功 closed / 失败重开。429 触发连接冷却（指数退避，遵守 `Retry-After`）。
+
+**状态持久化**（2026-11-26 头头裁决）：非 closed 的熔断状态**写穿**到 `circuit_state` 表——状态一变即落库，回到 closed 即删行；**重启后恢复**，不再是"重启即清零"。理由：
+
+- 重启清零等于让限流保护被绕过：重启网关就能立刻重试被 429 的上游；
+- 冷却窗口本身很短（失败熔断 60s、429 冷却上限 60s），持久化不会造成长期误伤。
+
+只持久化 open / half_open；**未达阈值的连续失败计数只存内存**（重启清零）。落库失败只记日志，不影响请求（熔断状态丢失只是重新计数）。
+
+**UI 展示**：应用内展示当前处于熔断/冷却的 `(channel, upstream_model)`：状态、原因（连续失败 / 上游限流）、剩余秒数（IPC 命令 `circuit_status`）。
 
 ---
 
@@ -296,6 +309,7 @@ harness (pi 等)
 | P-4 | 学习式兼容：若某渠道因 R-4 注入报 400 且 body 含 `stream_options` 关键字，自动降级关闭注入并记入渠道 meta（本次会话生效） | 流式 |
 | P-5 | 上游无 `usage` 字段（个别渠道流式）→ `usage_log.estimated=1`，本地估算 | 全部 |
 | P-6 | 响应头除 hop-by-hop 外透传（`content-type` 必须为 `text/event-stream` 时不得缓冲） | 全部 |
+| P-7 | 注入 `X-Routed-Via: <channel.name>/<upstream_model>` 响应头（路由可追溯，调试用） | 全部 |
 
 ### 4.4 统一错误结构（入站返回给 harness）
 
@@ -310,6 +324,16 @@ harness (pi 等)
   }
 }
 ```
+
+**429 与 `Retry-After`**（2026-11-26 头头裁决；`Retry-After` 只走**响应头**，错误体字段表不变）：
+
+| 场景 | HTTP 状态 | `type` | 额外响应头 |
+|---|---|---|---|
+| 上游直接返回 429 | 429 | `rate_limit_error` | `Retry-After: <冷却秒数>` |
+| 冷却期内再请求（候选全被冷却跳过） | 429 | `rate_limit_error` | `Retry-After: <剩余冷却秒数>` |
+| 连续失败导致熔断（候选被跳过） | 502 | `upstream_error` | — |
+
+冷却时长 = `max(指数退避（2s 起步、逐次翻倍、60s 封顶）, 上游 `Retry-After`)`（§2.3）。限流原因必须让客户端看得见——冷却期回 502 会把"限流"这个真实原因藏成"没有可用候选"。
 
 ---
 
@@ -446,6 +470,7 @@ pub trait ProviderAdapter: Send + Sync {
 - 成本：`price` 表（用户可编辑，预填国产渠道公开牌价）→ `cost_micros`（1e-6 元）。
 - 聚合视图：按 日/渠道/模型/client_key 四维；TTFT P50/P95；输出 tokens/s。
 - 配额监控：对支持额度查询的渠道（GLM/Kimi/MiniMax 包月等）定时 probe，展示剩余与重置时间。
+- **限额自学习**：per `(channel, account)` 维护 RPM/RPD/TPM/TPD 计数；429 响应的 `Retry-After` 与 `x-ratelimit-*` 头、以及渠道文档上报值，写入 `account.quota_json`，作为熔断冷却时长与调度排序依据。（源自 FreeLLMAPI 参考实现，见 `docs/reviews/freellmapi-analysis.md` §4-2）
 
 ---
 
@@ -465,6 +490,11 @@ pub trait ProviderAdapter: Send + Sync {
 -- account 增加登录态路径引用（WorkBuddy）
 --   meta_json: { "users_dir": "C:/Users/<u>/.workbuddy/app/users/<hash>",
 --                "device_id_file": "C:/Users/<u>/.workbuddy/device-id" }
+
+-- circuit_state：熔断状态（02 §2.3；非 closed 才留行，回到 closed 即删行）
+--   主键 (channel_id, upstream_model) 与熔断粒度一致
+--   state: open | half_open；reason: failures | rate_limit
+--   open_until: 冷却截止（Unix 秒）；failures / rate_limit_hits 供 UI 展示
 ```
 
 其余表结构沿用 01 文档，不重复。
@@ -526,3 +556,13 @@ pub trait ProviderAdapter: Send + Sync {
 | 登录态切换器 / 设备指纹隔离（TraeWorkAssistant 式） | 明确**不进 roadmap**：维护成本与合规风险双高 |
 | 云同步 / 多设备 | store 层抽象预留，v1 不做 |
 | Gemini 协议出站 | adapter trait 已按协议无关设计 |
+
+---
+
+## 13. 变更记录
+
+| 版本 | 日期 | 变更 |
+|---|---|---|
+| v0.1 | 2026-11-25 | 初稿 |
+| v0.2 | 2026-11-25 | 依据 FreeLLMAPI 调研（`docs/reviews/freellmapi-analysis.md`，头头批准路线 B）：P-7 X-Routed-Via 响应头；§8 限额自学习；route_group 增加 sticky_session 策略（DDL 注释同步 01 文档）；§0.2 补非目标"一键配置 harness 向导" |
+| v0.3 | 2026-11-26 | 头头裁决两项：① 限流冷却期内回 **429 + `Retry-After`**（§4.4 回填，错误体字段表不变）；② 熔断状态由"只存内存、重启清零"改为**落库 + 重启恢复**（§2.3），新增 `circuit_state` 表（§9）与 UI 展示 |

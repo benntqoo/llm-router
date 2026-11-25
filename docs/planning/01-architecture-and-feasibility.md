@@ -236,7 +236,7 @@ CREATE UNIQUE INDEX idx_model_alias ON model(alias);
 CREATE TABLE route_group (
   id            TEXT PRIMARY KEY,
   alias         TEXT NOT NULL UNIQUE,    -- 对外名，如 "smart"
-  strategy      TEXT NOT NULL DEFAULT 'priority'  -- priority|round_robin|cost
+  strategy      TEXT NOT NULL DEFAULT 'priority'  -- priority|round_robin|cost|sticky_session
 );
 CREATE TABLE route_member (
   group_id      TEXT NOT NULL REFERENCES route_group(id) ON DELETE CASCADE,

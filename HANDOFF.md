@@ -54,9 +54,10 @@
 第 4 步：~~T3 网关骨架 + 入站鉴权~~ ✅（提交 `359b2ce`，验收留档 `docs/reviews/T3-gateway-auth-verification.md`）
 第 5 步：~~T4 出站适配器~~ ✅（提交 `364974f`，验收留档 `docs/reviews/T4-outbound-adapter-verification.md`）
 第 6 步：~~T5 路由与别名~~ ✅（提交 `eb3fddd`，验收留档 `docs/reviews/T5-routing-alias-verification.md`）
-第 7 步：~~T6 流式管道 + fallback + 熔断~~ ✅（提交 `ad50996`，验收留档 `docs/reviews/T6-stream-fallback-circuit-verification.md`）；下一步 T7 usage 采集（关键路径 T7→T10）
-第 8 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
-第 9 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
+第 7 步：~~T6 流式管道 + fallback + 熔断~~ ✅（提交 `ad50996`，验收留档 `docs/reviews/T6-stream-fallback-circuit-verification.md`）
+第 8 步：~~T6 追加：熔断落库 + UI 展示 + 429/Retry-After 口径~~ ✅（头头裁决后落地，留档 `docs/reviews/T6-circuit-persistence-verification.md`）；下一步 T7 usage 采集（关键路径 T7→T10）
+第 9 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
+第 10 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
 ```
 
 排期基准 6 周（03 §4）。滞后处理按 03 §5 降级预案，不擅自砍范围。
@@ -113,12 +114,12 @@
 | ✅ | T4 出站适配器（ProviderAdapter trait + openai_compat R-1~R-8 + 7 个渠道预设 + MiniMax 错误码映射） | 提交 `364974f`；留档 `docs/reviews/T4-outbound-adapter-verification.md` |
 | ✅ | T5 路由与别名（别名解析 + priority/round_robin/cost/sticky_session 四策略 + 未命中附可用别名 + fallback 候选链） | 提交 `eb3fddd`；留档 `docs/reviews/T5-routing-alias-verification.md` |
 | ✅ | T6 流式管道 + fallback + 熔断（reqwest 出站转发 + SSE 零缓冲直通 + 首字节前重试 + 断连 abort 上游 + 熔断状态机 + 429 冷却 + P-3/P-4/P-7） | 提交 `ad50996`；留档 `docs/reviews/T6-stream-fallback-circuit-verification.md` |
+| ✅ | T6 追加：熔断状态**落库 + 重启恢复**（`circuit_state` 表，schema v5）+ UI 展示（`circuit_status`）+ 限流冷却期回 429 + `Retry-After` | 头头 2026-11-26 裁决；留档 `docs/reviews/T6-circuit-persistence-verification.md`；提案 `docs/reviews/proposal-circuit-persistence.md` |
 | 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6，待头头裁决 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 02 §6.1 标题写"8 profile"但表体只有 7 行（03 T8 写"7 个 profile"） | T4 已按 7 个落地；是否回填标题待裁决，见 `docs/reviews/T4-outbound-adapter-verification.md` §6 |
 | 🔴 | 统一错误体新增 `available_models` 字段是否回填 02 §4.4 | 02 §2.1 ③ 要求"响应体附可用别名"，§4.4 字段表未列；已按可选字段实现，见 `docs/reviews/T5-routing-alias-verification.md` §6 |
-| 🔴 | **限流冷却期内回 429 + `Retry-After` 响应头**是否回填 02 §4.4 | §3.3 把 429 单列一类，§2.3 只写"429 触发连接冷却"，未写冷却期内回什么；已实现为 429 + 响应头（错误体字段表未改），见 `docs/reviews/T6-stream-fallback-circuit-verification.md` §6 |
-| 🔴 | 熔断/冷却状态是否需要落库与 UI 展示 | 02 §2.3 明确"只存内存、重启清零"，当前按此实现；若要在 UI 显示"某渠道正在冷却"需额外设计 |
+| 🔴 | **手动解除熔断**入口（UI 按钮） | 熔断只存"当前状态"，最长 60s 自然到期；手动解除属 T9 UI 第一轮范围，是否要做待裁决 |
 | 🔴 | 分支命名：仓库实为 `master` + `origin/master`，AGENT.md §8 要求 `main` + `dev`（已建 `dev`） | 待头头裁决是否重命名 `master` → `main` |
 | 🔴 | T18 签到站点清单待指定 | `docs/planning/03-delivery-plan.md` §2 T18 |
 | ⏳ | HANDOFF §5 五项未验证项 | 验证方法见 §5；命中对应任务前必须先实测再实现 |

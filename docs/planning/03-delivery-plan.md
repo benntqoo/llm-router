@@ -59,16 +59,17 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 - 验收：单测覆盖每个改写规则（R-1/R-3/R-5/R-7 必测）；MiniMax 出站 URL 按 §4.2 口径拼接。
 
 **T5 路由与别名** `1d` · 依赖 T3
-- 目标：alias 唯一索引、route_group 三策略（priority/round_robin/cost）、未命中返回可用别名。
-- 验收：route_group 命中/单别名命中/未命中三条路径单测通过。
+- 目标：alias 唯一索引、route_group 四策略（priority/round_robin/cost/**sticky_session**）、未命中返回可用别名。
+- 验收：route_group 命中/单别名命中/未命中三条路径单测通过；sticky_session 对同一 client_key+模型连续请求返回同渠道（多账号池场景）。
 
 **T6 流式管道 + fallback + 熔断** `3d` · 依赖 T4 T5
-- 目标：SSE 零缓冲直通、首字节前重试、客户端断连 abort 上游、熔断状态机、P-4 学习式兼容。
-- 验收：mock 上游可复现"首字节后失败不重试""断连取消上游""3 连败熔断"三个场景（用内存 mock server 测试）。
+- 目标：SSE 零缓冲直通、首字节前重试、客户端断连 abort 上游、熔断状态机、P-4 学习式兼容、P-7 `X-Routed-Via` 响应头注入、429 响应 `Retry-After`/`x-ratelimit-*` 解析进冷却参数。
+- 验收：mock 上游可复现"首字节后失败不重试""断连取消上游""3 连败熔断""429 冷却时长遵循 Retry-After"四个场景（用内存 mock server 测试）。
+- 追加（2026-11-26 头头裁决）：熔断状态**落库 + 重启恢复**（新增 `circuit_state` 表，02 §2.3/§9）+ 应用内 UI 展示（`circuit_status`）；限流冷却期内回 **429 + `Retry-After`**（02 §4.4）。
 
 **T7 usage 采集** `1.5d` · 依赖 T6
-- 目标：tee 解析 usage 帧、R-4 注入、estimated 估算入口（估算器本身在 T12）、`usage_log` 落库。
-- 验收：流式/非流式各一条用例，usage_log 字段与上游返回一致。
+- 目标：tee 解析 usage 帧、R-4 注入、estimated 估算入口（估算器本身在 T12）、`usage_log` 落库、per `(channel, account)` 的 RPM/RPD/TPM/TPD 计数与 `quota_json` 回写（限额自学习，02 §8）。
+- 验收：流式/非流式各一条用例，usage_log 字段与上游返回一致；429 触发后 quota_json 记录更新。
 
 **T8 A 类预设 + 自定义渠道** `1.5d` · 依赖 T4
 - 目标：02 §6.1 的 7 个 profile 数据 + "自定义 OpenAI 兼容渠道"表单（base_url/路径模板/鉴权样式/group_id）。
