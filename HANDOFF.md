@@ -49,10 +49,11 @@
 
 ```
 第 1 步：~~T0 仓库初始化~~ ✅（提交 `c98bd69`，验收留档 `docs/reviews/T0-scaffold-verification.md`）
-第 2 步：~~T1 数据层~~ ✅（提交 `2bf7df5`，验收留档 `docs/reviews/T1-datastore-verification.md`）；下一步 T2 加密保险库
-第 3 步：按 03 §3 依赖图推进，关键路径 T2→T4→T6→T7→T10
-第 4 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
-第 5 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
+第 2 步：~~T1 数据层~~ ✅（提交 `2bf7df5`，验收留档 `docs/reviews/T1-datastore-verification.md`）
+第 3 步：~~T2 加密保险库~~ ✅（提交 `ac93d35`，验收留档 `docs/reviews/T2-vault-verification.md`）；下一步 T3 网关骨架 + 入站鉴权
+第 4 步：按 03 §3 依赖图推进，关键路径 T3→T4→T6→T7→T10
+第 5 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
+第 6 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
 ```
 
 排期基准 6 周（03 §4）。滞后处理按 03 §5 降级预案，不擅自砍范围。
@@ -104,6 +105,8 @@
 |---|---|---|
 | ✅ | T0 仓库初始化 | 提交 `c98bd69`（分支 `dev`）；留档 `docs/reviews/T0-scaffold-verification.md` |
 | ✅ | T1 数据层（SQLite WAL + 迁移框架 + v1 全量建表） | 提交 `2bf7df5`；留档 `docs/reviews/T1-datastore-verification.md` |
+| ✅ | T2 加密保险库（DPAPI/Keychain + AES-256-GCM + Argon2id + 30s 回看遮蔽） | 提交 `ac93d35`；留档 `docs/reviews/T2-vault-verification.md` |
+| 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6，待头头裁决 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 分支命名：仓库实为 `master` + `origin/master`，AGENT.md §8 要求 `main` + `dev`（已建 `dev`） | 待头头裁决是否重命名 `master` → `main` |
 | 🔴 | T18 签到站点清单待指定 | `docs/planning/03-delivery-plan.md` §2 T18 |
