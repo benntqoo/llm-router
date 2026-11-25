@@ -34,6 +34,8 @@ zeroize = { version = "1.9.2", features = ["derive"] }
 rand = "0.9"
 # vault.bin 字段的 base64 编解码
 base64 = "0.23"
+# client key 的 SHA-256 哈希（02 §3.1：只存哈希，不存明文）
+sha2 = "0.10"
 
 # Windows DPAPI（主密钥由 OS 原生保护，绑定当前用户）
 [target.'cfg(windows)'.dependencies]

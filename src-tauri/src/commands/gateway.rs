@@ -25,6 +25,6 @@ pub fn gateway_status(state: State<'_, AppState>) -> GatewayStatus {
         running: true,
         addr: state.gateway_addr.clone(),
         base_url: state.gateway_base_url.clone(),
-        note: "T0 骨架：仅 /healthz；OpenAI 兼容入站与 client key 鉴权在 T3 接入".to_string(),
+        note: "T3 已接入：OpenAI 入站 + client key 鉴权 + Host 校验 + 限流；别名路由与出站适配在 T4/T5 落地".to_string(),
     }
 }
