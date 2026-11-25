@@ -6,10 +6,14 @@
 
 pub mod commands;
 pub mod gateway;
+pub mod store;
+
+use std::sync::Arc;
 
 use tauri::Manager;
 
 use crate::gateway::server;
+use crate::store::Store;
 
 /// 应用级共享状态。后续任务（渠道/保险库/用量）在此扩展。
 #[derive(Clone, Debug)]
@@ -18,6 +22,8 @@ pub struct AppState {
     pub gateway_addr: String,
     /// 供客户端填入的 base_url，形如 `http://127.0.0.1:8787/v1`
     pub gateway_base_url: String,
+    /// 数据层句柄（SQLite + 迁移）
+    pub store: Arc<Store>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -41,9 +47,19 @@ pub fn run() {
                 "[gateway] 监听 http://{local_addr}（OpenAI 兼容入口将在 T3 接入）"
             );
 
+            // 数据层：空库自动建表（迁移到最新版本）；失败即启动失败。
+            let db_path = store::default_db_path();
+            let store = Store::open(&db_path).map_err(std::io::Error::other)?;
+            println!(
+                "[store] 数据库 {}（schema v{}）",
+                db_path.display(),
+                store.version().map_err(std::io::Error::other)?
+            );
+
             app.manage(AppState {
                 gateway_addr: local_addr.to_string(),
                 gateway_base_url: format!("http://{local_addr}/v1"),
+                store: Arc::new(store),
             });
             Ok(())
         })

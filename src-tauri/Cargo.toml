@@ -20,8 +20,11 @@ serde_json = "1"
 # 网关 HTTP 服务（02 §1.3 技术选型，已锁定）
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+thiserror = "2.0.21"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 # tower::util::ServiceExt::oneshot 用于在单测里直接调用 axum Router
 tower = { version = "0.5", features = ["util"] }
 
