@@ -19,6 +19,7 @@ use serde_json::json;
 
 use crate::gateway::auth::{self, AuthenticatedClient};
 use crate::gateway::errors::GatewayError;
+use crate::gateway::fallback::Forwarder;
 use crate::gateway::inbound::openai::{parse_chat_request, ModelEntry, ModelList};
 use crate::gateway::ratelimit::RateLimiter;
 use crate::gateway::router::{AliasRouter, RouteError};
@@ -39,6 +40,8 @@ pub struct GatewayState {
     pub limiter: Arc<RateLimiter>,
     /// 路由器（别名解析 + 路由策略；持有 sticky / round_robin 内存状态）。
     pub router: Arc<AliasRouter>,
+    /// 出站转发器（reqwest 发送 + 熔断 + fallback + SSE 直通）。
+    pub forwarder: Arc<Forwarder>,
 }
 
 impl fmt::Debug for GatewayState {
@@ -93,8 +96,8 @@ async fn healthz() -> Json<HealthPayload> {
 
 /// `POST /v1/chat/completions`
 ///
-/// 当前阶段（T5）完成：Host 校验 → client key 鉴权 → 限流 → body 解析 → **路由解析**。
-/// 出站转发（reqwest + SSE 直通）在 T6 接入；未接入时返回 503 + 统一错误结构。
+/// 当前阶段（T6）完成：Host 校验 → client key 鉴权 → 限流 → body 解析 → 路由解析
+/// → **出站转发**（fallback + 熔断 + SSE 直通）。
 async fn chat_completions(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -115,15 +118,8 @@ async fn chat_completions(
         .await
         .map_err(route_error_to_gateway)?;
 
-    // 出站转发在 T6 落地；本阶段止步于"已解析出路由目标"，不做假响应。
-    Err(GatewayError::not_implemented(format!(
-        "路由已解析：别名 {:?} → 渠道 {:?}（上游模型 {:?}，策略 {:?}）；出站转发在 T6 落地",
-        plan.alias,
-        plan.primary.channel_name,
-        plan.primary.upstream_model,
-        plan.strategy.as_str()
-    ))
-    .with_channel(plan.primary.channel_name.clone()))
+    // ④⑤⑥⑧⑨ 候选链 + 出站转发 + 熔断 + SSE 直通（02 §2.1）
+    state.forwarder.forward(&plan, &request, &headers).await
 }
 
 /// 路由错误 → 统一错误结构。
@@ -260,19 +256,56 @@ pub fn health_payload() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn temp_state() -> (tempfile::TempDir, GatewayState) {
+    use crate::gateway::circuit::CircuitBreaker;
+    use crate::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
+    use crate::vault::Vault;
+
+    /// 启动一个恒返回 500 的本机 mock 上游，返回 base_url。
+    ///
+    /// 不用"黑洞地址"（如 127.0.0.1:9）：本机防火墙会把这类连接丢弃，
+    /// 导致每次等待 30s 连接超时，拖慢整个测试套件。
+    async fn start_mock_500() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            (StatusCode::INTERNAL_SERVER_ERROR, "upstream boom").into_response()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 mock 端口");
+        let addr = listener.local_addr().expect("读取 mock 地址");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn temp_state() -> (tempfile::TempDir, GatewayState, Arc<RwLock<Vault>>, String) {
         let dir = tempfile::tempdir().expect("临时目录");
         let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
+        let vault = Arc::new(RwLock::new(
+            Vault::open(Arc::clone(&store), dir.path().join("vault.bin"), None)
+                .expect("打开保险库"),
+        ));
+        let forwarder = Arc::new(Forwarder::new(
+            OutboundClient::new().expect("出站客户端"),
+            Arc::new(CircuitBreaker::new()),
+            Arc::new(StreamUsageDowngrades::default()),
+            Arc::clone(&vault),
+        ));
         let state = GatewayState {
             router: Arc::new(AliasRouter::new(Arc::clone(&store))),
             store,
             limiter: Arc::new(RateLimiter::new()),
+            forwarder,
         };
-        (dir, state)
+        let mock_base = start_mock_500().await;
+        (dir, state, vault, mock_base)
     }
 
     fn create_client_key(state: &GatewayState) -> String {
@@ -317,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_without_key_returns_401_unified_structure() {
-        let (_dir, state) = temp_state();
+        let (_dir, state, _vault, _mock) = temp_state().await;
         let response = router(state)
             .oneshot(chat_request(None))
             .await
@@ -334,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_with_invalid_key_returns_401() {
-        let (_dir, state) = temp_state();
+        let (_dir, state, _vault, _mock) = temp_state().await;
         let response = router(state)
             .oneshot(chat_request(Some("llmr_wrong")))
             .await
@@ -342,16 +375,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// 种入一个渠道 + 模型（别名 `deepseek-chat`）。
-    fn seed_model(state: &GatewayState) {
+    /// 种入一个渠道 + 模型（别名 `deepseek-chat`）+ 凭证。
+    ///
+    /// base_url 指向本机 mock（恒返回 500）：出站必然失败，用来验证
+    /// "鉴权通过 → 进入出站阶段 → 统一错误结构"，且不依赖外网。
+    fn seed_model(state: &GatewayState, vault: &RwLock<Vault>, base_url: &str) {
         let now = crate::vault::now_secs();
         state
             .store
             .with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO channel (id, name, kind, provider, base_url, enabled, priority, created_at)
-                     VALUES ('c1', 'DeepSeek 官方', 'api_key', 'deepseek', 'https://api.deepseek.com', 1, 100, ?1)",
-                    rusqlite::params![now],
+                     VALUES ('c1', 'DeepSeek 官方', 'api_key', 'deepseek', ?1, 1, 100, ?2)",
+                    rusqlite::params![base_url, now],
                 )?;
                 conn.execute(
                     "INSERT INTO model (id, channel_id, upstream_id, alias, enabled)
@@ -361,33 +397,41 @@ mod tests {
                 Ok(())
             })
             .expect("写入渠道与模型");
+        let guard = vault.write().unwrap_or_else(|e| e.into_inner());
+        guard
+            .put_credential(
+                "c1",
+                "api_key",
+                &crate::vault::crypto::SecretBytes::from_slice(b"sk-test"),
+            )
+            .expect("写入凭证");
     }
 
     #[tokio::test]
     async fn chat_completions_with_valid_key_passes_auth() {
-        let (_dir, state) = temp_state();
+        let (_dir, state, vault, mock) = temp_state().await;
         let key = create_client_key(&state);
-        seed_model(&state);
+        seed_model(&state, &vault, &mock);
         let response = router(state)
             .oneshot(chat_request(Some(&key)))
             .await
             .expect("请求应成功");
-        // 鉴权通过 → 路由解析成功 → 出站转发在 T6 落地（503 + 统一结构）
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // 鉴权通过 → 路由命中 → 出站阶段（本例上游不可达 → 502 统一结构）
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("读取响应体");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("应为 JSON");
-        assert_eq!(value["error"]["type"], "api_error");
+        assert_eq!(value["error"]["type"], "upstream_error");
         assert_eq!(value["error"]["channel"], "DeepSeek 官方");
     }
 
     #[tokio::test]
     async fn chat_completions_with_unknown_alias_returns_400_with_available_aliases() {
         // 02 §2.1 ③：别名未命中 → 400，响应体附可用别名列表
-        let (_dir, state) = temp_state();
+        let (_dir, state, vault, mock) = temp_state().await;
         let key = create_client_key(&state);
-        seed_model(&state);
+        seed_model(&state, &vault, &mock);
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -413,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn models_returns_empty_list_without_models() {
-        let (_dir, state) = temp_state();
+        let (_dir, state, _vault, _mock) = temp_state().await;
         let key = create_client_key(&state);
         let response = router(state)
             .oneshot(models_request(Some(&key)))
@@ -430,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn models_requires_key() {
-        let (_dir, state) = temp_state();
+        let (_dir, state, _vault, _mock) = temp_state().await;
         let response = router(state)
             .oneshot(models_request(None))
             .await
@@ -440,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_loopback_host_is_rejected() {
-        let (_dir, state) = temp_state();
+        let (_dir, state, _vault, _mock) = temp_state().await;
         let key = create_client_key(&state);
         let req = Request::builder()
             .uri("/v1/models")
@@ -454,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn rpm_limit_returns_429() {
-        let (_dir, state) = temp_state();
+        let (_dir, state, _vault, _mock) = temp_state().await;
         let key = create_client_key(&state);
         state
             .store

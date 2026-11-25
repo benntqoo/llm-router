@@ -4,13 +4,19 @@
 //! 1. route_group 命中 / 单别名命中 / 未命中 三条路径单测通过；
 //! 2. sticky_session 对同一 client_key + 模型连续请求返回同渠道（多账号池场景）。
 
-use std::sync::Arc;
+mod common;
+
+use std::sync::{Arc, RwLock};
 
 use llm_router_lib::gateway::auth;
+use llm_router_lib::gateway::circuit::CircuitBreaker;
+use llm_router_lib::gateway::fallback::Forwarder;
+use llm_router_lib::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use llm_router_lib::gateway::ratelimit::RateLimiter;
 use llm_router_lib::gateway::router::{AliasRouter, RouteError, Strategy};
 use llm_router_lib::gateway::server::{self, GatewayState};
 use llm_router_lib::store::Store;
+use llm_router_lib::vault::Vault;
 use tower::ServiceExt;
 
 /// 测试用状态。
@@ -19,29 +25,45 @@ struct Fixture {
     store: Arc<Store>,
     router: Arc<AliasRouter>,
     state: GatewayState,
+    vault: Arc<RwLock<Vault>>,
+    /// 本机 mock 上游（恒返回 500）的 base_url
+    mock_base: String,
 }
 
-fn fixture() -> Fixture {
+async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().expect("临时目录");
     let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     let router = Arc::new(AliasRouter::new(Arc::clone(&store)));
+    let vault = Arc::new(RwLock::new(
+        Vault::open(Arc::clone(&store), dir.path().join("vault.bin"), None)
+            .expect("打开保险库"),
+    ));
     let state = GatewayState {
         router: Arc::clone(&router),
+        forwarder: Arc::new(Forwarder::new(
+            OutboundClient::new().expect("出站客户端"),
+            Arc::new(CircuitBreaker::new()),
+            Arc::new(StreamUsageDowngrades::default()),
+            Arc::clone(&vault),
+        )),
         store: Arc::clone(&store),
         limiter: Arc::new(RateLimiter::new()),
     };
+    let mock_base = common::start_mock(common::mock_always_500()).await;
     Fixture {
         _dir: dir,
         store,
         router,
         state,
+        vault,
+        mock_base,
     }
 }
 
-/// 插入渠道。
+/// 插入渠道（base_url 指向本机 mock，恒返回 500；HTTP 层用例据此得到确定的上游失败）。
 #[allow(clippy::too_many_arguments)]
 fn seed_channel(
-    store: &Store,
+    f: &Fixture,
     id: &str,
     name: &str,
     provider: &str,
@@ -49,12 +71,12 @@ fn seed_channel(
     enabled: bool,
 ) {
     let now = llm_router_lib::vault::now_secs();
-    store
+    f.store
         .with_conn(|conn| {
             conn.execute(
                 "INSERT INTO channel (id, name, kind, provider, base_url, enabled, priority, created_at)
-                 VALUES (?1, ?2, 'api_key', ?3, 'https://example.invalid', ?4, ?5, ?6)",
-                rusqlite::params![id, name, provider, enabled, priority, now],
+                 VALUES (?1, ?2, 'api_key', ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![id, name, provider, f.mock_base, enabled, priority, now],
             )?;
             Ok(())
         })
@@ -101,19 +123,17 @@ fn seed_member(store: &Store, group_id: &str, model_id: &str, weight: i64) {
         .expect("插入路由组成员");
 }
 
-/// 插入凭证（只放 id 与密文占位；明文不参与）。
-fn seed_credential(store: &Store, id: &str, channel_id: &str) {
-    let now = llm_router_lib::vault::now_secs();
-    store
-        .with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO credential (id, channel_id, kind, ciphertext, nonce, key_version, created_at, updated_at)
-                 VALUES (?1, ?2, 'api_key', x'00', x'00', 1, ?3, ?3)",
-                rusqlite::params![id, channel_id, now],
-            )?;
-            Ok(())
-        })
-        .expect("插入凭证");
+/// 插入凭证（走保险库真实加密，明文不落库），返回凭证 id。
+fn seed_credential(f: &Fixture, channel_id: &str) -> String {
+    f.vault
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .put_credential(
+            channel_id,
+            "api_key",
+            &llm_router_lib::vault::crypto::SecretBytes::from_slice(b"sk-test"),
+        )
+        .expect("插入凭证")
 }
 
 /// 插入价目表。
@@ -165,25 +185,26 @@ fn disable_channel(store: &Store, id: &str) {
         .expect("禁用渠道");
 }
 
-/// 典型数据：两个渠道 + 两个模型 + 一个 priority 路由组。
-fn seed_two_channels(f: &Fixture) {
-    seed_channel(&f.store, "c1", "DeepSeek 官方", "deepseek", 10, true);
-    seed_channel(&f.store, "c2", "Kimi 官方", "kimi", 20, true);
+/// 典型数据：两个渠道 + 两个模型 + 一个 priority 路由组。返回 (渠道1凭证, 渠道2凭证)。
+fn seed_two_channels(f: &Fixture) -> (String, String) {
+    seed_channel(&f, "c1", "DeepSeek 官方", "deepseek", 10, true);
+    seed_channel(&f, "c2", "Kimi 官方", "kimi", 20, true);
     seed_model(&f.store, "m1", "c1", "ds-chat", "deepseek-chat");
     seed_model(&f.store, "m2", "c2", "moonshot-chat", "moonshot-v1-8k");
-    seed_credential(&f.store, "cred1", "c1");
-    seed_credential(&f.store, "cred2", "c2");
+    let cred1 = seed_credential(f, "c1");
+    let cred2 = seed_credential(f, "c2");
     seed_group(&f.store, "g1", "smart", "priority");
     seed_member(&f.store, "g1", "m1", 100);
     seed_member(&f.store, "g1", "m2", 100);
+    (cred1, cred2)
 }
 
 // ── 三条路径（验收判据 1）──────────────────────────────────────────────
 
 #[tokio::test]
 async fn acceptance_route_group_hit_selects_by_priority() {
-    let f = fixture();
-    seed_two_channels(&f);
+    let f = fixture().await;
+    let (cred1, _cred2) = seed_two_channels(&f);
 
     let plan = f
         .router
@@ -197,7 +218,7 @@ async fn acceptance_route_group_hit_selects_by_priority() {
     assert_eq!(plan.primary.channel_id, "c1");
     assert_eq!(plan.primary.channel_name, "DeepSeek 官方");
     assert_eq!(plan.primary.upstream_model, "deepseek-chat");
-    assert_eq!(plan.primary.credential_id.as_deref(), Some("cred1"));
+    assert_eq!(plan.primary.credential_id.as_deref(), Some(cred1.as_str()));
     // 候选链：首选在首位，其余按 priority 排序
     assert_eq!(plan.candidates.len(), 2);
     assert_eq!(plan.candidates[0].channel_id, "c1");
@@ -206,7 +227,7 @@ async fn acceptance_route_group_hit_selects_by_priority() {
 
 #[tokio::test]
 async fn acceptance_single_alias_hit() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
 
     let plan = f
@@ -223,7 +244,7 @@ async fn acceptance_single_alias_hit() {
 
 #[tokio::test]
 async fn acceptance_alias_miss_returns_available_aliases() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
 
     let err = f
@@ -253,9 +274,9 @@ async fn acceptance_alias_miss_returns_available_aliases() {
 
 #[tokio::test]
 async fn acceptance_sticky_session_pins_same_channel_for_same_client_key() {
-    let f = fixture();
-    seed_channel(&f.store, "c1", "DeepSeek 官方", "deepseek", 10, true);
-    seed_channel(&f.store, "c2", "Kimi 官方", "kimi", 20, true);
+    let f = fixture().await;
+    seed_channel(&f, "c1", "DeepSeek 官方", "deepseek", 10, true);
+    seed_channel(&f, "c2", "Kimi 官方", "kimi", 20, true);
     seed_model(&f.store, "m1", "c1", "ds-chat", "deepseek-chat");
     seed_model(&f.store, "m2", "c2", "moonshot-chat", "moonshot-v1-8k");
     seed_group(&f.store, "g1", "smart", "sticky_session");
@@ -273,7 +294,7 @@ async fn acceptance_sticky_session_pins_same_channel_for_same_client_key() {
     }
 
     // 粘性是真的"粘住"：新增一个优先级更高的候选后，原 client 仍留在原渠道
-    seed_channel(&f.store, "c3", "GLM 官方", "glm", 1, true);
+    seed_channel(&f, "c3", "GLM 官方", "glm", 1, true);
     seed_model(&f.store, "m3", "c3", "glm-chat", "glm-4-plus");
     seed_member(&f.store, "g1", "m3", 100);
 
@@ -293,7 +314,7 @@ async fn acceptance_sticky_session_pins_same_channel_for_same_client_key() {
 
 #[tokio::test]
 async fn acceptance_sticky_session_reassigns_when_pinned_channel_disabled() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
     f.store
         .with_conn(|conn| {
@@ -318,7 +339,7 @@ async fn acceptance_sticky_session_reassigns_when_pinned_channel_disabled() {
 
 #[tokio::test]
 async fn acceptance_round_robin_rotates_candidates() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
     f.store
         .with_conn(|conn| {
@@ -342,7 +363,7 @@ async fn acceptance_round_robin_rotates_candidates() {
 
 #[tokio::test]
 async fn acceptance_cost_strategy_prefers_cheapest_candidate() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
     // deepseek 贵、kimi 便宜
     seed_price(&f.store, "deepseek", "deepseek-*", 2_000_000, 8_000_000);
@@ -369,7 +390,7 @@ async fn acceptance_cost_strategy_prefers_cheapest_candidate() {
 
 #[tokio::test]
 async fn acceptance_model_alias_is_unique() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
 
     // 重复别名必须被唯一索引挡住（idx_model_alias，T1 建表时已建）
@@ -398,7 +419,7 @@ async fn acceptance_model_alias_is_unique() {
 
 #[tokio::test]
 async fn acceptance_gateway_returns_400_with_available_aliases_on_miss() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
     let key = seed_client_key(&f.store, "ck1");
 
@@ -434,7 +455,7 @@ async fn acceptance_gateway_returns_400_with_available_aliases_on_miss() {
 
 #[tokio::test]
 async fn acceptance_gateway_resolves_route_group_before_outbound() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
     let key = seed_client_key(&f.store, "ck1");
 
@@ -453,21 +474,29 @@ async fn acceptance_gateway_resolves_route_group_before_outbound() {
         .await
         .expect("请求应成功");
 
-    // 出站转发在 T6 落地 → 503，但错误体必须带出已解析到的渠道
-    assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    // 出站转发在 T6 落地；上游不可达 → 502 统一错误结构（路由已解析，channel 带出）
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("读取响应体");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("应为 JSON");
-    assert_eq!(value["error"]["type"], "api_error");
-    assert_eq!(value["error"]["channel"], "DeepSeek 官方");
+    assert_eq!(value["error"]["type"], "upstream_error");
+    // 两个候选都连不上 → 错误带出最后尝试的渠道，并列出走过的候选
+    assert_eq!(value["error"]["channel"], "Kimi 官方");
+    let retried = value["error"]["retried"]
+        .as_array()
+        .expect("应列出走过的候选");
+    assert_eq!(retried.len(), 2, "实际 {retried:?}");
     let message = value["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("deepseek-chat"), "消息应带出上游模型：{message}");
+    assert!(
+        message.contains("500"),
+        "消息应带出上游状态：{message}"
+    );
 }
 
 #[tokio::test]
 async fn acceptance_models_lists_route_group_aliases() {
-    let f = fixture();
+    let f = fixture().await;
     seed_two_channels(&f);
     let key = seed_client_key(&f.store, "ck1");
 

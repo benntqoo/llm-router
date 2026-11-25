@@ -68,6 +68,12 @@ pub struct RouteCandidate {
     pub channel_name: String,
     /// `channel.provider`
     pub provider: String,
+    /// `channel.kind`（api_key / oauth / session）
+    pub channel_kind: String,
+    /// `channel.base_url`
+    pub channel_base_url: String,
+    /// `channel.meta_json`（渠道私有参数，构造出站配置时用）
+    pub channel_meta_json: Option<String>,
     /// 上游真实模型名（R-1 用）
     pub upstream_model: String,
     /// `channel.priority`（越小越优先）
@@ -337,7 +343,8 @@ fn load_group_candidates(
     group_id: &str,
 ) -> rusqlite::Result<Vec<RouteCandidate>> {
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.channel_id, m.upstream_id, c.name, c.provider, c.priority, rm.weight
+        "SELECT m.id, m.channel_id, m.upstream_id, c.name, c.provider, c.priority, rm.weight,
+                c.kind, c.base_url, c.meta_json
          FROM route_member rm
          JOIN model m ON m.id = rm.model_id
          JOIN channel c ON c.id = m.channel_id
@@ -353,6 +360,9 @@ fn load_group_candidates(
             provider: row.get(4)?,
             channel_priority: row.get(5)?,
             weight: row.get(6)?,
+            channel_kind: row.get(7)?,
+            channel_base_url: row.get(8)?,
+            channel_meta_json: row.get(9)?,
             cost_key: None,
             credential_id: None,
         })
@@ -366,7 +376,8 @@ fn load_model_candidates(
     alias: &str,
 ) -> rusqlite::Result<Vec<RouteCandidate>> {
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.channel_id, m.upstream_id, c.name, c.provider, c.priority, 100
+        "SELECT m.id, m.channel_id, m.upstream_id, c.name, c.provider, c.priority, 100,
+                c.kind, c.base_url, c.meta_json
          FROM model m
          JOIN channel c ON c.id = m.channel_id
          WHERE m.alias = ?1 AND m.enabled = 1 AND c.enabled = 1",
@@ -380,6 +391,9 @@ fn load_model_candidates(
             provider: row.get(4)?,
             channel_priority: row.get(5)?,
             weight: row.get(6)?,
+            channel_kind: row.get(7)?,
+            channel_base_url: row.get(8)?,
+            channel_meta_json: row.get(9)?,
             cost_key: None,
             credential_id: None,
         })
@@ -572,6 +586,9 @@ mod tests {
             channel_name: format!("渠道 {channel_id}"),
             provider: "deepseek".to_string(),
             upstream_model: format!("{model_id}-upstream"),
+            channel_kind: "api_key".to_string(),
+            channel_base_url: "https://api.deepseek.com".to_string(),
+            channel_meta_json: None,
             channel_priority: priority,
             weight,
             cost_key: cost,

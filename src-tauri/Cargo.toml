@@ -37,6 +37,13 @@ base64 = "0.23"
 # client key 的 SHA-256 哈希（02 §3.1：只存哈希，不存明文）
 sha2 = "0.10"
 async-trait = "0.1.92"
+# 出站 HTTP 客户端（02 §1.3 技术选型，已锁定）
+# 不用 default-features：native-tls 需要系统 OpenSSL；rustls 纯 Rust 且本地缓存齐全。
+# 不开 http2：本地 cargo 缓存无 h2 crate，HTTP/1.1 足够各 OpenAI 兼容上游。
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+# 流式管道：Stream 组合（stream.rs 的逐帧转发与错误收尾）
+futures-util = "0.3"
+bytes = "1"
 
 # Windows DPAPI（主密钥由 OS 原生保护，绑定当前用户）
 [target.'cfg(windows)'.dependencies]
@@ -50,6 +57,8 @@ security-framework = "3"
 tempfile = "3.27.0"
 # tower::util::ServiceExt::oneshot 用于在单测里直接调用 axum Router
 tower = { version = "0.5", features = ["util"] }
+# BodyExt::frame() 用于逐帧读取流式响应（验证零缓冲与断连取消）
+http-body-util = "0.1"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

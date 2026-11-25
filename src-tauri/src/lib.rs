@@ -13,6 +13,9 @@ use std::sync::{Arc, RwLock};
 
 use tauri::Manager;
 
+use crate::gateway::circuit::CircuitBreaker;
+use crate::gateway::fallback::Forwarder;
+use crate::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use crate::gateway::ratelimit::RateLimiter;
 use crate::gateway::router::AliasRouter;
 use crate::gateway::server::{self, GatewayState};
@@ -49,14 +52,19 @@ pub fn run() {
 
             // 加密保险库：首次启动自动创建（OS 原生保护主密钥）
             let vault_path = vault::default_vault_path();
-            let vault = Vault::open(Arc::clone(&store), &vault_path, None)
-                .map_err(std::io::Error::other)?;
-            println!(
-                "[vault] 保险库 {}（主密钥 v{}{}）",
-                vault_path.display(),
-                vault.key_version(),
-                if vault.is_locked() { "，待解锁" } else { "" }
-            );
+            let vault = Arc::new(RwLock::new(
+                Vault::open(Arc::clone(&store), &vault_path, None)
+                    .map_err(std::io::Error::other)?,
+            ));
+            {
+                let guard = vault.read().unwrap_or_else(|e| e.into_inner());
+                println!(
+                    "[vault] 保险库 {}（主密钥 v{}{}）",
+                    vault_path.display(),
+                    guard.key_version(),
+                    if guard.is_locked() { "，待解锁" } else { "" }
+                );
+            }
 
             // 绑定策略（AGENT.md §5-4）：非回环地址必须已有有效 client key。
             let addr = server::resolve_bind_addr().map_err(std::io::Error::other)?;
@@ -70,10 +78,18 @@ pub fn run() {
 
             let limiter = Arc::new(RateLimiter::new());
             let router = Arc::new(AliasRouter::new(Arc::clone(&store)));
+            // 出站转发：HTTP 客户端 + 熔断器 + R-4 注入降级状态 + 保险库（凭证解密）
+            let forwarder = Arc::new(Forwarder::new(
+                OutboundClient::new().map_err(std::io::Error::other)?,
+                Arc::new(CircuitBreaker::new()),
+                Arc::new(StreamUsageDowngrades::default()),
+                Arc::clone(&vault),
+            ));
             let gateway_state = GatewayState {
                 store: Arc::clone(&store),
                 limiter: Arc::clone(&limiter),
                 router,
+                forwarder,
             };
             let router = server::router(gateway_state.clone());
 
@@ -90,7 +106,7 @@ pub fn run() {
                 gateway_addr: local_addr.to_string(),
                 gateway_base_url: format!("http://{local_addr}/v1"),
                 store: Arc::clone(&store),
-                vault: Arc::new(RwLock::new(vault)),
+                vault: Arc::clone(&vault),
                 limiter,
             });
             Ok(())
