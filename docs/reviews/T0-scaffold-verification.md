@@ -79,6 +79,8 @@ Failed to setup app: error encountered during setup hook:
 ```
 
 > 实现说明：当前策略比红线更严——client key 鉴权（T3）落地前**任何**非回环地址都拒绝启动，而不是"有 client key 才允许"。T3 完成鉴权后按红线放开。
+>
+> **T3 更新**：随 T3 接入 client key，绑定策略已按红线细化为「非回环地址 + 已存在有效 client key 才允许启动」，实测见 `docs/reviews/T3-gateway-auth-verification.md` §2.3。
 
 ## 3. 本次交付物
 
