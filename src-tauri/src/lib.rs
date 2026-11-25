@@ -5,6 +5,7 @@
 
 pub mod commands;
 pub mod gateway;
+pub mod providers;
 pub mod store;
 pub mod vault;
 
