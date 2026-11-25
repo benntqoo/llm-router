@@ -91,7 +91,6 @@ fn acceptance_each_credential_gets_unique_ciphertext() {
     let rows: Vec<(String, Vec<u8>, Vec<u8>)> = vault
         .store()
         .with_conn(|conn| {
-            use rusqlite::Row;
             let mut stmt =
                 conn.prepare("SELECT id, ciphertext, nonce FROM credential ORDER BY created_at")?;
             let mut rows = stmt.query([])?;

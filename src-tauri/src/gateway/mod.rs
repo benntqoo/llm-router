@@ -2,10 +2,12 @@
 //!
 //! T3 已包含：`server`（axum 路由与监听）、`auth`（入站鉴权）、`errors`（统一错误结构）、
 //! `ratelimit`（限流）、`inbound/openai`（入站解析）。
-//! T4/T5 起补：`router`（别名解析）、`fallback`（熔断重试）、`sse`（流式直通）。
+//! T5 已包含：`router`（别名解析与路由策略）。
+//! T6 起补：`fallback`（熔断重试）、`sse`（流式直通）、出站转发。
 
 pub mod auth;
 pub mod errors;
 pub mod inbound;
 pub mod ratelimit;
+pub mod router;
 pub mod server;

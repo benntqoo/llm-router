@@ -16,6 +16,7 @@ fn temp_state() -> (tempfile::TempDir, GatewayState) {
     let dir = tempfile::tempdir().expect("临时目录");
     let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     let state = GatewayState {
+        router: Arc::new(llm_router_lib::gateway::router::AliasRouter::new(Arc::clone(&store))),
         store,
         limiter: Arc::new(RateLimiter::new()),
     };
@@ -92,10 +93,32 @@ async fn acceptance_models_returns_empty_alias_list() {
     assert!(value["data"].as_array().expect("data 应为数组").is_empty());
 }
 
+/// 种入一个渠道 + 模型（别名 `deepseek-chat`），供路由解析命中。
+fn seed_model(state: &GatewayState) {
+    let now = llm_router_lib::vault::now_secs();
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO channel (id, name, kind, provider, base_url, enabled, priority, created_at)
+                 VALUES ('c1', 'DeepSeek 官方', 'api_key', 'deepseek', 'https://api.deepseek.com', 1, 100, ?1)",
+                rusqlite::params![now],
+            )?;
+            conn.execute(
+                "INSERT INTO model (id, channel_id, upstream_id, alias, enabled)
+                 VALUES ('m1', 'c1', 'deepseek-chat', 'deepseek-chat', 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("写入渠道与模型");
+}
+
 #[tokio::test]
 async fn acceptance_valid_key_passes_auth_and_reaches_routing_stage() {
     let (_dir, state) = temp_state();
     let key = create_client_key(&state, "e2e");
+    seed_model(&state);
     let response = server::router(state)
         .oneshot(
             Request::builder()
@@ -109,13 +132,46 @@ async fn acceptance_valid_key_passes_auth_and_reaches_routing_stage() {
         .await
         .expect("请求应成功");
 
-    // 鉴权通过；出站适配在 T4/T5 落地 → 503 + 统一错误结构
+    // 鉴权通过 → 路由解析成功 → 出站转发在 T6 落地 → 503 + 统一错误结构
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("读取响应体");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("应为 JSON");
     assert_eq!(value["error"]["type"], "api_error");
+    assert_eq!(value["error"]["channel"], "DeepSeek 官方");
+}
+
+#[tokio::test]
+async fn acceptance_unknown_alias_returns_400_with_available_aliases() {
+    // 02 §2.1 ③：别名未命中 → 400 + 可用别名列表
+    let (_dir, state) = temp_state();
+    let key = create_client_key(&state, "e2e");
+    seed_model(&state);
+    let response = server::router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::from(r#"{"model":"not-exist","messages":[]}"#))
+                .expect("构造请求"),
+        )
+        .await
+        .expect("请求应成功");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("读取响应体");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("应为 JSON");
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["code"], "model_not_found");
+    let available = value["error"]["available_models"]
+        .as_array()
+        .expect("应附可用别名列表");
+    assert_eq!(available[0], "deepseek-chat");
 }
 
 #[tokio::test]
@@ -154,6 +210,7 @@ fn seed_client_key() {
     std::fs::create_dir_all(&dir).expect("创建目录");
     let store = Arc::new(Store::open(dir.join("store.db")).expect("打开库"));
     let state = GatewayState {
+        router: Arc::new(llm_router_lib::gateway::router::AliasRouter::new(Arc::clone(&store))),
         store,
         limiter: Arc::new(RateLimiter::new()),
     };

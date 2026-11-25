@@ -48,6 +48,9 @@ pub struct ErrorBody {
     /// 渠道名。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// 可用别名列表（仅"别名未命中"时填充；02 §2.1 ③ 要求附可用别名）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_models: Option<Vec<String>>,
     /// fallback 走过的候选。
     pub retried: Vec<String>,
 }
@@ -70,6 +73,7 @@ impl GatewayError {
                 kind,
                 code: None,
                 channel: None,
+                available_models: None,
                 retried: Vec::new(),
             },
             status: None,
@@ -91,6 +95,12 @@ impl GatewayError {
     /// 附带渠道名。
     pub fn with_channel(mut self, channel: impl Into<String>) -> Self {
         self.error.channel = Some(channel.into());
+        self
+    }
+
+    /// 附上可用别名列表（别名未命中时，02 §2.1 ③ 要求响应体附可用别名）。
+    pub fn with_available_models(mut self, models: Vec<String>) -> Self {
+        self.error.available_models = Some(models);
         self
     }
 

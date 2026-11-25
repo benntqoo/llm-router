@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use tauri::Manager;
 
 use crate::gateway::ratelimit::RateLimiter;
+use crate::gateway::router::AliasRouter;
 use crate::gateway::server::{self, GatewayState};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -68,9 +69,11 @@ pub fn run() {
             let local_addr = listener.local_addr().map_err(std::io::Error::other)?;
 
             let limiter = Arc::new(RateLimiter::new());
+            let router = Arc::new(AliasRouter::new(Arc::clone(&store)));
             let gateway_state = GatewayState {
                 store: Arc::clone(&store),
                 limiter: Arc::clone(&limiter),
+                router,
             };
             let router = server::router(gateway_state.clone());
 

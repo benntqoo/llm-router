@@ -21,6 +21,7 @@ use crate::gateway::auth::{self, AuthenticatedClient};
 use crate::gateway::errors::GatewayError;
 use crate::gateway::inbound::openai::{parse_chat_request, ModelEntry, ModelList};
 use crate::gateway::ratelimit::RateLimiter;
+use crate::gateway::router::{AliasRouter, RouteError};
 use crate::store::Store;
 
 /// 网关默认监听地址。
@@ -36,6 +37,8 @@ pub struct GatewayState {
     pub store: Arc<Store>,
     /// 限流器。
     pub limiter: Arc<RateLimiter>,
+    /// 路由器（别名解析 + 路由策略；持有 sticky / round_robin 内存状态）。
+    pub router: Arc<AliasRouter>,
 }
 
 impl fmt::Debug for GatewayState {
@@ -90,8 +93,8 @@ async fn healthz() -> Json<HealthPayload> {
 
 /// `POST /v1/chat/completions`
 ///
-/// 当前阶段（T3）完成：Host 校验 → client key 鉴权 → 限流 → body 解析。
-/// 路由与出站适配在 T4/T5 接入，未实现时返回 503 + 统一错误结构。
+/// 当前阶段（T5）完成：Host 校验 → client key 鉴权 → 限流 → body 解析 → **路由解析**。
+/// 出站转发（reqwest + SSE 直通）在 T6 接入；未接入时返回 503 + 统一错误结构。
 async fn chat_completions(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -105,13 +108,45 @@ async fn chat_completions(
         .map_err(|e| GatewayError::invalid_request(format!("请求体不是合法 JSON: {e}")))?;
     let request = parse_chat_request(value)?;
 
+    // ②→③ 路由解析（02 §2.1 ③）
+    let plan = state
+        .router
+        .resolve(&client.id, &request.model)
+        .await
+        .map_err(route_error_to_gateway)?;
+
+    // 出站转发在 T6 落地；本阶段止步于"已解析出路由目标"，不做假响应。
     Err(GatewayError::not_implemented(format!(
-        "网关出站尚未接入：别名 {:?} 的路由与上游适配在 T4/T5 落地",
-        request.model
-    )))
+        "路由已解析：别名 {:?} → 渠道 {:?}（上游模型 {:?}，策略 {:?}）；出站转发在 T6 落地",
+        plan.alias,
+        plan.primary.channel_name,
+        plan.primary.upstream_model,
+        plan.strategy.as_str()
+    ))
+    .with_channel(plan.primary.channel_name.clone()))
+}
+
+/// 路由错误 → 统一错误结构。
+fn route_error_to_gateway(err: RouteError) -> GatewayError {
+    match err {
+        RouteError::AliasNotFound { alias, available } => GatewayError::invalid_request(format!(
+            "未知的模型别名 {alias:?}：既没有匹配的 model.alias，也没有匹配的 route_group.alias"
+        ))
+        .with_code("model_not_found")
+        .with_available_models(available),
+        RouteError::NoCandidate { alias, reason } => {
+            GatewayError::invalid_request(format!("别名 {alias:?} 没有可用候选：{reason}"))
+        }
+        RouteError::Internal(message) => GatewayError::new(
+            crate::gateway::errors::ErrorKind::ApiError,
+            format!("路由查询失败: {message}"),
+        ),
+    }
 }
 
 /// `GET /v1/models`：返回模型别名列表。
+///
+/// 别名 = `model.alias`（单别名）∪ `route_group.alias`（路由组对外名）。
 async fn list_models(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -124,9 +159,14 @@ async fn list_models(
         .store
         .with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT m.alias, c.name FROM model m
-                 JOIN channel c ON c.id = m.channel_id
-                 WHERE m.enabled = 1 ORDER BY m.alias",
+                "SELECT alias, owned_by FROM (
+                     SELECT m.alias AS alias, c.name AS owned_by
+                     FROM model m JOIN channel c ON c.id = m.channel_id
+                     WHERE m.enabled = 1 AND c.enabled = 1
+                     UNION
+                     SELECT rg.alias AS alias, 'route_group' AS owned_by
+                     FROM route_group rg
+                 ) ORDER BY alias",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(ModelEntry {
@@ -228,6 +268,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("临时目录");
         let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
         let state = GatewayState {
+            router: Arc::new(AliasRouter::new(Arc::clone(&store))),
             store,
             limiter: Arc::new(RateLimiter::new()),
         };
@@ -301,21 +342,73 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// 种入一个渠道 + 模型（别名 `deepseek-chat`）。
+    fn seed_model(state: &GatewayState) {
+        let now = crate::vault::now_secs();
+        state
+            .store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO channel (id, name, kind, provider, base_url, enabled, priority, created_at)
+                     VALUES ('c1', 'DeepSeek 官方', 'api_key', 'deepseek', 'https://api.deepseek.com', 1, 100, ?1)",
+                    rusqlite::params![now],
+                )?;
+                conn.execute(
+                    "INSERT INTO model (id, channel_id, upstream_id, alias, enabled)
+                     VALUES ('m1', 'c1', 'deepseek-chat', 'deepseek-chat', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("写入渠道与模型");
+    }
+
     #[tokio::test]
     async fn chat_completions_with_valid_key_passes_auth() {
         let (_dir, state) = temp_state();
         let key = create_client_key(&state);
+        seed_model(&state);
         let response = router(state)
             .oneshot(chat_request(Some(&key)))
             .await
             .expect("请求应成功");
-        // 鉴权通过，进入路由阶段（T3 尚未接入 → 503 + 统一结构）
+        // 鉴权通过 → 路由解析成功 → 出站转发在 T6 落地（503 + 统一结构）
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("读取响应体");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("应为 JSON");
         assert_eq!(value["error"]["type"], "api_error");
+        assert_eq!(value["error"]["channel"], "DeepSeek 官方");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_with_unknown_alias_returns_400_with_available_aliases() {
+        // 02 §2.1 ③：别名未命中 → 400，响应体附可用别名列表
+        let (_dir, state) = temp_state();
+        let key = create_client_key(&state);
+        seed_model(&state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("host", "127.0.0.1:8787")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::from(r#"{"model":"not-exist","messages":[]}"#))
+            .expect("构造请求");
+
+        let response = router(state).oneshot(request).await.expect("请求应成功");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("读取响应体");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("应为 JSON");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["code"], "model_not_found");
+        let available = value["error"]["available_models"]
+            .as_array()
+            .expect("应附可用别名列表");
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0], "deepseek-chat");
     }
 
     #[tokio::test]
