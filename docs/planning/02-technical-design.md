@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.3（变更记录见 §13） |
+| 版本 | v0.4（变更记录见 §13） |
 | 日期 | 2026-11-26 |
 | 上游文档 | `01-architecture-and-feasibility.md`（可行性基线与竞品调研） |
 | 状态 | 待评审后进入开发。**本文档未改动任何代码或配置**。 |
@@ -198,6 +198,10 @@ harness (pi 等)
 只持久化 open / half_open；**未达阈值的连续失败计数只存内存**（重启清零）。落库失败只记日志，不影响请求（熔断状态丢失只是重新计数）。
 
 **UI 展示**：应用内展示当前处于熔断/冷却的 `(channel, upstream_model)`：状态、原因（连续失败 / 上游限流）、剩余秒数（IPC 命令 `circuit_status`）。
+
+**熔断时长可配置**（2026-11-26 头头裁决）：连续失败触发的 open 持续时长默认 **60s**，用户可在应用内调整，**最小单位 1 秒**。设置存 `app_setting` 表（键 `circuit_open_secs`），启动时读回，改动**立即生效**（作用于之后新打开的熔断，不追溯修改已在冷却中的熔断）。429 的冷却时长**不由该设置决定**——它跟着上游的 `Retry-After` 走（指数退避只作为下限）。
+
+**手动解除熔断**：UI 每条熔断记录带"解除"按钮，调用 `circuit_reset`——清掉内存状态并删除落库行（重启也不会复活）。适用场景：上游已恢复、但用户不想等冷却窗口自然到期（最长 60s）。
 
 ---
 
@@ -495,6 +499,9 @@ pub trait ProviderAdapter: Send + Sync {
 --   主键 (channel_id, upstream_model) 与熔断粒度一致
 --   state: open | half_open；reason: failures | rate_limit
 --   open_until: 冷却截止（Unix 秒）；failures / rate_limit_hits 供 UI 展示
+
+-- app_setting：应用级设置（键值对；02 §2.3 熔断时长等）
+--   当前取值：circuit_open_secs = 连续失败熔断时长（秒，默认 60，最小 1）
 ```
 
 其余表结构沿用 01 文档，不重复。
@@ -566,3 +573,4 @@ pub trait ProviderAdapter: Send + Sync {
 | v0.1 | 2026-11-25 | 初稿 |
 | v0.2 | 2026-11-25 | 依据 FreeLLMAPI 调研（`docs/reviews/freellmapi-analysis.md`，头头批准路线 B）：P-7 X-Routed-Via 响应头；§8 限额自学习；route_group 增加 sticky_session 策略（DDL 注释同步 01 文档）；§0.2 补非目标"一键配置 harness 向导" |
 | v0.3 | 2026-11-26 | 头头裁决两项：① 限流冷却期内回 **429 + `Retry-After`**（§4.4 回填，错误体字段表不变）；② 熔断状态由"只存内存、重启清零"改为**落库 + 重启恢复**（§2.3），新增 `circuit_state` 表（§9）与 UI 展示 |
+| v0.4 | 2026-11-26 | 头头裁决：③ 熔断**时长可配置**（默认 60s、最小单位 1s、存 `app_setting` 表，§2.3/§9）；④ UI 增加**手动解除熔断**（`circuit_reset`，§2.3） |

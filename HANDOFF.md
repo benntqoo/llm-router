@@ -115,11 +115,12 @@
 | ✅ | T5 路由与别名（别名解析 + priority/round_robin/cost/sticky_session 四策略 + 未命中附可用别名 + fallback 候选链） | 提交 `eb3fddd`；留档 `docs/reviews/T5-routing-alias-verification.md` |
 | ✅ | T6 流式管道 + fallback + 熔断（reqwest 出站转发 + SSE 零缓冲直通 + 首字节前重试 + 断连 abort 上游 + 熔断状态机 + 429 冷却 + P-3/P-4/P-7） | 提交 `ad50996`；留档 `docs/reviews/T6-stream-fallback-circuit-verification.md` |
 | ✅ | T6 追加：熔断状态**落库 + 重启恢复**（`circuit_state` 表，schema v5）+ UI 展示（`circuit_status`）+ 限流冷却期回 429 + `Retry-After` | 头头 2026-11-26 裁决；留档 `docs/reviews/T6-circuit-persistence-verification.md`；提案 `docs/reviews/proposal-circuit-persistence.md` |
+| ✅ | T6 追加二：熔断**时长可配置**（默认 60s / 最小 1s，`app_setting` 表，schema v6）+ **手动解除熔断**（`circuit_reset`） | 头头 2026-11-26 裁决；同上留档 §2.5 |
 | 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6，待头头裁决 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 02 §6.1 标题写"8 profile"但表体只有 7 行（03 T8 写"7 个 profile"） | T4 已按 7 个落地；是否回填标题待裁决，见 `docs/reviews/T4-outbound-adapter-verification.md` §6 |
 | 🔴 | 统一错误体新增 `available_models` 字段是否回填 02 §4.4 | 02 §2.1 ③ 要求"响应体附可用别名"，§4.4 字段表未列；已按可选字段实现，见 `docs/reviews/T5-routing-alias-verification.md` §6 |
-| 🔴 | **手动解除熔断**入口（UI 按钮） | 熔断只存"当前状态"，最长 60s 自然到期；手动解除属 T9 UI 第一轮范围，是否要做待裁决 |
+| 🔴 | **429 冷却时长是否也给用户一个上限旋钮** | 刻意不做：429 冷却跟随上游 `Retry-After`（02 §4.4），用同一旋钮覆盖会破坏"遵守 Retry-After"口径；若头头要，另走提案 |
 | 🔴 | 分支命名：仓库实为 `master` + `origin/master`，AGENT.md §8 要求 `main` + `dev`（已建 `dev`） | 待头头裁决是否重命名 `master` → `main` |
 | 🔴 | T18 签到站点清单待指定 | `docs/planning/03-delivery-plan.md` §2 T18 |
 | ⏳ | HANDOFF §5 五项未验证项 | 验证方法见 §5；命中对应任务前必须先实测再实现 |

@@ -2,12 +2,12 @@
 
 | 项 | 值 |
 |---|---|
-| 任务 | T6 追加项（头头 2026-11-26 裁决 T6 留档 §6 的两条待裁决） |
+| 任务 | T6 追加项（头头 2026-11-26 裁决 T6 留档 §6 的两条待裁决 + 追加两项） |
 | 依据 | `docs/reviews/proposal-circuit-persistence.md`（提案与裁决）；02 §2.3 / §4.4 / §9 |
 | 验收日期 | 2026-11-26 |
 | 执行 | MiniMax Code（开发 agent） |
 | 分支 | `dev` |
-| 代码提交 | `a3809a2` |
+| 代码提交 | `a3809a2`（落库 + UI）、`56ecca9`（时长可配置 + 手动解除） |
 | 结论 | **通过**（判据逐条实测见 §1） |
 
 ## 1. 判据对照
@@ -21,6 +21,8 @@
 | 5 | 未达阈值的失败**不落库** | ✅ | §2.2 单测 + §2.3 真机（前 2 次失败时表为空） |
 | 6 | 迁移 v5 可升可降 | ✅ | §2.2（迁移 up/down 断言） |
 | 7 | 限流冷却期回 **429 + `Retry-After`**（口径回填 02 §4.4） | ✅ | T6 主留档 §2.4 已实测；本次补文档回填 |
+| 8 | **手动解除熔断**（UI 按钮 → 清内存 + 删落库行） | ✅ | §2.5 真机：点一次按钮，落库行即被删除，后续请求重新打到上游 |
+| 9 | **熔断时长可配置**（默认 60s / 最小 1s / 秒级） | ✅ | §2.5 真机：UI 改 30 秒 → 落库 → 立即生效（新熔断只剩 29s 而非 60s） |
 
 ## 2. 实测记录
 
@@ -101,18 +103,68 @@ DeepSeek 官方 · deepseek-v3 · 熔断中 · 连续失败 · 剩余 55s · 连
 
 同一张截图里还能看到：网关状态（运行中 / `127.0.0.1:8787`）、当前范围（T0–T6 已完成）、加密保险库（`llmr-t6p-verify` 独立库、1 条凭证）、Client Key 面板。
 
+### 2.5 手动解除 + 熔断时长设置（真机点击验证）
+
+UI 面板（`docs/reviews/app-ui-circuit-settings.png`）：
+
+![熔断状态与熔断设置](app-ui-circuit-settings.png)
+
+**手动解除**（真的用鼠标点了一次按钮）：
+
+```
+=== 点击前 circuit_state ===
+[('ch_baeb...', 'deepseek-v3', 'open', 'failures', 3)]
+CLICKED 1584,1094          # 「解除」按钮的屏幕坐标
+=== 点击后 circuit_state ===
+[]                          # 落库行被删除
+```
+
+界面随即显示绿色提示"已解除 DeepSeek 官方 / deepseek-v3 的熔断"，列表变为"当前没有渠道处于熔断或冷却中"；随后发一次请求，报错从"没有可用候选：全部候选被跳过或熔断中"变成"连接上游失败: …"——**说明请求重新打到了上游，熔断确实被解除了**。
+
+**熔断时长设置**（UI 输入框改成 30 秒并点"保存时长"）：
+
+```
+=== app_setting ===
+[('circuit_open_secs', '30', 1795627768)]     # 已落库
+```
+
+随后连续 3 次失败触发新熔断：
+
+```
+circuit_state: [('open', 'failures', 3, 1795627811)]
+now= 1795627782 → 剩余秒数= 29              # 30s 生效（默认应为 60s）
+```
+
+界面显示"当前生效：30 秒"与绿色提示"熔断时长已设为 30 秒（对之后新打开的熔断生效）"。
+
+### 2.6 新增用例（时长与解除）
+
+| 层 | 用例 | 断言要点 |
+|---|---|---|
+| 单测 | `open_duration_is_configurable` | 默认 60s；改成 120s 后新熔断的 `open_until = now+120` |
+| 单测 | `open_duration_is_clamped_to_one_second` | 0 与负值都钳到 1 秒（最小单位 1 秒） |
+| 单测 | `changing_duration_does_not_retroactively_change_open_circuits` | 已在冷却中的熔断不被新设置追溯修改 |
+| 单测 | `settings_default_to_sixty_seconds` | 未设置时返回默认 60 |
+| 单测 | `settings_are_persisted_and_applied_immediately` | 写设置 → 落库 + 运行时立即生效 → 再读一致 |
+| 单测 | `settings_below_one_second_are_clamped` | 0 / -5 → 1 |
+| 单测 | `manual_reset_clears_circuit_and_its_row` | 手动解除 → 列表清空 + `circuit_state` 行数归零 |
+| 单测 | `manual_reset_on_healthy_circuit_reports_nothing_to_clear` | 健康渠道调用返回 false |
+| 单测 | `setting_round_trip` / `setting_is_overwritten_not_duplicated` / `invalid_integer_falls_back_to_none` | `app_setting` 读写与覆盖 |
+| 迁移 | `migrate_down_to_rolls_back_partially` | 回滚版本 6/5/4/3；`app_setting` 表随 v6 一并回滚 |
+
 ## 3. 本次交付物
 
 | 路径 | 说明 |
 |---|---|
-| `src-tauri/src/store/schema.rs` | `CIRCUIT_STATE_DDL` + `ALL_TABLES` 增项（DDL 唯一权威载体） |
-| `src-tauri/src/store/migrations.rs` | v5 迁移 `circuit_state`（up 建表 / down 删表） |
-| `src-tauri/src/gateway/circuit.rs` | `CircuitSnapshot` / `CircuitStateKind` / `OpenReason`（字符串互转）、`CircuitPersistence` trait、`NoopPersistence`、写穿 + 启动恢复、`active_snapshots` |
+| `src-tauri/src/store/schema.rs` | `CIRCUIT_STATE_DDL`、`APP_SETTING_DDL` + `ALL_TABLES` 增项（DDL 唯一权威载体） |
+| `src-tauri/src/store/migrations.rs` | v5 `circuit_state`、v6 `app_setting` 迁移（均可 up 可 down） |
+| `src-tauri/src/store/settings.rs` | 应用级设置读写（键值对；`circuit_open_secs`） |
+| `src-tauri/src/gateway/circuit.rs` | `CircuitSnapshot` / `CircuitStateKind` / `OpenReason`（字符串互转）、`CircuitPersistence` trait、`NoopPersistence`、写穿 + 启动恢复、`active_snapshots`、**熔断时长运行期可调**（`set_open_duration_secs`） |
 | `src-tauri/src/gateway/circuit_store.rs` | 基于 `Store` 的持久化实现（upsert / delete / load_all），落库失败只记日志 |
 | `src-tauri/src/gateway/fallback.rs` | `circuit_key` 迁到 `circuit.rs`（单一来源），此处改为 re-export |
-| `src-tauri/src/commands/circuit.rs` | `circuit_status` IPC（拆出可测的 `circuit_status_of`） |
-| `src-tauri/src/lib.rs` | 构造带持久化的熔断器；`AppState` 增加 `circuit` 字段 |
-| `src/CircuitPanel.tsx` | 熔断状态面板（5s 自动刷新 + 手动刷新） |
+| `src-tauri/src/commands/circuit.rs` | `circuit_status` IPC（拆出可测的 `circuit_status_of`）+ **`circuit_settings_get` / `circuit_settings_set` / `circuit_reset`** |
+| `src-tauri/src/lib.rs` | 构造带持久化的熔断器；`AppState` 增加 `circuit` 字段；**启动读回落库的熔断时长**；注册新 IPC |
+| `src/CircuitPanel.tsx` | 熔断状态面板（5s 自动刷新 + 手动刷新）+ **每条记录的「解除」按钮** + **「熔断设置」（秒级输入 + 保存）** |
 | `src/App.tsx` | 挂载 `<CircuitPanel />`；范围说明更新到 T6 |
 | `src-tauri/tests/stream_e2e.rs` | 2 个新增 e2e（落库 + 重启恢复 + 恢复后清理） |
 | `docs/planning/02-technical-design.md` | §2.3 持久化口径、§4.4 429/`Retry-After` 回填、§9 `circuit_state` DDL、§13 → v0.3 |
@@ -132,12 +184,15 @@ DeepSeek 官方 · deepseek-v3 · 熔断中 · 连续失败 · 剩余 55s · 连
 | **落库失败只记日志，不影响请求** | 熔断状态丢失只是重新计数，不能让请求失败 |
 | **UI 读运行中的熔断器（不查库）** | 库是持久化副本，运行时真相在内存；查库会滞后 |
 | **重启恢复的语义** | 恢复的是"冷却截止时间"，不是"重新计时"——重启不会延长冷却，也不会绕过它 |
-| 手动解除熔断 | **未实现**（本次裁决只要求展示）；当前只能等冷却窗口自然到期（最长 60s）。属 T9 UI 第一轮范围 |
-| 熔断历史趋势 | **未做**（只存当前状态，不存历史）；要做历史需另立表，属 T13 用量统计范围 |
+| 手动解除熔断 | **已实现**（§2.5）：`circuit_reset` 清内存状态 + 删落库行（重启不复活）；按 `(channel, upstream_model)` 粒度，不做"一键全解" |
+| 熔断时长 | **可配置**（§2.5）：默认 60s、最小 1 秒，存 `app_setting` 表；立即生效但**不追溯**已在冷却中的熔断 |
+| 429 冷却时长 | **不可配**：跟随上游 `Retry-After`（指数退避只作下限）。用同一个旋钮覆盖它会破坏"遵守 Retry-After"口径（02 §4.4） |
+| 熔断历史的趋势视图 | **未做**（只存当前状态，不存历史）；要做历史需另立表，属 T13 用量统计范围 |
 | 账号级熔断 | 粒度仍是 `(channel_id, upstream_model)`，不是 `(channel, account)`——账号池尚未落地（T8/T9） |
 
 ## 5. 未做
 
-- 手动解除熔断按钮、熔断历史的趋势视图 —— T9 / T13
+- 熔断历史的趋势视图、解除操作的审计记录 —— T7 / T13
 - 账号级（多凭证）熔断粒度 —— T8/T9 账号池落地后
 - 熔断状态的跨设备同步（v1 纯本地，不做云同步）—— 02 §12
+- 429 冷却时长的用户可配上限 —— 有意不做（见 §4）；若要，需另走提案

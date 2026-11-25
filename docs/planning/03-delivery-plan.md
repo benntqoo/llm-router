@@ -65,7 +65,7 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 **T6 流式管道 + fallback + 熔断** `3d` · 依赖 T4 T5
 - 目标：SSE 零缓冲直通、首字节前重试、客户端断连 abort 上游、熔断状态机、P-4 学习式兼容、P-7 `X-Routed-Via` 响应头注入、429 响应 `Retry-After`/`x-ratelimit-*` 解析进冷却参数。
 - 验收：mock 上游可复现"首字节后失败不重试""断连取消上游""3 连败熔断""429 冷却时长遵循 Retry-After"四个场景（用内存 mock server 测试）。
-- 追加（2026-11-26 头头裁决）：熔断状态**落库 + 重启恢复**（新增 `circuit_state` 表，02 §2.3/§9）+ 应用内 UI 展示（`circuit_status`）；限流冷却期内回 **429 + `Retry-After`**（02 §4.4）。
+- 追加（2026-11-26 头头裁决）：熔断状态**落库 + 重启恢复**（新增 `circuit_state` 表，02 §2.3/§9）+ 应用内 UI 展示（`circuit_status`）；限流冷却期内回 **429 + `Retry-After`**（02 §4.4）；熔断**时长可配置**（默认 60s、最小 1s，新增 `app_setting` 表）+ **手动解除熔断**。
 
 **T7 usage 采集** `1.5d` · 依赖 T6
 - 目标：tee 解析 usage 帧、R-4 注入、estimated 估算入口（估算器本身在 T12）、`usage_log` 落库、per `(channel, account)` 的 RPM/RPD/TPM/TPD 计数与 `quota_json` 回写（限额自学习，02 §8）。
