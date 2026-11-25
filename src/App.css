@@ -103,3 +103,120 @@ code {
   color: #e0605e;
   font-size: 14px;
 }
+
+.ok {
+  color: #4caf7d;
+  font-size: 14px;
+}
+
+.card h3 {
+  margin: 18px 0 8px;
+  font-size: 14px;
+  color: #9aa0a6;
+  font-weight: 600;
+}
+
+.row-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0;
+}
+
+.row-inline input[type="text"],
+.row-inline input[type="password"],
+.row-inline input:not([type]) {
+  background: #14161b;
+  border: 1px solid #2c303a;
+  border-radius: 6px;
+  color: #e8eaed;
+  padding: 6px 10px;
+  font-size: 13px;
+  min-width: 180px;
+}
+
+.card button {
+  background: #262a33;
+  border: 1px solid #39404d;
+  border-radius: 6px;
+  color: #e8eaed;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.card button:hover {
+  border-color: #4caf7d;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #9aa0a6;
+}
+
+.cred-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cred-list li {
+  background: #14161b;
+  border: 1px solid #2c303a;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.cred-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.cred-meta {
+  font-size: 13px;
+  color: #9aa0a6;
+}
+
+.cred-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.cred-secret {
+  margin-top: 8px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+  color: #e8eaed;
+  word-break: break-all;
+}
+
+.cred-secret em {
+  color: #9aa0a6;
+  font-style: normal;
+  margin-left: 8px;
+}
+
+.export-plain {
+  margin-top: 10px;
+}
+
+.export-plain pre {
+  background: #14161b;
+  border: 1px solid #2c303a;
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 12px;
+  max-height: 240px;
+  overflow: auto;
+  word-break: break-all;
+}

@@ -128,6 +128,14 @@ impl Store {
         Arc::clone(&self.conn)
     }
 
+    /// 在锁保护下执行一段数据库操作。
+    ///
+    /// 注意：`Mutex` 不可重入，闭包里不要再调用本类型的方法。
+    pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let guard = self.lock();
+        f(&guard)
+    }
+
     /// 库文件路径。
     pub fn path(&self) -> &Path {
         &self.path

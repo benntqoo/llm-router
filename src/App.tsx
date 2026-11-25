@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import VaultPanel from "./VaultPanel";
 import "./App.css";
 
 type GatewayStatus = {
@@ -58,6 +59,8 @@ function App() {
           后续里程碑：T1 数据层 → T2 加密保险库 → T3 入站鉴权 → T4/T5 出站与路由 → T6 流式管道
         </p>
       </section>
+
+      <VaultPanel />
     </main>
   );
 }

@@ -7,13 +7,15 @@
 pub mod commands;
 pub mod gateway;
 pub mod store;
+pub mod vault;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tauri::Manager;
 
 use crate::gateway::server;
 use crate::store::Store;
+use crate::vault::Vault;
 
 /// 应用级共享状态。后续任务（渠道/保险库/用量）在此扩展。
 #[derive(Clone, Debug)]
@@ -24,6 +26,8 @@ pub struct AppState {
     pub gateway_base_url: String,
     /// 数据层句柄（SQLite + 迁移）
     pub store: Arc<Store>,
+    /// 加密保险库（写锁用于主密钥轮换与解锁）
+    pub vault: Arc<RwLock<Vault>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -56,14 +60,39 @@ pub fn run() {
                 store.version().map_err(std::io::Error::other)?
             );
 
+            // 加密保险库：首次启动自动创建（OS 原生保护主密钥）
+            let vault_path = vault::default_vault_path();
+            let vault = Vault::open(Arc::new(store.clone()), &vault_path, None)
+                .map_err(std::io::Error::other)?;
+            println!(
+                "[vault] 保险库 {}（主密钥 v{}{}）",
+                vault_path.display(),
+                vault.key_version(),
+                if vault.is_locked() { "，待解锁" } else { "" }
+            );
+
             app.manage(AppState {
                 gateway_addr: local_addr.to_string(),
                 gateway_base_url: format!("http://{local_addr}/v1"),
                 store: Arc::new(store),
+                vault: Arc::new(RwLock::new(vault)),
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![commands::gateway::gateway_status])
+        .invoke_handler(tauri::generate_handler![
+            commands::gateway::gateway_status,
+            commands::vault::vault_status,
+            commands::vault::vault_put_secret,
+            commands::vault::vault_reveal_secret,
+            commands::vault::vault_list_secrets,
+            commands::vault::vault_delete_secret,
+            commands::vault::vault_rotate_master_key,
+            commands::vault::vault_unlock,
+            commands::vault::vault_enable_password_mode,
+            commands::vault::vault_disable_password_mode,
+            commands::vault::vault_export_plaintext,
+            commands::vault::vault_export_encrypted_backup,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

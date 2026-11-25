@@ -3,3 +3,4 @@
 //! T0 只有 `gateway` 一个域。
 
 pub mod gateway;
+pub mod vault;

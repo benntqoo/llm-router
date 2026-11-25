@@ -23,6 +23,26 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 thiserror = "2.0.21"
 
+# ── 加密保险库（02 §5）──
+# AES-256-GCM：加密每条凭据（RustCrypto）
+aes-gcm = "0.10"
+# Argon2id：可选的主密码模式派生 KEK
+argon2 = "0.5"
+# 敏感内存零化
+zeroize = { version = "1.9.2", features = ["derive"] }
+# 随机数（主密钥 / nonce）
+rand = "0.9"
+# vault.bin 字段的 base64 编解码
+base64 = "0.23"
+
+# Windows DPAPI（主密钥由 OS 原生保护，绑定当前用户）
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+# macOS Keychain（主密钥由 OS 原生保护）
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 # tower::util::ServiceExt::oneshot 用于在单测里直接调用 axum Router
