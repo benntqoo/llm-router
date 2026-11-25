@@ -1,1 +1,31 @@
-.workbuddy
+# ── 敏感数据（AGENT.md §8 硬要求：以下路径一律禁止提交）──
+vault.bin
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-*
+.env
+.env.*
+!.env.example
+logs/
+*.log
+
+# ── 构建产物 ──
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# ── 编辑器 / 系统 ──
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── agent 工作日志（HANDOFF §3：本地留存，不入库）──
+.workbuddy/
