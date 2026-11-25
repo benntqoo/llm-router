@@ -18,6 +18,7 @@ use axum::Router;
 use http_body_util::BodyExt;
 use llm_router_lib::gateway::auth;
 use llm_router_lib::gateway::circuit::CircuitBreaker;
+use llm_router_lib::gateway::circuit_store::StoreCircuitPersistence;
 use llm_router_lib::gateway::fallback::{circuit_key, Forwarder};
 use llm_router_lib::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use llm_router_lib::gateway::ratelimit::RateLimiter;
@@ -240,9 +241,12 @@ fn fixture() -> Fixture {
         Vault::open(Arc::clone(&store), dir.path().join("vault.bin"), None)
             .expect("打开保险库"),
     ));
+    // 与生产同款：熔断器带落库（写穿 + 启动恢复）
     let forwarder = Arc::new(Forwarder::new(
         OutboundClient::new().expect("出站客户端"),
-        Arc::new(CircuitBreaker::new()),
+        Arc::new(CircuitBreaker::with_persistence(Arc::new(
+            StoreCircuitPersistence::new(Arc::clone(&store)),
+        ))),
         Arc::new(StreamUsageDowngrades::default()),
         Arc::clone(&vault),
     ));
@@ -691,7 +695,6 @@ async fn acceptance_fallback_switches_candidate_before_first_byte() {
 }
 
 // ── 附加验收：上游 401 不重试（不可重试类） ───────────────────────────
-
 #[tokio::test]
 async fn acceptance_unauthorized_is_not_retried() {
     let (base, mock) = start_mock().await;
@@ -709,5 +712,99 @@ async fn acceptance_unauthorized_is_not_retried() {
         mock.ok_hits.load(Ordering::SeqCst),
         0,
         "不可重试错误不得切换候选"
+    );
+}
+
+// ── 附加验收：熔断状态落库 + 重启恢复 + 回到正常即清理 ──────────────────
+
+/// 读取 `circuit_state` 表的全部行。
+fn circuit_rows(store: &Store) -> Vec<(String, String, String, Option<String>)> {
+    store
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT channel_id, upstream_model, state, reason FROM circuit_state ORDER BY channel_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .expect("读取 circuit_state")
+}
+
+#[tokio::test]
+async fn acceptance_circuit_state_is_persisted_and_survives_restart() {
+    let (base, mock) = start_mock().await;
+    let f = fixture();
+    seed_channel(&f, "c1", "故障渠道", "fail500", &base, 10);
+
+    // 前 2 次失败：未达阈值 → 不落库
+    for _ in 0..2 {
+        let response = chat(&f, "c1", false).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+    assert!(
+        circuit_rows(&f.store).is_empty(),
+        "未达熔断阈值时不应有落库行"
+    );
+
+    // 第 3 次失败 → 熔断打开 → 写穿落库
+    let response = chat(&f, "c1", false).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let rows = circuit_rows(&f.store);
+    assert_eq!(rows.len(), 1, "熔断打开应落库 1 行：{rows:?}");
+    assert_eq!(rows[0].0, "c1");
+    assert_eq!(rows[0].1, "deepseek-chat");
+    assert_eq!(rows[0].2, "open");
+    assert_eq!(rows[0].3.as_deref(), Some("failures"));
+
+    // 模拟重启：新建熔断器（读同一个库）→ 状态应恢复，仍在拦截
+    let restarted = CircuitBreaker::with_persistence(Arc::new(StoreCircuitPersistence::new(
+        Arc::clone(&f.store),
+    )));
+    let key = circuit_key("c1", "deepseek-chat");
+    assert!(
+        !restarted.allow(&key),
+        "重启后熔断必须继续生效（不能再打上游）"
+    );
+    let before_restart = mock.fail500_hits.load(Ordering::SeqCst);
+    let response = chat(&f, "c1", false).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        mock.fail500_hits.load(Ordering::SeqCst),
+        before_restart,
+        "熔断中不得再打上游"
+    );
+}
+
+#[tokio::test]
+async fn acceptance_circuit_row_is_removed_after_recovery() {
+    let (base, _mock) = start_mock().await;
+    let f = fixture();
+    seed_channel(&f, "c1", "故障渠道", "fail500", &base, 10);
+
+    for _ in 0..3 {
+        let _ = chat(&f, "c1", false).await;
+    }
+    assert_eq!(circuit_rows(&f.store).len(), 1, "熔断应已落库");
+
+    // 模拟一次成功（half_open 探测成功）→ 回到 closed → 落库行应被删除
+    let key = circuit_key("c1", "deepseek-chat");
+    f.state
+        .forwarder
+        .circuit
+        .on_success(&key);
+    assert!(
+        circuit_rows(&f.store).is_empty(),
+        "回到 closed 后落库行应被清理"
     );
 }

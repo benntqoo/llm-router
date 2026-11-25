@@ -11,7 +11,9 @@
 //! 429 走另一条冷却通道：**指数退避**（基数 2s，逐次翻倍，上限 60s），
 //! 且**遵守上游的 `Retry-After`**（取两者较大值）。
 //!
-//! 状态**只存内存**，重启即清零（02 §2.3：不持久化，避免误伤）。
+//! **持久化**：非 closed 的熔断状态写穿到 `circuit_state` 表（状态变化即落库），
+//! **重启后恢复**——重启清零会让限流保护被绕过（重启网关就能立刻重试被 429 的上游）。
+//! 冷却窗口本身很短（失败熔断 60s、429 冷却上限 60s），持久化不会造成长期误伤。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,6 +28,19 @@ pub const RATE_LIMIT_BASE_SECS: i64 = 2;
 /// 429 冷却上限（秒）。
 pub const RATE_LIMIT_MAX_SECS: i64 = 60;
 
+/// 熔断粒度键中 `channel_id` 与 `upstream_model` 的分隔符。
+pub const KEY_SEPARATOR: char = '\u{1}';
+
+/// 拼装熔断粒度键（`(channel_id, upstream_model)`）。
+pub fn circuit_key(channel_id: &str, upstream_model: &str) -> String {
+    format!("{channel_id}{KEY_SEPARATOR}{upstream_model}")
+}
+
+/// 拆分熔断粒度键。
+fn split_key(key: &str) -> Option<(&str, &str)> {
+    key.split_once(KEY_SEPARATOR)
+}
+
 /// 熔断状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
@@ -37,6 +52,38 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+/// 熔断状态种类（落库 / UI 用；不携带截止时间）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitStateKind {
+    /// 正常放行（不落库）。
+    Closed,
+    /// 熔断中。
+    Open,
+    /// 半开（冷却已过，等一次探测）。
+    HalfOpen,
+}
+
+impl CircuitStateKind {
+    /// 落库用的字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CircuitStateKind::Closed => "closed",
+            CircuitStateKind::Open => "open",
+            CircuitStateKind::HalfOpen => "half_open",
+        }
+    }
+
+    /// 从落库字符串还原。
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "closed" => Some(CircuitStateKind::Closed),
+            "open" => Some(CircuitStateKind::Open),
+            "half_open" => Some(CircuitStateKind::HalfOpen),
+            _ => None,
+        }
+    }
+}
+
 /// 熔断打开的原因（决定冷却期内回给客户端的语义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenReason {
@@ -44,6 +91,68 @@ pub enum OpenReason {
     Failures,
     /// 上游限流触发（429）。
     RateLimit,
+}
+
+impl OpenReason {
+    /// 落库用的字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpenReason::Failures => "failures",
+            OpenReason::RateLimit => "rate_limit",
+        }
+    }
+
+    /// 从落库字符串还原。
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "failures" => Some(OpenReason::Failures),
+            "rate_limit" => Some(OpenReason::RateLimit),
+            _ => None,
+        }
+    }
+}
+
+/// 熔断状态快照（落库 / UI 的数据形状）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitSnapshot {
+    /// 渠道 id。
+    pub channel_id: String,
+    /// 上游模型名。
+    pub upstream_model: String,
+    /// 状态种类。
+    pub state: CircuitStateKind,
+    /// 打开原因。
+    pub reason: Option<OpenReason>,
+    /// 连续失败次数。
+    pub failures: u32,
+    /// 429 命中次数（指数退避用）。
+    pub rate_limit_hits: u32,
+    /// 冷却截止（Unix 秒）。
+    pub open_until: Option<i64>,
+}
+
+/// 熔断状态的持久化出口（写穿 + 启动恢复）。
+///
+/// 默认实现是"不落库"（单元测试与纯内存用法）。
+pub trait CircuitPersistence: Send + Sync {
+    /// 保存（写穿）。
+    fn save(&self, snapshot: &CircuitSnapshot);
+    /// 删除（回到 closed）。
+    fn remove(&self, channel_id: &str, upstream_model: &str);
+    /// 读取全部（启动恢复）。
+    fn load_all(&self) -> Vec<CircuitSnapshot>;
+}
+
+/// 不落库的持久化实现（默认）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopPersistence;
+
+impl CircuitPersistence for NoopPersistence {
+    fn save(&self, _snapshot: &CircuitSnapshot) {}
+    fn remove(&self, _channel_id: &str, _upstream_model: &str) {}
+    fn load_all(&self) -> Vec<CircuitSnapshot> {
+        Vec::new()
+    }
 }
 
 /// 单个熔断器的内部状态。
@@ -61,11 +170,45 @@ struct Entry {
     rate_limit_hits: u32,
 }
 
+impl Entry {
+    /// 当前状态种类（`now` 用于判断冷却是否到期）。
+    fn kind(&self, now: i64) -> CircuitStateKind {
+        match self.open_until {
+            None => CircuitStateKind::Closed,
+            Some(until) if now < until => CircuitStateKind::Open,
+            Some(_) => CircuitStateKind::HalfOpen,
+        }
+    }
+
+    /// 快照（closed 不落库 → 返回 `None`）。
+    fn snapshot(
+        &self,
+        channel_id: &str,
+        upstream_model: &str,
+        now: i64,
+    ) -> Option<CircuitSnapshot> {
+        let state = self.kind(now);
+        if state == CircuitStateKind::Closed {
+            return None;
+        }
+        Some(CircuitSnapshot {
+            channel_id: channel_id.to_string(),
+            upstream_model: upstream_model.to_string(),
+            state,
+            reason: self.open_reason,
+            failures: self.failures,
+            rate_limit_hits: self.rate_limit_hits,
+            open_until: self.open_until,
+        })
+    }
+}
+
 /// 熔断器。
 #[derive(Clone)]
 pub struct CircuitBreaker {
     inner: Arc<Mutex<HashMap<String, Entry>>>,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    persistence: Arc<dyn CircuitPersistence>,
 }
 
 impl std::fmt::Debug for CircuitBreaker {
@@ -83,11 +226,12 @@ impl Default for CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    /// 构造熔断器（使用真实时钟）。
+    /// 构造熔断器（使用真实时钟，不落库）。
     pub fn new() -> Self {
         CircuitBreaker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             now: Arc::new(crate::vault::now_secs),
+            persistence: Arc::new(NoopPersistence),
         }
     }
 
@@ -96,7 +240,106 @@ impl CircuitBreaker {
         CircuitBreaker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             now,
+            persistence: Arc::new(NoopPersistence),
         }
+    }
+
+    /// 构造熔断器（带持久化；启动时恢复已落库的熔断状态）。
+    pub fn with_persistence(persistence: Arc<dyn CircuitPersistence>) -> Self {
+        let breaker = CircuitBreaker {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            now: Arc::new(crate::vault::now_secs),
+            persistence,
+        };
+        breaker.restore();
+        breaker
+    }
+
+    /// 构造熔断器（带持久化 + 注入时钟，测试用）。
+    pub fn with_persistence_and_clock(
+        persistence: Arc<dyn CircuitPersistence>,
+        now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
+        let breaker = CircuitBreaker {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            now,
+            persistence,
+        };
+        breaker.restore();
+        breaker
+    }
+
+    /// 从持久化层恢复熔断状态（启动时调用一次）。
+    fn restore(&self) {
+        let snapshots = self.persistence.load_all();
+        if snapshots.is_empty() {
+            return;
+        }
+        let mut guard = lock(&self.inner);
+        for snapshot in snapshots {
+            let key = circuit_key(&snapshot.channel_id, &snapshot.upstream_model);
+            guard.insert(
+                key,
+                Entry {
+                    failures: snapshot.failures,
+                    open_until: snapshot.open_until,
+                    open_reason: snapshot.reason,
+                    // 重启后没有在途探测
+                    probing: false,
+                    rate_limit_hits: snapshot.rate_limit_hits,
+                },
+            );
+        }
+    }
+
+    /// 当前状态的快照（closed → `None`）。
+    fn current_snapshot(&self, key: &str, now: i64) -> Option<CircuitSnapshot> {
+        let (channel_id, upstream_model) = split_key(key)?;
+        let guard = lock(&self.inner);
+        guard
+            .get(key)
+            .and_then(|entry| entry.snapshot(channel_id, upstream_model, now))
+    }
+
+    /// 状态变化后写穿持久化（必须在释放内部锁之后调用）。
+    ///
+    /// **只在落库载荷真的变了时才写**：closed 状态下的一次成功、或未达阈值的失败，
+    /// 都不产生落库行变化——不写库，也就不会每次请求都打一条 DELETE。
+    fn persist_if_changed(&self, key: &str, before: Option<CircuitSnapshot>) {
+        let now = (self.now)();
+        let after = self.current_snapshot(key, now);
+        if before == after {
+            return;
+        }
+        match after {
+            Some(snapshot) => self.persistence.save(&snapshot),
+            None => {
+                if let Some((channel_id, upstream_model)) = split_key(key) {
+                    self.persistence.remove(channel_id, upstream_model);
+                }
+            }
+        }
+    }
+
+    /// 当前处于非 closed 状态的熔断快照（UI 展示用）。
+    pub fn active_snapshots(&self) -> Vec<CircuitSnapshot> {
+        let now = (self.now)();
+        let guard = lock(&self.inner);
+        let mut out = Vec::new();
+        for (key, entry) in guard.iter() {
+            let Some((channel_id, upstream_model)) = split_key(key) else {
+                continue;
+            };
+            if let Some(snapshot) = entry.snapshot(channel_id, upstream_model, now) {
+                out.push(snapshot);
+            }
+        }
+        out.sort_by(|a, b| {
+            a.open_until
+                .cmp(&b.open_until)
+                .then_with(|| a.channel_id.cmp(&b.channel_id))
+        });
+        out
     }
 
     /// 是否允许请求。
@@ -106,6 +349,7 @@ impl CircuitBreaker {
     /// - open 已到期 → 转为 half_open，**放行一次**探测（探测未回结果前不再放行）。
     pub fn allow(&self, key: &str) -> bool {
         let now = (self.now)();
+        let before = self.current_snapshot(key, now);
         let mut guard = lock(&self.inner);
         let entry = guard.entry(key.to_string()).or_default();
         match entry.open_until {
@@ -117,6 +361,8 @@ impl CircuitBreaker {
                     return false;
                 }
                 entry.probing = true;
+                drop(guard);
+                self.persist_if_changed(key, before);
                 true
             }
         }
@@ -124,13 +370,17 @@ impl CircuitBreaker {
 
     /// 记录一次成功：回到 closed，清空计数。
     pub fn on_success(&self, key: &str) {
-        let mut guard = lock(&self.inner);
-        let entry = guard.entry(key.to_string()).or_default();
-        entry.failures = 0;
-        entry.open_until = None;
-        entry.open_reason = None;
-        entry.probing = false;
-        entry.rate_limit_hits = 0;
+        let before = self.current_snapshot(key, (self.now)());
+        {
+            let mut guard = lock(&self.inner);
+            let entry = guard.entry(key.to_string()).or_default();
+            entry.failures = 0;
+            entry.open_until = None;
+            entry.open_reason = None;
+            entry.probing = false;
+            entry.rate_limit_hits = 0;
+        }
+        self.persist_if_changed(key, before);
     }
 
     /// 记录一次失败（网络错误 / 5xx）。
@@ -139,16 +389,20 @@ impl CircuitBreaker {
     /// 若本次是 half_open 探测失败 → 立即重新打开。
     pub fn on_failure(&self, key: &str) {
         let now = (self.now)();
-        let mut guard = lock(&self.inner);
-        let entry = guard.entry(key.to_string()).or_default();
-        let was_probing = entry.probing;
-        entry.failures += 1;
-        entry.probing = false;
-        if was_probing || entry.failures >= FAILURE_THRESHOLD {
-            entry.failures = entry.failures.min(FAILURE_THRESHOLD);
-            entry.open_until = Some(now + OPEN_DURATION_SECS);
-            entry.open_reason = Some(OpenReason::Failures);
+        let before = self.current_snapshot(key, now);
+        {
+            let mut guard = lock(&self.inner);
+            let entry = guard.entry(key.to_string()).or_default();
+            let was_probing = entry.probing;
+            entry.failures += 1;
+            entry.probing = false;
+            if was_probing || entry.failures >= FAILURE_THRESHOLD {
+                entry.failures = entry.failures.min(FAILURE_THRESHOLD);
+                entry.open_until = Some(now + OPEN_DURATION_SECS);
+                entry.open_reason = Some(OpenReason::Failures);
+            }
         }
+        self.persist_if_changed(key, before);
     }
 
     /// 记录一次 429：进入冷却。
@@ -156,15 +410,19 @@ impl CircuitBreaker {
     /// 冷却时长 = `max(指数退避, Retry-After)`。
     pub fn on_rate_limited(&self, key: &str, retry_after: Option<Duration>) {
         let now = (self.now)();
-        let mut guard = lock(&self.inner);
-        let entry = guard.entry(key.to_string()).or_default();
-        entry.rate_limit_hits = entry.rate_limit_hits.saturating_add(1);
-        entry.probing = false;
-        let backoff = rate_limit_backoff(entry.rate_limit_hits);
-        let retry_secs = retry_after.map(|d| d.as_secs() as i64).unwrap_or(0);
-        let cooldown = backoff.max(retry_secs).max(1);
-        entry.open_until = Some(now + cooldown);
-        entry.open_reason = Some(OpenReason::RateLimit);
+        let before = self.current_snapshot(key, now);
+        {
+            let mut guard = lock(&self.inner);
+            let entry = guard.entry(key.to_string()).or_default();
+            entry.rate_limit_hits = entry.rate_limit_hits.saturating_add(1);
+            entry.probing = false;
+            let backoff = rate_limit_backoff(entry.rate_limit_hits);
+            let retry_secs = retry_after.map(|d| d.as_secs() as i64).unwrap_or(0);
+            let cooldown = backoff.max(retry_secs).max(1);
+            entry.open_until = Some(now + cooldown);
+            entry.open_reason = Some(OpenReason::RateLimit);
+        }
+        self.persist_if_changed(key, before);
     }
 
     /// 当前冷却信息：剩余秒数 + 打开原因。
@@ -206,8 +464,13 @@ impl CircuitBreaker {
 
     /// 清除某个 key 的状态（渠道被删除 / 重置时用）。
     pub fn reset(&self, key: &str) {
-        let mut guard = lock(&self.inner);
-        guard.remove(key);
+        {
+            let mut guard = lock(&self.inner);
+            guard.remove(key);
+        }
+        if let Some((channel_id, upstream_model)) = split_key(key) {
+            self.persistence.remove(channel_id, upstream_model);
+        }
     }
 }
 
@@ -239,6 +502,171 @@ mod tests {
         };
         let breaker = CircuitBreaker::with_clock(clock);
         (now, breaker)
+    }
+
+    /// 记录写穿调用的假持久化层。
+    #[derive(Default)]
+    struct RecordingPersistence {
+        saved: Mutex<Vec<CircuitSnapshot>>,
+        removed: Mutex<Vec<(String, String)>>,
+        loaded: Mutex<Vec<CircuitSnapshot>>,
+    }
+
+    impl CircuitPersistence for RecordingPersistence {
+        fn save(&self, snapshot: &CircuitSnapshot) {
+            lock(&self.saved).push(snapshot.clone());
+        }
+        fn remove(&self, channel_id: &str, upstream_model: &str) {
+            lock(&self.removed).push((
+                channel_id.to_string(),
+                upstream_model.to_string(),
+            ));
+        }
+        fn load_all(&self) -> Vec<CircuitSnapshot> {
+            lock(&self.loaded).clone()
+        }
+    }
+
+    /// 带假持久化层 + 假时钟的熔断器。
+    fn persistent_breaker() -> (
+        Arc<AtomicI64>,
+        CircuitBreaker,
+        Arc<RecordingPersistence>,
+    ) {
+        let now = Arc::new(AtomicI64::new(1_000));
+        let clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let recorder = Arc::new(RecordingPersistence::default());
+        let persistence: Arc<dyn CircuitPersistence> = recorder.clone();
+        let breaker = CircuitBreaker::with_persistence_and_clock(persistence, clock);
+        (now, breaker, recorder)
+    }
+
+    #[test]
+    fn opening_the_circuit_is_written_through() {
+        let (_now, breaker, persistence) = persistent_breaker();
+        let key = circuit_key("c1", "deepseek-chat");
+
+        breaker.on_failure(&key);
+        breaker.on_failure(&key);
+        assert!(
+            lock(&persistence.saved).is_empty(),
+            "未达阈值时状态仍是 closed，不落库"
+        );
+
+        breaker.on_failure(&key);
+        let saved = lock(&persistence.saved).clone();
+        assert_eq!(saved.len(), 1, "熔断打开应写穿一次");
+        assert_eq!(saved[0].channel_id, "c1");
+        assert_eq!(saved[0].upstream_model, "deepseek-chat");
+        assert_eq!(saved[0].state, CircuitStateKind::Open);
+        assert_eq!(saved[0].reason, Some(OpenReason::Failures));
+        assert_eq!(saved[0].open_until, Some(1_000 + OPEN_DURATION_SECS));
+    }
+
+    #[test]
+    fn success_removes_the_persisted_row() {
+        let (_now, breaker, persistence) = persistent_breaker();
+        let key = circuit_key("c1", "deepseek-chat");
+        for _ in 0..3 {
+            breaker.on_failure(&key);
+        }
+        assert_eq!(lock(&persistence.saved).len(), 1);
+
+        breaker.on_success(&key);
+        let removed = lock(&persistence.removed).clone();
+        assert_eq!(
+            removed,
+            vec![("c1".to_string(), "deepseek-chat".to_string())],
+            "回到 closed 应删除落库行"
+        );
+    }
+
+    #[test]
+    fn rate_limit_is_persisted_with_its_reason() {
+        let (_now, breaker, persistence) = persistent_breaker();
+        let key = circuit_key("c1", "deepseek-chat");
+        breaker.on_rate_limited(&key, Some(Duration::from_secs(5)));
+
+        let saved = lock(&persistence.saved).clone();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].state, CircuitStateKind::Open);
+        assert_eq!(saved[0].reason, Some(OpenReason::RateLimit));
+        assert_eq!(saved[0].open_until, Some(1_005));
+        assert_eq!(saved[0].rate_limit_hits, 1);
+    }
+
+    #[test]
+    fn state_is_restored_on_startup() {
+        let recorder = Arc::new(RecordingPersistence::default());
+        // 模拟上一次运行留下的熔断记录
+        lock(&recorder.loaded).push(CircuitSnapshot {
+            channel_id: "c1".to_string(),
+            upstream_model: "deepseek-chat".to_string(),
+            state: CircuitStateKind::Open,
+            reason: Some(OpenReason::Failures),
+            failures: 3,
+            rate_limit_hits: 0,
+            open_until: Some(2_000),
+        });
+
+        let now = Arc::new(AtomicI64::new(1_000));
+        let clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let persistence: Arc<dyn CircuitPersistence> = recorder.clone();
+        let breaker = CircuitBreaker::with_persistence_and_clock(persistence, clock);
+
+        let key = circuit_key("c1", "deepseek-chat");
+        assert!(
+            !breaker.allow(&key),
+            "重启后仍在冷却期内，必须继续拦截"
+        );
+        assert_eq!(
+            breaker.state(&key),
+            CircuitState::Open { until: 2_000 },
+            "恢复后的状态应与落库一致"
+        );
+
+        // 冷却到期 → 放行一次探测
+        now.store(2_000, Ordering::SeqCst);
+        assert!(breaker.allow(&key), "冷却到期应放行探测");
+    }
+
+    #[test]
+    fn active_snapshots_only_list_non_closed_circuits() {
+        let (_now, breaker, _persistence) = persistent_breaker();
+        let open_key = circuit_key("c1", "deepseek-chat");
+        let ok_key = circuit_key("c2", "kimi-chat");
+
+        breaker.on_success(&ok_key);
+        for _ in 0..3 {
+            breaker.on_failure(&open_key);
+        }
+
+        let active = breaker.active_snapshots();
+        assert_eq!(active.len(), 1, "只应列出非 closed 的熔断");
+        assert_eq!(active[0].channel_id, "c1");
+        assert_eq!(active[0].state, CircuitStateKind::Open);
+    }
+
+    #[test]
+    fn state_kind_and_reason_round_trip_through_strings() {
+        for kind in [
+            CircuitStateKind::Closed,
+            CircuitStateKind::Open,
+            CircuitStateKind::HalfOpen,
+        ] {
+            assert_eq!(CircuitStateKind::from_str(kind.as_str()), Some(kind));
+        }
+        for reason in [OpenReason::Failures, OpenReason::RateLimit] {
+            assert_eq!(OpenReason::from_str(reason.as_str()), Some(reason));
+        }
+        assert_eq!(CircuitStateKind::from_str("nope"), None);
+        assert_eq!(OpenReason::from_str("nope"), None);
     }
 
     #[test]

@@ -77,6 +77,12 @@ pub const MIGRATIONS: &[Migration] = &[
             "DROP TABLE IF EXISTS checkin_site;",
         ],
     },
+    Migration {
+        version: 5,
+        name: "circuit_state",
+        up: &[crate::store::schema::CIRCUIT_STATE_DDL],
+        down: &["DROP TABLE IF EXISTS circuit_state;"],
+    },
 ];
 
 /// 确保版本表存在。

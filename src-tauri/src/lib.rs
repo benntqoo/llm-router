@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use tauri::Manager;
 
 use crate::gateway::circuit::CircuitBreaker;
+use crate::gateway::circuit_store::StoreCircuitPersistence;
 use crate::gateway::fallback::Forwarder;
 use crate::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use crate::gateway::ratelimit::RateLimiter;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub vault: Arc<RwLock<Vault>>,
     /// 限流器（与网关共享同一实例）
     pub limiter: Arc<RateLimiter>,
+    /// 熔断器（与网关共享同一实例；状态落库，重启恢复）
+    pub circuit: Arc<CircuitBreaker>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -79,9 +82,13 @@ pub fn run() {
             let limiter = Arc::new(RateLimiter::new());
             let router = Arc::new(AliasRouter::new(Arc::clone(&store)));
             // 出站转发：HTTP 客户端 + 熔断器 + R-4 注入降级状态 + 保险库（凭证解密）
+            // 熔断器带持久化：非 closed 的熔断写穿 `circuit_state` 表，启动时恢复
+            let circuit = Arc::new(CircuitBreaker::with_persistence(Arc::new(
+                StoreCircuitPersistence::new(Arc::clone(&store)),
+            )));
             let forwarder = Arc::new(Forwarder::new(
                 OutboundClient::new().map_err(std::io::Error::other)?,
-                Arc::new(CircuitBreaker::new()),
+                Arc::clone(&circuit),
                 Arc::new(StreamUsageDowngrades::default()),
                 Arc::clone(&vault),
             ));
@@ -108,11 +115,13 @@ pub fn run() {
                 store: Arc::clone(&store),
                 vault: Arc::clone(&vault),
                 limiter,
+                circuit,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::gateway::gateway_status,
+            commands::circuit::circuit_status,
             commands::vault::vault_status,
             commands::vault::vault_put_secret,
             commands::vault::vault_reveal_secret,

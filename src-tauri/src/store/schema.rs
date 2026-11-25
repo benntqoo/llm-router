@@ -161,6 +161,24 @@ CREATE TABLE price (
 );
 "#;
 
+/// 熔断状态：非 closed 的熔断/冷却记录（02 §2.3）。
+///
+/// 只在熔断打开（open）或半开探测（half_open）时存在；回到 closed 即删除该行，
+/// 因此这张表天然只反映"当前正在冷却的渠道"。
+pub const CIRCUIT_STATE_DDL: &str = r#"
+CREATE TABLE circuit_state (
+  channel_id      TEXT NOT NULL REFERENCES channel(id) ON DELETE CASCADE,
+  upstream_model  TEXT NOT NULL,
+  state           TEXT NOT NULL,              -- open|half_open
+  reason          TEXT,                       -- failures|rate_limit
+  failures        INTEGER NOT NULL DEFAULT 0, -- 连续失败次数
+  rate_limit_hits INTEGER NOT NULL DEFAULT 0, -- 429 命中次数（指数退避用）
+  open_until      INTEGER,                    -- 冷却截止（Unix 秒）
+  updated_at      INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, upstream_model)
+);
+"#;
+
 /// v1 全部业务表名（迁移后应全部存在；用于测试断言）。
 pub const ALL_TABLES: &[&str] = &[
     "channel",
@@ -174,4 +192,5 @@ pub const ALL_TABLES: &[&str] = &[
     "checkin_site",
     "checkin_result",
     "price",
+    "circuit_state",
 ];

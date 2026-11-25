@@ -266,7 +266,7 @@ mod tests {
     fn migrate_down_to_rolls_back_partially() {
         let store = Store::open_in_memory().expect("打开内存库失败");
         let reverted = store.migrate_down_to(2).expect("回滚失败");
-        assert_eq!(reverted, vec![4, 3], "应回滚版本 4 与 3");
+        assert_eq!(reverted, vec![5, 4, 3], "应回滚版本 5、4 与 3");
         assert_eq!(store.version().expect("读取版本失败"), 2);
 
         let conn = store.lock();
@@ -274,6 +274,7 @@ mod tests {
         assert!(tables.iter().any(|t| t == "channel"), "核心表应保留");
         assert!(!tables.iter().any(|t| t == "usage_log"), "用量表应已回滚");
         assert!(!tables.iter().any(|t| t == "checkin_site"), "签到表应已回滚");
+        assert!(!tables.iter().any(|t| t == "circuit_state"), "熔断表应已回滚");
 
         // 回滚后重新 up 应能回到最新版本
         drop(conn);

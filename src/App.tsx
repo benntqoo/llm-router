@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import CircuitPanel from "./CircuitPanel";
 import ClientKeyPanel from "./ClientKeyPanel";
 import VaultPanel from "./VaultPanel";
 import "./App.css";
@@ -57,14 +58,16 @@ function App() {
         <h2>当前范围</h2>
         <p className="muted">{status?.note ?? "正在读取…"}</p>
         <p className="muted">
-          已完成 T0 骨架 / T1 数据层 / T2 加密保险库 / T3 入站鉴权；
-          后续：T4/T5 出站与路由 → T6 流式管道 → T7 用量 → T8 预设 → T9 UI → T10 实测矩阵
+          已完成 T0 骨架 / T1 数据层 / T2 加密保险库 / T3 入站鉴权 / T4 出站适配器 /
+          T5 路由别名 / T6 流式管道与熔断；后续：T7 用量 → T8 预设 → T9 UI → T10 实测矩阵
         </p>
       </section>
 
       <VaultPanel />
 
       <ClientKeyPanel />
+
+      <CircuitPanel />
     </main>
   );
 }

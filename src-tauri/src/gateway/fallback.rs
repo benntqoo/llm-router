@@ -30,9 +30,7 @@ use crate::providers::presets::minimax;
 use crate::vault::Vault;
 
 /// 熔断粒度键：`(channel_id, upstream_model)`（02 §2.3）。
-pub fn circuit_key(channel_id: &str, upstream_model: &str) -> String {
-    format!("{channel_id}\u{1}{upstream_model}")
-}
+pub use crate::gateway::circuit::circuit_key;
 
 /// 转发器。
 #[derive(Clone)]
