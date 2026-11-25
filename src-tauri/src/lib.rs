@@ -86,6 +86,13 @@ pub fn run() {
             let circuit = Arc::new(CircuitBreaker::with_persistence(Arc::new(
                 StoreCircuitPersistence::new(Arc::clone(&store)),
             )));
+            // 读回落库的熔断时长设置（用户可调；默认 60s）
+            if let Some(secs) = store::settings::get_int_setting(
+                &store,
+                store::settings::KEY_CIRCUIT_OPEN_SECS,
+            ) {
+                circuit.set_open_duration_secs(secs);
+            }
             let forwarder = Arc::new(Forwarder::new(
                 OutboundClient::new().map_err(std::io::Error::other)?,
                 Arc::clone(&circuit),
@@ -122,6 +129,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::gateway::gateway_status,
             commands::circuit::circuit_status,
+            commands::circuit::circuit_settings_get,
+            commands::circuit::circuit_settings_set,
+            commands::circuit::circuit_reset,
             commands::vault::vault_status,
             commands::vault::vault_put_secret,
             commands::vault::vault_reveal_secret,

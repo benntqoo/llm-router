@@ -179,6 +179,15 @@ CREATE TABLE circuit_state (
 );
 "#;
 
+/// 应用级设置（键值对；02 §2.3 熔断时长等）。
+pub const APP_SETTING_DDL: &str = r#"
+CREATE TABLE app_setting (
+  key        TEXT PRIMARY KEY,   -- 如 circuit_open_secs
+  value      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+"#;
+
 /// v1 全部业务表名（迁移后应全部存在；用于测试断言）。
 pub const ALL_TABLES: &[&str] = &[
     "channel",
@@ -193,4 +202,5 @@ pub const ALL_TABLES: &[&str] = &[
     "checkin_result",
     "price",
     "circuit_state",
+    "app_setting",
 ];

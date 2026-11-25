@@ -83,6 +83,12 @@ pub const MIGRATIONS: &[Migration] = &[
         up: &[crate::store::schema::CIRCUIT_STATE_DDL],
         down: &["DROP TABLE IF EXISTS circuit_state;"],
     },
+    Migration {
+        version: 6,
+        name: "app_setting",
+        up: &[crate::store::schema::APP_SETTING_DDL],
+        down: &["DROP TABLE IF EXISTS app_setting;"],
+    },
 ];
 
 /// 确保版本表存在。

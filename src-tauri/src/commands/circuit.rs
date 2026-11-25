@@ -6,6 +6,10 @@
 use serde::Serialize;
 use tauri::State;
 
+use crate::gateway::circuit::{
+    circuit_key, CircuitState, MIN_OPEN_DURATION_SECS, OPEN_DURATION_SECS,
+};
+use crate::store::settings::{get_int_setting, set_int_setting, KEY_CIRCUIT_OPEN_SECS};
 use crate::AppState;
 
 /// 单条熔断状态。
@@ -71,6 +75,71 @@ pub fn circuit_status_of(state: &AppState) -> Result<Vec<CircuitStatusRow>, Stri
     Ok(rows)
 }
 
+/// 熔断设置。
+#[derive(Serialize, Clone, Debug)]
+pub struct CircuitSettings {
+    /// 连续失败触发的熔断时长（秒；默认 60，最小 1）。
+    pub open_duration_secs: i64,
+}
+
+/// 读熔断设置。
+#[tauri::command]
+pub fn circuit_settings_get(state: State<'_, AppState>) -> Result<CircuitSettings, String> {
+    circuit_settings_get_of(&state)
+}
+
+/// 熔断设置（可测版本）。
+pub fn circuit_settings_get_of(state: &AppState) -> Result<CircuitSettings, String> {
+    let open_duration_secs = get_int_setting(&state.store, KEY_CIRCUIT_OPEN_SECS)
+        .unwrap_or(OPEN_DURATION_SECS)
+        .max(MIN_OPEN_DURATION_SECS);
+    Ok(CircuitSettings { open_duration_secs })
+}
+
+/// 写熔断设置（秒；最小 1 秒）。
+#[tauri::command]
+pub fn circuit_settings_set(
+    state: State<'_, AppState>,
+    open_duration_secs: i64,
+) -> Result<CircuitSettings, String> {
+    circuit_settings_set_of(&state, open_duration_secs)
+}
+
+/// 写熔断设置（可测版本）：落库 + 立即生效。
+pub fn circuit_settings_set_of(
+    state: &AppState,
+    open_duration_secs: i64,
+) -> Result<CircuitSettings, String> {
+    // 先钳到下限再落库，保证库里的值与运行时一致
+    let clamped = state.circuit.set_open_duration_secs(open_duration_secs);
+    set_int_setting(&state.store, KEY_CIRCUIT_OPEN_SECS, clamped).map_err(|e| e.to_string())?;
+    Ok(CircuitSettings {
+        open_duration_secs: clamped,
+    })
+}
+
+/// 手动解除熔断（清内存状态 + 删落库行）。
+#[tauri::command]
+pub fn circuit_reset(
+    state: State<'_, AppState>,
+    channel_id: String,
+    upstream_model: String,
+) -> Result<bool, String> {
+    circuit_reset_of(&state, &channel_id, &upstream_model)
+}
+
+/// 手动解除熔断（可测版本）；返回是否确实解除了一个熔断。
+pub fn circuit_reset_of(
+    state: &AppState,
+    channel_id: &str,
+    upstream_model: &str,
+) -> Result<bool, String> {
+    let key = circuit_key(channel_id, upstream_model);
+    let existed = state.circuit.state(&key) != CircuitState::Closed;
+    state.circuit.reset(&key);
+    Ok(existed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,7 +150,6 @@ mod tests {
     use crate::gateway::ratelimit::RateLimiter;
     use crate::store::Store;
     use crate::vault::Vault;
-
     /// 构造一个带渠道的 `AppState`（只用到熔断与数据层）。
     fn app_state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -171,5 +239,68 @@ mod tests {
             circuit_status_of(&state).expect("查询失败").is_empty(),
             "回到 closed 后不应再展示"
         );
+    }
+
+    #[test]
+    fn settings_default_to_sixty_seconds() {
+        let (_dir, state) = app_state();
+        let settings = circuit_settings_get_of(&state).expect("读取失败");
+        assert_eq!(settings.open_duration_secs, 60);
+    }
+
+    #[test]
+    fn settings_are_persisted_and_applied_immediately() {
+        let (_dir, state) = app_state();
+        let saved = circuit_settings_set_of(&state, 180).expect("写入失败");
+        assert_eq!(saved.open_duration_secs, 180);
+        assert_eq!(state.circuit.open_duration_secs(), 180, "运行时立即生效");
+
+        // 再读一次应来自落库的值
+        let reread = circuit_settings_get_of(&state).expect("读取失败");
+        assert_eq!(reread.open_duration_secs, 180);
+    }
+
+    #[test]
+    fn settings_below_one_second_are_clamped() {
+        let (_dir, state) = app_state();
+        let saved = circuit_settings_set_of(&state, 0).expect("写入失败");
+        assert_eq!(saved.open_duration_secs, 1);
+        let saved = circuit_settings_set_of(&state, -5).expect("写入失败");
+        assert_eq!(saved.open_duration_secs, 1);
+    }
+
+    #[test]
+    fn manual_reset_clears_circuit_and_its_row() {
+        let (_dir, state) = app_state();
+        let key = crate::gateway::circuit::circuit_key("c1", "deepseek-chat");
+        for _ in 0..3 {
+            state.circuit.on_failure(&key);
+        }
+        assert_eq!(circuit_status_of(&state).expect("查询失败").len(), 1);
+
+        let existed = circuit_reset_of(&state, "c1", "deepseek-chat").expect("解除失败");
+        assert!(existed, "确实存在熔断时应返回 true");
+        assert!(
+            circuit_status_of(&state).expect("查询失败").is_empty(),
+            "解除后不应再展示"
+        );
+
+        // 落库行也应被清掉（重启不会复活）
+        let rows = state
+            .store
+            .with_conn(|conn| {
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM circuit_state", [], |row| row.get(0))?;
+                Ok(count)
+            })
+            .expect("查询失败");
+        assert_eq!(rows, 0, "手动解除应删除落库行");
+    }
+
+    #[test]
+    fn manual_reset_on_healthy_circuit_reports_nothing_to_clear() {
+        let (_dir, state) = app_state();
+        let existed = circuit_reset_of(&state, "c1", "deepseek-chat").expect("解除失败");
+        assert!(!existed, "没有熔断时应返回 false");
     }
 }

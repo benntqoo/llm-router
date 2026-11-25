@@ -16,13 +16,16 @@
 //! 冷却窗口本身很短（失败熔断 60s、429 冷却上限 60s），持久化不会造成长期误伤。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// 连续失败多少次后熔断。
 pub const FAILURE_THRESHOLD: u32 = 3;
-/// 熔断打开后的冷却时长（秒）。
+/// 熔断打开后的冷却时长（秒）——**默认值**，用户可在应用内调整（02 §2.3）。
 pub const OPEN_DURATION_SECS: i64 = 60;
+/// 熔断时长可调的下限（秒）——最小单位 1 秒。
+pub const MIN_OPEN_DURATION_SECS: i64 = 1;
 /// 429 冷却的指数退避基数（秒）。
 pub const RATE_LIMIT_BASE_SECS: i64 = 2;
 /// 429 冷却上限（秒）。
@@ -209,6 +212,8 @@ pub struct CircuitBreaker {
     inner: Arc<Mutex<HashMap<String, Entry>>>,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     persistence: Arc<dyn CircuitPersistence>,
+    /// 连续失败触发的熔断时长（秒）；运行期可改（02 §2.3）。
+    open_duration_secs: Arc<AtomicI64>,
 }
 
 impl std::fmt::Debug for CircuitBreaker {
@@ -232,6 +237,7 @@ impl CircuitBreaker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             now: Arc::new(crate::vault::now_secs),
             persistence: Arc::new(NoopPersistence),
+            open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
         }
     }
 
@@ -241,6 +247,7 @@ impl CircuitBreaker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             now,
             persistence: Arc::new(NoopPersistence),
+            open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
         }
     }
 
@@ -250,6 +257,7 @@ impl CircuitBreaker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             now: Arc::new(crate::vault::now_secs),
             persistence,
+            open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
         };
         breaker.restore();
         breaker
@@ -264,9 +272,25 @@ impl CircuitBreaker {
             inner: Arc::new(Mutex::new(HashMap::new())),
             now,
             persistence,
+            open_duration_secs: Arc::new(AtomicI64::new(OPEN_DURATION_SECS)),
         };
         breaker.restore();
         breaker
+    }
+
+    /// 当前熔断时长（秒）。
+    pub fn open_duration_secs(&self) -> i64 {
+        self.open_duration_secs.load(Ordering::SeqCst)
+    }
+
+    /// 调整熔断时长（秒）。
+    ///
+    /// 小于 `MIN_OPEN_DURATION_SECS` 的值会被抬到下限（最小单位 1 秒）。
+    /// 只影响**之后**新打开的熔断，不追溯修改已在冷却中的熔断。
+    pub fn set_open_duration_secs(&self, secs: i64) -> i64 {
+        let clamped = secs.max(MIN_OPEN_DURATION_SECS);
+        self.open_duration_secs.store(clamped, Ordering::SeqCst);
+        clamped
     }
 
     /// 从持久化层恢复熔断状态（启动时调用一次）。
@@ -389,6 +413,7 @@ impl CircuitBreaker {
     /// 若本次是 half_open 探测失败 → 立即重新打开。
     pub fn on_failure(&self, key: &str) {
         let now = (self.now)();
+        let duration = self.open_duration_secs();
         let before = self.current_snapshot(key, now);
         {
             let mut guard = lock(&self.inner);
@@ -398,7 +423,7 @@ impl CircuitBreaker {
             entry.probing = false;
             if was_probing || entry.failures >= FAILURE_THRESHOLD {
                 entry.failures = entry.failures.min(FAILURE_THRESHOLD);
-                entry.open_until = Some(now + OPEN_DURATION_SECS);
+                entry.open_until = Some(now + duration);
                 entry.open_reason = Some(OpenReason::Failures);
             }
         }
@@ -667,6 +692,53 @@ mod tests {
         }
         assert_eq!(CircuitStateKind::from_str("nope"), None);
         assert_eq!(OpenReason::from_str("nope"), None);
+    }
+
+    #[test]
+    fn open_duration_is_configurable() {
+        let (_now, breaker, _persistence) = persistent_breaker();
+        assert_eq!(breaker.open_duration_secs(), OPEN_DURATION_SECS, "默认 60s");
+
+        breaker.set_open_duration_secs(120);
+        assert_eq!(breaker.open_duration_secs(), 120);
+
+        let key = circuit_key("c1", "deepseek-chat");
+        for _ in 0..3 {
+            breaker.on_failure(&key);
+        }
+        assert_eq!(
+            breaker.state(&key),
+            CircuitState::Open { until: 1_000 + 120 },
+            "熔断时长应按新设置计算"
+        );
+    }
+
+    #[test]
+    fn open_duration_is_clamped_to_one_second() {
+        let (_now, breaker, _persistence) = persistent_breaker();
+        assert_eq!(breaker.set_open_duration_secs(0), MIN_OPEN_DURATION_SECS);
+        assert_eq!(breaker.set_open_duration_secs(-30), MIN_OPEN_DURATION_SECS);
+        assert_eq!(breaker.open_duration_secs(), MIN_OPEN_DURATION_SECS);
+    }
+
+    #[test]
+    fn changing_duration_does_not_retroactively_change_open_circuits() {
+        let (_now, breaker, _persistence) = persistent_breaker();
+        let key = circuit_key("c1", "deepseek-chat");
+        for _ in 0..3 {
+            breaker.on_failure(&key);
+        }
+        assert_eq!(
+            breaker.state(&key),
+            CircuitState::Open { until: 1_000 + OPEN_DURATION_SECS }
+        );
+
+        breaker.set_open_duration_secs(300);
+        assert_eq!(
+            breaker.state(&key),
+            CircuitState::Open { until: 1_000 + OPEN_DURATION_SECS },
+            "已在冷却中的熔断不被新设置追溯修改"
+        );
     }
 
     #[test]
