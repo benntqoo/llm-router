@@ -132,11 +132,10 @@
 | ✅ | **T11 安全验收**（02 §10.2 四条判据全过）：① 库内明文（dump + 主库 + WAL/SHM 三层扫描，**明文凭证命中 0**）；② `vault.bin` 三重扫描 0 命中；③ 日志敏感键**全部脱敏为 `***`**（本轮补上了 §5.2 承诺但一直没接的 `gateway::logging::request_log` 中间件）；④ 绑定策略（无 client key ⇒ 拒绝启动且端口不监听；有 client key ⇒ 允许改绑）。四条判据固化为只读执行器 `scripts/security_check.py` | 留档 `docs/reviews/security-check-m1.md`；02 §10.2 执行口径 + §1.2（v0.10）；回归 `cargo test` 291 项全绿 |
 | ✅ | **T12 本地估算器**（M2 第一张卡）：产线默认估算器由**字符启发式**换成 **tiktoken-rs**（`gateway::estimator::TiktokenEstimator`；编码表 crate 内嵌、运行期不联网）；编码选择 o200k 家族走 `o200k_base`、其余（含全部国产模型）走 `cl100k_base`；`is_approximation(model)` 把"国产模型只能近似"写成可查询事实。口径细化：**上游缺一项 → 只补缺的那一项**（"缺失"= 没有该键，值为 0 不算缺失），上游已给的精确值**一律不被覆盖**（R7），估算值一律 `estimated=1`、不参与预算告警。验收判据"无 usage 渠道强制走估算路径"**e2e + 真机双证通过** | 留档 `docs/reviews/T12-token-estimator.md`；02 §8.1 估算入口细化 + §13（v0.11）；回归 `cargo test` 299 项全绿；代价：二进制 24.2 → 32.2 MB |
 | 🟡 | **M1 里程碑状态：判据 ②③④ 已验通过；① 的真实 DeepSeek 部分挂起**（头头决定先不测真实上游，与 T10 真实矩阵同一前提）。**汇报件见 `docs/reviews/M1-milestone-report.md`** | 03 §1 判据；解除条件 = 拿到任一 A 类渠道真实 API Key（一把钥匙同时解锁 T10 真实矩阵与 M1 判据 ①） |
-| 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径。**T11 已把"明文凭证命中 / 结构性命中"的分类口径写进 02 §10.2 并实现为 `scripts/security_check.py`（等价于提案 1+3）**，但 **AGENT.md §9 原文未改**（按 §6-3 走提案流程），正式口径仍待头头裁决 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6；T11 口径见 `docs/reviews/security-check-m1.md` §4 |
+| ✅ | **AGENT.md §9 安全验收正则口径**（头头 2026-11-26 裁决：改为指向执行器）。§9 保留四条判据语义，**执行统一走只读执行器** `scripts/security_check.py`，并写明"明文凭证命中必须为 0 / 结构性命中逐条列出"的分类口径；原命令三处与现实不符之处（正则恒命中 `api_key`、`strings` 是 Unix 工具、`grep logs/` 而应用不落日志文件）一并清掉 | 留档 `docs/reviews/security-check-m1.md` §4 + §4.1（含在**用户真实库**与**已录密钥的验证库**上的实跑留档，退出码 0）；02 §10.2 执行口径 |
+| ✅ | **02 §6.1 标题"8 profile"** → 已按事实改为 **"7 profile"**（表体 7 行；T4/T8/UI/T8 任务卡均按 7 个落地，03 T8 卡片写的也是"7 个 profile"） | 头头 2026-11-26 裁决；02 §6.1 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
-| 🔴 | 02 §6.1 标题写"8 profile"但表体只有 7 行（03 T8 写"7 个 profile"） | T4 与 T8 均按 7 个落地（T8 的 §6.1.1 列出 7 条默认模型，UI 下拉也是 7 个）；是否回填标题待裁决，见 `docs/reviews/T4-outbound-adapter-verification.md` §6 |
 | 🔴 | 统一错误体新增 `available_models` 字段是否回填 02 §4.4 | 02 §2.1 ③ 要求"响应体附可用别名"，§4.4 字段表未列；已按可选字段实现，见 `docs/reviews/T5-routing-alias-verification.md` §6 |
-| 🔴 | 分支命名：仓库实为 `master` + `origin/master`，AGENT.md §8 要求 `main` + `dev`（已建 `dev`） | 待头头裁决是否重命名 `master` → `main` |
 | 🔴 | T18 签到站点清单待指定 | `docs/planning/03-delivery-plan.md` §2 T18 |
 | ⏳ | HANDOFF §5 五项未验证项 | 验证方法见 §5；命中对应任务前必须先实测再实现 |
 

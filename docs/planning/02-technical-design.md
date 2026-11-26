@@ -386,7 +386,7 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 
 ## 6. 渠道适配器规格
 
-### 6.1 v1 预设表（API Key 型，8 profile）
+### 6.1 v1 预设表（API Key 型，7 profile）
 
 | 渠道 | base_url | 出站路径 | 鉴权 | 特殊规则 |
 |---|---|---|---|---|

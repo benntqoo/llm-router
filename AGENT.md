@@ -79,12 +79,29 @@
 
 ## 9. M1 安全验收命令（每项必须留档）
 
+**四条判据的语义**（口径与 02 §10.2 一致）：
+
+1. 应用库无**明文凭证**（`store.db` **及其 WAL/SHM**）
+2. 保险库 `vault.bin` 无明文 key 片段
+3. 日志里 `Authorization` / `api_key` / `token` 等敏感键的**值**全部脱敏为 `***`
+4. 无 client key 时绑 `0.0.0.0` 启动 → **必须拒绝**，且端口不监听
+
+**执行：统一走只读执行器**（`scripts/security_check.py`，只读，不改库与保险库）：
+
+```powershell
+python scripts/security_check.py `
+    --store "<store.db>" --vault "<vault.bin>" `
+    --log <应用 stdout 日志> --log <应用 stderr 日志> `
+    --secret "<渠道 key 明文>" --secret "<client key 明文>" `
+    --dump-out <dump.sql> --bind-check "<llm-router.exe>"
 ```
-1. sqlite3 <store.db> ".dump" | grep -iE "sk-|Bearer |api_key"   # 无明文命中
-2. strings vault.bin | grep -iE "sk-|Bearer "                    # 无明文命中
-3. grep -rE "Authorization|api_key" logs/                        # 全部为 ***
-4. 无 client key 时绑 0.0.0.0 启动                                # 必须拒绝
-```
+
+退出码 `0` = 四条全过；`1` = 有明文凭证命中；`2` = 参数或环境问题。
+
+> **命中项分两类**（这是判据 1 能自动判定的前提）：
+> **明文凭证命中**（命中真实密钥值或 `sk-…`/`llmr_…`/`Bearer …` 形态）→ **必须为 0**；
+> **结构性命中**（DDL 注释、列名、`credential.kind` 枚举值等字段名/取值）→ 逐条列出供人工核对，**不静默忽略**。
+> 原命令里的 `grep -iE "sk-|api_key|Bearer"` 会**恒定命中** DDL 注释与 `kind` 取值，无法判定。
 
 ## 10. 沟通
 
