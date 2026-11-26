@@ -119,7 +119,7 @@
 | ✅ | T6 追加二：熔断**时长可配置**（默认 60s / 最小 1s，`app_setting` 表，schema v6）+ **手动解除熔断**（`circuit_reset`） | 头头 2026-11-26 裁决；同上留档 §2.5 |
 | ✅ | T6 追加三：**429 冷却上限可配置**（默认 60s / 最小 1s，`app_setting.rate_limit_cooldown_cap_secs`；冷却 = `min(max(退避, Retry-After), 上限)`，回给客户端的 `Retry-After` 为实际生效值） | 头头 2026-11-26 裁决；提交 `96be851`；同上留档 §2.7；提案裁决五 |
 | ✅ | T7 usage 采集（流式**旁路 tee** 解析 usage 帧 + 记 TTFT + 非流式直读 + `estimated` 估算入口 + `usage_log` 落库（增 `account_id`，schema v7）+ per `(channel, account)` 的 RPM/RPD/TPM/TPD 计数 + 429 限额自学习回写 `quota_json`） | 提交 `59053b2`；留档 `docs/reviews/T7-usage-capture.md`；02 §8.1/§8.2（v0.6） |
-| 🔴 | **T7 账号口径待头头确认**：API Key 型渠道按需补建默认账号 `acct_default_<channel_id>`（原 `account` 表只服务 OAuth / 登录态型；为满足"per `(channel, account)` 计数 + `quota_json` 唯一落点"而引入）。已按此实现并回填 02 §8.2（v0.6），**请确认是否认可** | T7 留档 `docs/reviews/T7-usage-capture.md` §4「待上报头头」 |
+| ✅ | T7 账号口径（**头头 2026-11-26 认可**）：API Key 型渠道按需补建默认账号 `acct_default_<channel_id>`（"账号"在 v1 是统一概念，后续接账号池不改采集层）。02 §8.2 口径不变 | T7 留档 `docs/reviews/T7-usage-capture.md` §4 |
 | 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6，待头头裁决 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 02 §6.1 标题写"8 profile"但表体只有 7 行（03 T8 写"7 个 profile"） | T4 已按 7 个落地；是否回填标题待裁决，见 `docs/reviews/T4-outbound-adapter-verification.md` §6 |
