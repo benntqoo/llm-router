@@ -34,6 +34,17 @@ pub enum ToolSupport {
     Unknown,
 }
 
+impl ToolSupport {
+    /// 文本形式（前端用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolSupport::Stable => "stable",
+            ToolSupport::Partial => "partial",
+            ToolSupport::Unknown => "unknown",
+        }
+    }
+}
+
 /// 预设定义（纯数据）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetDef {
@@ -57,6 +68,8 @@ pub struct PresetDef {
     pub extra_headers: &'static [(&'static str, &'static str)],
     /// `tool_calls` 兼容度
     pub tool_support: ToolSupport,
+    /// 默认模型：`(上游模型名, 对外别名)`（02 §6.1.1；**未实测建议值**，可改）
+    pub default_models: &'static [(&'static str, &'static str)],
 }
 
 impl PresetDef {
@@ -82,6 +95,63 @@ impl PresetDef {
                 .collect(),
         }
     }
+
+    /// 前端视图（IPC 用；`PresetDef` 本身是 `&'static` 引用，不便直接序列化）。
+    pub fn view(&self) -> PresetView {
+        PresetView {
+            provider: self.provider.to_string(),
+            name: self.name.to_string(),
+            base_url: self.base_url.to_string(),
+            chat_path: self.chat_path.to_string(),
+            kind: self.kind.as_str().to_string(),
+            auth_style: self.auth_style.as_str().to_string(),
+            inject_stream_usage: self.inject_stream_usage,
+            supports_groupid_query: self.supports_groupid_query,
+            tool_support: self.tool_support.as_str().to_string(),
+            default_models: self
+                .default_models
+                .iter()
+                .map(|(upstream, alias)| ModelSuggestion {
+                    upstream_id: upstream.to_string(),
+                    alias: alias.to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// 预设的前端视图（02 §6.1 的 profile 数据）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresetView {
+    /// 预设标识（写入 `channel.provider`）。
+    pub provider: String,
+    /// 渠道默认名。
+    pub name: String,
+    /// 基础地址。
+    pub base_url: String,
+    /// chat 路径模板。
+    pub chat_path: String,
+    /// 渠道类型（`api_key`）。
+    pub kind: String,
+    /// 鉴权样式（`bearer`）。
+    pub auth_style: String,
+    /// 是否注入 `stream_options.include_usage`（R-4）。
+    pub inject_stream_usage: bool,
+    /// 是否支持 `?GroupId=` 追加（R-5）。
+    pub supports_groupid_query: bool,
+    /// `tool_calls` 兼容度（`stable` / `partial` / `unknown`）。
+    pub tool_support: String,
+    /// 默认模型建议（**未实测**，用户可改）。
+    pub default_models: Vec<ModelSuggestion>,
+}
+
+/// 一条模型建议。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelSuggestion {
+    /// 上游真实模型名（R-1 替换的目标）。
+    pub upstream_id: String,
+    /// 对外别名。
+    pub alias: String,
 }
 
 /// 全部 v1 预设（02 §6.1 表体的 7 行，顺序与文档一致）。
@@ -100,6 +170,11 @@ pub fn all() -> Vec<PresetDef> {
 /// 按 `channel.provider` 查预设。
 pub fn find(provider: &str) -> Option<PresetDef> {
     all().into_iter().find(|p| p.provider == provider)
+}
+
+/// 全部预设的前端视图（IPC 用）。
+pub fn all_views() -> Vec<PresetView> {
+    all().iter().map(PresetDef::view).collect()
 }
 
 #[cfg(test)]

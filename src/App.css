@@ -136,6 +136,46 @@ code {
   min-width: 180px;
 }
 
+.row-inline select,
+.field select {
+  background: #14161b;
+  border: 1px solid #2c303a;
+  border-radius: 6px;
+  color: #e8eaed;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: #9aa0a6;
+}
+
+.field.block {
+  display: flex;
+  margin: 8px 0;
+}
+
+.field input,
+.field textarea {
+  background: #14161b;
+  border: 1px solid #2c303a;
+  border-radius: 6px;
+  color: #e8eaed;
+  padding: 6px 10px;
+  font-size: 13px;
+  min-width: 180px;
+  font-family: inherit;
+}
+
+.field textarea {
+  resize: vertical;
+  width: 100%;
+}
+
 .card button {
   background: #262a33;
   border: 1px solid #39404d;

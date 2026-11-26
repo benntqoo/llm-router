@@ -60,6 +60,25 @@ pub enum AuthStyle {
     CustomHeader,
 }
 
+impl AuthStyle {
+    /// 文本形式（写进 `channel.meta_json.auth_style`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthStyle::Bearer => "bearer",
+            AuthStyle::CustomHeader => "custom_header",
+        }
+    }
+
+    /// 解析 `channel.meta_json.auth_style`。
+    pub fn parse(raw: &str) -> Option<AuthStyle> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "bearer" => Some(AuthStyle::Bearer),
+            "custom_header" | "custom-header" => Some(AuthStyle::CustomHeader),
+            _ => None,
+        }
+    }
+}
+
 /// 渠道配置：预设 + 渠道行覆盖（02 §9 的 `channel.meta_json`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelConfig {

@@ -26,5 +26,7 @@ pub fn preset() -> PresetDef {
         supports_groupid_query: true,
         extra_headers: &[],
         tool_support: ToolSupport::Unknown,
+        // 02 §6.1.1：默认模型建议（未实测，可改）
+        default_models: &[("abab6.5s-chat", "abab6.5s-chat")],
     }
 }

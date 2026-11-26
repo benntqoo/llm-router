@@ -13,6 +13,9 @@ pub enum StoreError {
 
     #[error("迁移失败: {0}")]
     Migration(String),
+
+    #[error("数据校验失败: {0}")]
+    Invalid(String),
 }
 
 /// 存储层结果别名。

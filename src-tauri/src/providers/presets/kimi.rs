@@ -17,5 +17,7 @@ pub fn preset() -> PresetDef {
         supports_groupid_query: false,
         extra_headers: &[],
         tool_support: ToolSupport::Unknown,
+        // 02 §6.1.1：默认模型建议（未实测，可改）
+        default_models: &[("moonshot-v1-8k", "moonshot-v1-8k")],
     }
 }

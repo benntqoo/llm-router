@@ -141,42 +141,67 @@ fn apply_meta_overrides(
         };
     }
     if let Some(value) = map.get("supports_groupid_query") {
-        config.supports_groupid_query = value.as_bool().ok_or_else(|| {
-            AdapterError::Config("meta_json.supports_groupid_query 必须是布尔值".to_string())
-        })?;
+        // null = 不覆盖（表单里的"没填"不是错）
+        if !value.is_null() {
+            config.supports_groupid_query = value.as_bool().ok_or_else(|| {
+                AdapterError::Config("meta_json.supports_groupid_query 必须是布尔值".to_string())
+            })?;
+        }
     }
     if let Some(value) = map.get("path_chat") {
-        let path = value.as_str().ok_or_else(|| {
-            AdapterError::Config("meta_json.path_chat 必须是字符串".to_string())
-        })?;
-        config.chat_path = path.to_string();
+        if !value.is_null() {
+            let path = value.as_str().ok_or_else(|| {
+                AdapterError::Config("meta_json.path_chat 必须是字符串".to_string())
+            })?;
+            config.chat_path = path.to_string();
+        }
     }
     if let Some(value) = map.get("inject_stream_usage") {
-        config.inject_stream_usage = value.as_bool().ok_or_else(|| {
-            AdapterError::Config("meta_json.inject_stream_usage 必须是布尔值".to_string())
-        })?;
+        if !value.is_null() {
+            config.inject_stream_usage = value.as_bool().ok_or_else(|| {
+                AdapterError::Config("meta_json.inject_stream_usage 必须是布尔值".to_string())
+            })?;
+        }
     }
     if let Some(value) = map.get("base_url") {
-        let base = value.as_str().ok_or_else(|| {
-            AdapterError::Config("meta_json.base_url 必须是字符串".to_string())
-        })?;
-        config.base_url = base.to_string();
+        if !value.is_null() {
+            let base = value.as_str().ok_or_else(|| {
+                AdapterError::Config("meta_json.base_url 必须是字符串".to_string())
+            })?;
+            config.base_url = base.to_string();
+        }
     }
     if let Some(value) = map.get("auth_header_name") {
-        let name = value.as_str().ok_or_else(|| {
-            AdapterError::Config("meta_json.auth_header_name 必须是字符串".to_string())
-        })?;
-        config.auth_header_name = Some(name.to_string());
+        if !value.is_null() {
+            let name = value.as_str().ok_or_else(|| {
+                AdapterError::Config("meta_json.auth_header_name 必须是字符串".to_string())
+            })?;
+            config.auth_header_name = Some(name.to_string());
+        }
+    }
+    if let Some(value) = map.get("auth_style") {
+        if !value.is_null() {
+            let style = value.as_str().ok_or_else(|| {
+                AdapterError::Config("meta_json.auth_style 必须是字符串".to_string())
+            })?;
+            config.auth_style = AuthStyle::parse(style).ok_or_else(|| {
+                AdapterError::Config(format!(
+                    "meta_json.auth_style 不支持 {style:?}（可选 bearer / custom_header）"
+                ))
+            })?;
+        }
     }
     if let Some(value) = map.get("extra_headers") {
-        let map = value.as_object().ok_or_else(|| {
-            AdapterError::Config("meta_json.extra_headers 必须是对象".to_string())
-        })?;
-        for (k, v) in map {
-            let v = v.as_str().ok_or_else(|| {
-                AdapterError::Config(format!("meta_json.extra_headers.{k} 必须是字符串"))
+        if !value.is_null() {
+            let map = value.as_object().ok_or_else(|| {
+                AdapterError::Config("meta_json.extra_headers 必须是对象".to_string())
             })?;
-            config.extra_headers.push((k.to_string(), v.to_string()));
+            for (k, v) in map {
+                let v = v.as_str().ok_or_else(|| {
+                    AdapterError::Config(format!("meta_json.extra_headers.{k} 必须是字符串"))
+                })?;
+                config.extra_headers.push((k.to_string(), v.to_string()));
+            }
         }
     }
     Ok(())
@@ -326,5 +351,44 @@ mod tests {
             config.extra_headers,
             vec![("editor-version".to_string(), "vscode/1.95.0".to_string())]
         );
+    }
+
+    #[test]
+    fn meta_json_can_switch_to_custom_auth_header() {
+        // T8 自定义渠道表单：鉴权样式 + 头名
+        let mut r = row("custom");
+        r.meta_json = Some(
+            r#"{"auth_style":"custom_header","auth_header_name":"x-api-key"}"#.to_string(),
+        );
+        let config = config_from_row(&r).expect("构造配置");
+        assert_eq!(config.auth_style, AuthStyle::CustomHeader);
+        assert_eq!(config.auth_header_name.as_deref(), Some("x-api-key"));
+    }
+
+    #[test]
+    fn meta_json_rejects_unknown_auth_style() {
+        let mut r = row("custom");
+        r.meta_json = Some(r#"{"auth_style":"magic"}"#.to_string());
+        let err = config_from_row(&r).expect_err("未知鉴权样式应报错");
+        assert!(matches!(err, AdapterError::Config(_)));
+    }
+
+    #[test]
+    fn meta_json_null_values_mean_no_override() {
+        // 表单里的"没填"写成 null（整份替换语义），不能当成类型错误
+        let mut r = row("deepseek");
+        r.meta_json = Some(
+            r#"{"path_chat":null,"auth_style":null,"auth_header_name":null,
+                "supports_groupid_query":null,"inject_stream_usage":null,
+                "base_url":null,"extra_headers":null,"group_id":null}"#
+                .to_string(),
+        );
+        let config = config_from_row(&r).expect("null 不应导致失败");
+        assert_eq!(config.chat_path, "/v1/chat/completions");
+        assert_eq!(config.auth_style, AuthStyle::Bearer);
+        assert_eq!(config.auth_header_name, None);
+        assert_eq!(config.group_id, None);
+        assert!(config.inject_stream_usage);
+        assert!(config.extra_headers.is_empty());
     }
 }

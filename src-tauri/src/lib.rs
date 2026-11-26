@@ -141,6 +141,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::gateway::gateway_status,
+            commands::channel::channel_presets,
+            commands::channel::channel_list,
+            commands::channel::channel_save,
+            commands::channel::channel_delete,
+            commands::channel::channel_put_key,
             commands::circuit::circuit_status,
             commands::circuit::circuit_settings_get,
             commands::circuit::circuit_settings_set,
