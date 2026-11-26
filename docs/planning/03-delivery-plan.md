@@ -99,6 +99,7 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 
 **T12 本地估算器** `1d` · 依赖 T7
 - tiktoken-rs 包装；国产模型标 estimated=1。验收：无 usage 渠道强制走估算路径。
+- 落地（2026-11-26）：**验收通过**（e2e + 真机双证）。新增 `gateway::estimator::TiktokenEstimator`（**tiktoken-rs 0.12.1**，编码表 crate 内嵌、运行期不联网），**产线默认估算器**由字符启发式（字符数/4）换成 tiktoken（`CharRatioEstimator` 保留为轻量回退与单测基准）。编码选择：**o200k 家族**（gpt-4o/gpt-4.1/gpt-5/o1/o3/o4/gpt-oss）走 `o200k_base`，**其余全部**（含全部国产模型）走 `cl100k_base`；`is_approximation(model)` 把「国产模型只能近似」写成可查询事实（供 T13 成本换算与 T14 UI 取用），估算值**一律 `estimated=1`**、不参与预算告警（R7），上游已给的精确值**一律不被覆盖**。口径细化回填 02 §8.1（v0.11）：估算入口分**四种情形**——上游给全（原样用，`estimated=0`）/ 上游没回（全估，`estimated=1`）/ 上游**缺一项**（**只补缺的那一项**，另一项仍用上游精确值，`estimated=1`；"缺失"= usage 对象里没有该键，**值为 0 不算缺失**）/ 出站失败（不估 token）。e2e：升级"无 usage 走估算路径"用例（落库数**精确等于** tiktoken 计数，且**不等于**字符启发式计数）+ 新增"上游缺一项只补缺失侧"用例；既有 5 条行为不变。**真机**：应用实跑 → 真网关 → **不返 usage** 的 mock 上游 ⇒ 落库 `prompt_tokens=21 completion_tokens=12 estimated=1 status=success`（同提示词字符启发式只会给 ~8 ⇒ 确实走的是 tiktoken），而上游给了 usage 的行仍是 `estimated=0`。回归 `cargo test` → **299 项全绿**（新增 7 单测 + 1 e2e），0 失败 0 告警。代价：调试版二进制 24.2 MB → **32.2 MB**（内嵌 BPE 表）。验收留档 `docs/reviews/T12-token-estimator.md`。
 
 **T13 价目表与成本换算** `1d` · 依赖 T7
 - `price` 表 + 预填国产牌价 + `cost_micros` 换算。验收：单测覆盖"输入+输出+缓存读"三价换算。
