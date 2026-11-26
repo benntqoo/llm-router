@@ -57,37 +57,65 @@ impl UsageTokens {
     /// 对象里**一个已知字段都没有**时返回 `None`——空的 `usage: {}`
     /// 与"这帧压根没有 usage"必须区分开，否则会被误判成"上游报了 0 token"。
     pub fn from_value(usage: &Value) -> Option<Self> {
-        let map = usage.as_object()?;
-        const KNOWN: &[&str] = &[
-            "prompt_tokens",
-            "completion_tokens",
-            "input_tokens",
-            "output_tokens",
-        ];
-        if !KNOWN.iter().any(|key| map.contains_key(*key)) {
-            return None;
-        }
-        let int = |key: &str| -> i64 {
-            map.get(key)
-                .and_then(Value::as_i64)
-                .or_else(|| map.get(key).and_then(Value::as_u64).map(|v| v as i64))
-                .unwrap_or(0)
-        };
-        let nested = |parent: &str, child: &str| -> i64 {
-            map.get(parent)
-                .and_then(|p| p.get(child))
-                .and_then(Value::as_i64)
-                .or_else(|| {
-                    map.get(parent)
-                        .and_then(|p| p.get(child))
-                        .and_then(Value::as_u64)
-                        .map(|v| v as i64)
-                })
-                .unwrap_or(0)
-        };
-        let pick = |a: i64, b: i64| if a != 0 { a } else { b };
+        parse_reported_usage(usage).map(|reported| reported.tokens)
+    }
+}
 
-        Some(Self {
+/// 上游回报的 `usage`（数值 + **哪些项是上游真给的**）。
+///
+/// 02 §8.1：「`prompt_tokens` / `completion_tokens` —— 上游 `usage`；**缺失时由估算器补**」。
+/// 这里的"缺失"= 上游的 usage 对象里**没有这个键**（**值为 0 不算缺失**）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedUsage {
+    /// 上游给的数值。
+    pub tokens: UsageTokens,
+    /// 上游是否给了输入 token 数。
+    pub prompt_reported: bool,
+    /// 上游是否给了输出 token 数。
+    pub completion_reported: bool,
+}
+
+/// 从上游的 `usage` 对象解析（含"哪些项真给了"）。
+///
+/// 对象里**一个已知字段都没有**时返回 `None`——空的 `usage: {}`
+/// 与"这帧压根没有 usage"必须区分开，否则会被误判成"上游报了 0 token"。
+pub fn parse_reported_usage(usage: &Value) -> Option<ReportedUsage> {
+    let map = usage.as_object()?;
+    const KNOWN: &[&str] = &[
+        "prompt_tokens",
+        "completion_tokens",
+        "input_tokens",
+        "output_tokens",
+    ];
+    if !KNOWN.iter().any(|key| map.contains_key(*key)) {
+        return None;
+    }
+    let int = |key: &str| -> i64 {
+        map.get(key)
+            .and_then(Value::as_i64)
+            .or_else(|| map.get(key).and_then(Value::as_u64).map(|v| v as i64))
+            .unwrap_or(0)
+    };
+    let nested = |parent: &str, child: &str| -> i64 {
+        map.get(parent)
+            .and_then(|p| p.get(child))
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                map.get(parent)
+                    .and_then(|p| p.get(child))
+                    .and_then(Value::as_u64)
+                    .map(|v| v as i64)
+            })
+            .unwrap_or(0)
+    };
+    let pick = |a: i64, b: i64| if a != 0 { a } else { b };
+
+    let prompt_reported = map.contains_key("prompt_tokens") || map.contains_key("input_tokens");
+    let completion_reported =
+        map.contains_key("completion_tokens") || map.contains_key("output_tokens");
+
+    Some(ReportedUsage {
+        tokens: UsageTokens {
             prompt_tokens: pick(int("prompt_tokens"), int("input_tokens")),
             completion_tokens: pick(int("completion_tokens"), int("output_tokens")),
             cache_read_tokens: pick(
@@ -99,8 +127,10 @@ impl UsageTokens {
                 nested("completion_tokens_details", "reasoning_tokens"),
                 int("reasoning_tokens"),
             ),
-        })
-    }
+        },
+        prompt_reported,
+        completion_reported,
+    })
 }
 
 /// 从一个响应 JSON 里取 `usage`（没有则 `None`）。
@@ -108,19 +138,42 @@ pub fn parse_usage(response: &Value) -> Option<UsageTokens> {
     response.get("usage").and_then(UsageTokens::from_value)
 }
 
+/// 从一个响应 JSON 里取 `usage`（含"哪些项真给了"）。
+pub fn parse_reported_usage_from_response(response: &Value) -> Option<ReportedUsage> {
+    response.get("usage").and_then(parse_reported_usage)
+}
+
 /// 汇总"上游回报的 usage"或"本地估算"的结果。
 ///
-/// 返回 `(token 数, 是否估算)`：上游给了 usage 就用上游的（`estimated=false`），
-/// 否则走估算入口（`estimated=true`）。
+/// 返回 `(token 数, 是否估算)`。口径见 02 §8.1：
+///
+/// - 上游给了完整 usage → **原样用**，`estimated=false`；
+/// - 上游没回 usage → 全估，`estimated=true`；
+/// - 上游给了 usage 但**缺其中一项**（该键不存在，**值为 0 不算缺失**）→ **只补缺的那一项**，
+///   另一项仍用上游的精确值，但整行 `estimated=true`（这一行里含有非上游原样的数）。
+///
+/// **绝不用估算值覆盖上游已给的精确值**（R7）。
 pub fn resolve_tokens(
-    upstream: Option<UsageTokens>,
+    upstream: Option<ReportedUsage>,
     estimator: &dyn TokenEstimator,
     model: &str,
     prompt: &str,
     completion: &str,
 ) -> (UsageTokens, bool) {
     match upstream {
-        Some(usage) => (usage, false),
+        Some(reported) => {
+            let mut tokens = reported.tokens;
+            let mut estimated = false;
+            if !reported.prompt_reported {
+                tokens.prompt_tokens = estimate_one(estimator, model, prompt);
+                estimated = true;
+            }
+            if !reported.completion_reported {
+                tokens.completion_tokens = estimate_one(estimator, model, completion);
+                estimated = true;
+            }
+            (tokens, estimated)
+        }
         None => {
             let counts = estimator.estimate(model, prompt, completion);
             (
@@ -133,6 +186,14 @@ pub fn resolve_tokens(
             )
         }
     }
+}
+
+/// 估算单侧 token（估不出来记 0）。
+fn estimate_one(estimator: &dyn TokenEstimator, model: &str, text: &str) -> i64 {
+    estimator
+        .estimate(model, text, "")
+        .map(|c| c.prompt_tokens)
+        .unwrap_or(0)
 }
 
 /// 估算出的 token 数。
@@ -318,7 +379,7 @@ pub struct UsageTap<E> {
     estimator: Arc<dyn TokenEstimator>,
     sink: Arc<dyn UsageSink>,
     started: Instant,
-    usage: Option<UsageTokens>,
+    usage: Option<ReportedUsage>,
     ttft_ms: Option<i64>,
     completion_text: String,
     completion_truncated: bool,
@@ -374,7 +435,7 @@ impl<E> UsageTap<E> {
             let Ok(value) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
-            if let Some(usage) = value.get("usage").and_then(UsageTokens::from_value) {
+            if let Some(usage) = value.get("usage").and_then(parse_reported_usage) {
                 self.usage = Some(usage);
             }
             let (content, reasoning) = delta_text(&value);

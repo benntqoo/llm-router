@@ -20,7 +20,7 @@ use crate::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use crate::gateway::ratelimit::RateLimiter;
 use crate::gateway::router::AliasRouter;
 use crate::gateway::server::{self, GatewayState};
-use crate::gateway::usage::CharRatioEstimator;
+use crate::gateway::estimator::TiktokenEstimator;
 use crate::store::usage::StoreUsageSink;
 use crate::store::Store;
 use crate::vault::Vault;
@@ -110,7 +110,7 @@ pub fn run() {
                 Arc::clone(&store),
                 // 用量采集（02 §8.1）：落库 + 估算入口（估算器本身在 T12）
                 Arc::new(StoreUsageSink::new(Arc::clone(&store))),
-                Arc::new(CharRatioEstimator),
+                Arc::new(TiktokenEstimator),
             ));
             let gateway_state = GatewayState {
                 store: Arc::clone(&store),

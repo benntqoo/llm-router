@@ -26,8 +26,8 @@ use crate::gateway::outbound::{
 use crate::gateway::router::{RouteCandidate, RoutePlan};
 use crate::gateway::stream;
 use crate::gateway::usage::{
-    extract_completion_text, extract_prompt_text, parse_usage, resolve_tokens, TokenEstimator,
-    UsageContext, UsageTap, PROTOCOL_OPENAI,
+    extract_completion_text, extract_prompt_text, parse_reported_usage_from_response,
+    resolve_tokens, TokenEstimator, UsageContext, UsageTap, PROTOCOL_OPENAI,
 };
 use crate::providers;
 use crate::providers::adapter::{CallContext, OpenAIRequest, OutgoingCall, ProviderAdapter};
@@ -491,7 +491,7 @@ impl Forwarder {
         body: Option<&Value>,
         started: Instant,
     ) {
-        let upstream = body.and_then(parse_usage);
+        let upstream = body.and_then(parse_reported_usage_from_response);
         let completion = body.map(extract_completion_text).unwrap_or_default();
         let (tokens, estimated) = resolve_tokens(
             upstream,

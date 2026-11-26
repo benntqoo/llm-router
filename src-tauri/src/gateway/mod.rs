@@ -11,6 +11,7 @@ pub mod auth;
 pub mod circuit;
 pub mod circuit_store;
 pub mod errors;
+pub mod estimator;
 pub mod fallback;
 pub mod inbound;
 pub mod logging;

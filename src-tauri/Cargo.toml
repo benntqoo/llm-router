@@ -44,6 +44,7 @@ reqwest = { version = "0.12.28", default-features = false, features = ["rustls-t
 # 流式管道：Stream 组合（stream.rs 的逐帧转发与错误收尾）
 futures-util = "0.3"
 bytes = "1"
+tiktoken-rs = "0.12.1"
 
 # Windows DPAPI（主密钥由 OS 原生保护，绑定当前用户）
 [target.'cfg(windows)'.dependencies]

@@ -18,12 +18,13 @@ use axum::Router;
 use llm_router_lib::gateway::auth;
 use llm_router_lib::gateway::circuit::CircuitBreaker;
 use llm_router_lib::gateway::circuit_store::StoreCircuitPersistence;
+use llm_router_lib::gateway::estimator::TiktokenEstimator;
 use llm_router_lib::gateway::fallback::Forwarder;
 use llm_router_lib::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use llm_router_lib::gateway::ratelimit::RateLimiter;
 use llm_router_lib::gateway::router::AliasRouter;
 use llm_router_lib::gateway::server::{self, GatewayState};
-use llm_router_lib::gateway::usage::CharRatioEstimator;
+use llm_router_lib::gateway::usage::{CharRatioEstimator, TokenEstimator};
 use llm_router_lib::store::quota::read_quota;
 use llm_router_lib::store::usage::StoreUsageSink;
 use llm_router_lib::store::Store;
@@ -43,6 +44,10 @@ const NON_STREAM_BODY: &str = r#"{"id":"chatcmpl-usage","choices":[{"message":{"
 /// 非流式：成功但**没有** usage（走估算入口）。
 const NON_STREAM_NO_USAGE_BODY: &str =
     r#"{"id":"chatcmpl-nousage","choices":[{"message":{"role":"assistant","content":"你好，世界"}}]}"#;
+
+/// 非流式：成功，`usage` **只给**输入 token 数（缺输出 ⇒ 估算器补缺的那一项）。
+const NON_STREAM_PARTIAL_USAGE_BODY: &str =
+    r#"{"id":"chatcmpl-partial","choices":[{"message":{"role":"assistant","content":"你好，世界"}}],"usage":{"prompt_tokens":31}}"#;
 
 /// 流式：增量帧 + 末帧 usage（`stream_options.include_usage` 的形态）。
 const STREAM_BODY: &str = concat!(
@@ -76,6 +81,12 @@ async fn mock_handler(
             StatusCode::OK,
             [(CONTENT_TYPE, "application/json")],
             NON_STREAM_NO_USAGE_BODY,
+        )
+            .into_response(),
+        "partialusage" => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            NON_STREAM_PARTIAL_USAGE_BODY,
         )
             .into_response(),
         "sseusage" => (
@@ -142,7 +153,8 @@ fn fixture() -> Fixture {
         Arc::clone(&vault),
         Arc::clone(&store),
         Arc::new(StoreUsageSink::new(Arc::clone(&store))),
-        Arc::new(CharRatioEstimator),
+        // 与产线同款：T12 起默认用 tiktoken-rs 估算器
+        Arc::new(TiktokenEstimator),
     ));
     let state = GatewayState {
         router: Arc::new(AliasRouter::new(Arc::clone(&store))),
@@ -207,9 +219,14 @@ fn seed_channel(f: &Fixture, id: &str, name: &str, scenario: &str, base_url: &st
 
 /// 发起一次 chat 请求（流式或非流式）。
 async fn chat(f: &Fixture, model: &str, stream: bool) -> Response {
+    chat_with_prompt(f, model, stream, "hi").await
+}
+
+/// 发起一次 chat 请求，带自定义提示词（估算口径要按真实提示词对账）。
+async fn chat_with_prompt(f: &Fixture, model: &str, stream: bool, prompt: &str) -> Response {
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [{"role": "user", "content": prompt}],
         "stream": stream
     });
     server::router(f.state.clone())
@@ -413,7 +430,11 @@ async fn acceptance_rate_limit_updates_quota_json() {
     assert_eq!(row.estimated, 0);
 }
 
-// ── 补充：上游没回 usage → 走估算入口 ─────────────────────────────────
+// ── 补充：上游没回 usage → 走估算入口（T12：tiktoken 路径）─────────────
+
+/// 估算用例用的提示词：含 emoji——字符启发式与 tiktoken 的结论明显不同，
+/// 这样"落库的数确实来自 tiktoken"才测得出来。
+const ESTIMATE_PROMPT: &str = "🌈估算🌈路径🌈验证🌈token🌈";
 
 #[tokio::test]
 async fn acceptance_success_without_upstream_usage_is_estimated() {
@@ -421,7 +442,7 @@ async fn acceptance_success_without_upstream_usage_is_estimated() {
     let f = fixture();
     seed_channel(&f, "c1", "用量渠道", "nousage", &base, "chat-a");
 
-    let response = chat(&f, "chat-a", false).await;
+    let response = chat_with_prompt(&f, "chat-a", false, ESTIMATE_PROMPT).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let rows = wait_usage_rows(&f.store, 1).await;
@@ -429,6 +450,55 @@ async fn acceptance_success_without_upstream_usage_is_estimated() {
     assert_eq!(row.estimated, 1, "上游没回 usage → 应标估算");
     assert!(row.prompt_tokens > 0, "输入应被估算");
     assert!(row.completion_tokens > 0, "输出应被估算");
+    assert_eq!(row.status.as_deref(), Some("success"));
+
+    // 落库的数必须**等于 tiktoken 的计数**（上游模型名走 cl100k_base）
+    let completion = "你好，世界";
+    let tik = TiktokenEstimator
+        .estimate("deepseek-chat", ESTIMATE_PROMPT, completion)
+        .expect("tiktoken 估算");
+    let chr = CharRatioEstimator
+        .estimate("deepseek-chat", ESTIMATE_PROMPT, completion)
+        .expect("字符启发式估算");
+    assert_ne!(
+        tik.prompt_tokens, chr.prompt_tokens,
+        "用例必须能区分 tiktoken 与字符启发式，否则测不出换了实现"
+    );
+    assert_eq!(
+        row.prompt_tokens, tik.prompt_tokens,
+        "输入 token 应等于 tiktoken 计数"
+    );
+    assert_eq!(
+        row.completion_tokens, tik.completion_tokens,
+        "输出 token 应等于 tiktoken 计数"
+    );
+}
+
+// ── 补充：上游 usage 缺一项 → 只补缺的那一项（02 §8.1）──────────────────
+
+#[tokio::test]
+async fn acceptance_partial_upstream_usage_estimates_only_missing_side() {
+    let base = start_mock().await;
+    let f = fixture();
+    seed_channel(&f, "c1", "用量渠道", "partialusage", &base, "chat-a");
+
+    let response = chat(&f, "chat-a", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = wait_usage_rows(&f.store, 1).await;
+    let row = &rows[0];
+    assert_eq!(
+        row.prompt_tokens, 31,
+        "上游给了的输入 token 不该被估算覆盖（R7）"
+    );
+    assert!(
+        row.completion_tokens > 0,
+        "缺失的输出 token 应由估算器补"
+    );
+    assert_eq!(
+        row.estimated, 1,
+        "含估算值的行必须标估算，不能冒充精确值"
+    );
     assert_eq!(row.status.as_deref(), Some("success"));
 }
 

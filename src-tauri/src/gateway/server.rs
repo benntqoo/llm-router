@@ -255,7 +255,7 @@ mod tests {
 
     use crate::gateway::circuit::CircuitBreaker;
     use crate::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
-    use crate::gateway::usage::CharRatioEstimator;
+    use crate::gateway::estimator::TiktokenEstimator;
     use crate::store::usage::StoreUsageSink;
     use crate::vault::Vault;
 
@@ -292,7 +292,7 @@ mod tests {
             Arc::clone(&vault),
             Arc::clone(&store),
             Arc::new(StoreUsageSink::new(Arc::clone(&store))),
-            Arc::new(CharRatioEstimator),
+            Arc::new(TiktokenEstimator),
         ));
         let state = GatewayState {
             router: Arc::new(AliasRouter::new(Arc::clone(&store))),
