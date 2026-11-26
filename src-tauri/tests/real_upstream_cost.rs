@@ -6,9 +6,13 @@
 //! **默认不跑**（`#[ignore]`）：需要真实 API Key，且会打真实网络。
 //!
 //! ```powershell
-//! $env:OPENROUTER_API_KEY = "<你的 key>"
+//! $env:OPENROUTER_API_KEY = "<你的 OpenRouter API key（sk-or-v1- 开头）>"
 //! cargo test --offline --test real_upstream_cost -- --ignored --nocapture
 //! ```
+//!
+//! **key 必须是 OpenRouter 的 API key**（形如 `sk-or-v1-<64 hex>`）；本项目自己的入站
+//! client key（`llmr_` 开头）是**另一回事**，拿它去请求 OpenRouter 会被判成
+//! `Missing Authentication header`。
 //!
 //! - `OPENROUTER_MODEL` 可选，覆盖默认的免费模型（默认按候选列表依次尝试）。
 //! - **零花费**：只用 OpenRouter 的 `:free` 模型；`cost_micros` 由**我们自己的价目表**
@@ -240,7 +244,7 @@ fn query_rows(store: &Store) -> Vec<Row> {
 }
 
 async fn wait_rows(store: &Store, expected: usize) -> Vec<Row> {
-    for _ in 0..300 {
+    for _ in 0..1000 {
         let rows = query_rows(store);
         if rows.len() >= expected {
             return rows;
@@ -248,6 +252,39 @@ async fn wait_rows(store: &Store, expected: usize) -> Vec<Row> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("等待 {expected} 行 usage_log 超时，实际 {} 行", query_rows(store).len());
+}
+
+/// 候选模型列表：`OPENROUTER_MODEL` 优先，否则按免费模型列表依次尝试。
+fn candidate_models() -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(model) = std::env::var("OPENROUTER_MODEL") {
+        if !model.trim().is_empty() {
+            candidates.push(model.trim().to_string());
+        }
+    }
+    candidates.extend(FREE_MODEL_CANDIDATES.iter().map(|s| s.to_string()));
+    candidates
+}
+
+/// 逐个尝试候选模型，返回**第一个拿到 HTTP 200** 的夹具与模型 id。
+///
+/// 每个候选用独立夹具（独立 store / 保险库），所以失败候选留下的错误行不会污染成功候选的 `usage_log`。
+async fn first_working_fixture(api_key: &str, probe_prompt: &str) -> (Fixture, String) {
+    let mut errors: Vec<String> = Vec::new();
+    for model in candidate_models() {
+        let f = fixture();
+        seed_openrouter(&f, &model, api_key);
+        let (status, body) = chat(&f, probe_prompt).await;
+        if status == 200 {
+            return (f, model);
+        }
+        errors.push(format!("{model}: HTTP {status} → {}", truncate(&body, 200)));
+        println!("[real-upstream] {model} 失败（HTTP {status}），换下一个候选");
+    }
+    panic!(
+        "所有候选免费模型都失败：\n{}",
+        errors.join("\n")
+    );
 }
 
 /// 真实上游实测：**真实 token 数 → `cost_micros`**。
@@ -258,77 +295,51 @@ async fn real_upstream_cost_micros_matches_independent_recompute() {
         .expect("需要环境变量 OPENROUTER_API_KEY（真实上游实测用）");
     assert!(!api_key.trim().is_empty(), "OPENROUTER_API_KEY 不能为空");
 
-    // 模型候选：`OPENROUTER_MODEL` 优先，否则按免费模型列表依次尝试（免费模型限流较重）。
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(model) = std::env::var("OPENROUTER_MODEL") {
-        if !model.trim().is_empty() {
-            candidates.push(model);
-        }
-    }
-    candidates.extend(FREE_MODEL_CANDIDATES.iter().map(|s| s.to_string()));
+    // 逐个尝试候选免费模型（免费模型限流较重）→ 拿到第一个成功的夹具。
+    let (f, model) = first_working_fixture(&api_key, "用一句话介绍你自己。").await;
 
-    let mut last_error = String::new();
-    for model in &candidates {
-        let f = fixture();
-        seed_openrouter(&f, model, &api_key);
-        let (status, body) = chat(&f, "用一句话介绍你自己。").await;
-        if status != 200 {
-            last_error = format!("{model}: HTTP {status} → {}", truncate(&body, 300));
-            println!("[real-upstream] {model} 失败，换下一个候选");
-            continue;
-        }
-        // 上游真的回了内容（不是空壳）
-        assert!(
-            body.contains("choices"),
-            "{model}: 响应体不像 OpenAI 兼容格式 → {}",
-            truncate(&body, 300)
-        );
+    let rows = wait_rows(&f.store, 1).await;
+    let row = &rows[0];
 
-        let rows = wait_rows(&f.store, 1).await;
-        let row = &rows[0];
+    println!("[real-upstream] model = {model}");
+    println!(
+        "[real-upstream] usage: prompt={} completion={} cache_read={} cache_write={} estimated={} status={:?}",
+        row.prompt_tokens,
+        row.completion_tokens,
+        row.cache_read_tokens,
+        row.cache_write_tokens,
+        row.estimated,
+        row.status
+    );
+    println!("[real-upstream] cost_micros = {:?}", row.cost_micros);
 
-        println!("[real-upstream] model = {model}");
-        println!(
-            "[real-upstream] usage: prompt={} completion={} cache_read={} cache_write={} estimated={} status={:?}",
-            row.prompt_tokens,
-            row.completion_tokens,
-            row.cache_read_tokens,
-            row.cache_write_tokens,
-            row.estimated,
-            row.status
-        );
-        println!("[real-upstream] cost_micros = {:?}", row.cost_micros);
+    assert_eq!(row.status.as_deref(), Some("success"), "请求应成功");
+    assert!(
+        row.prompt_tokens > 0,
+        "{model}: 真实上游应报出输入 token（usage 解析没生效？）"
+    );
+    assert!(
+        row.completion_tokens > 0,
+        "{model}: 真实上游应报出输出 token（usage 解析没生效？）"
+    );
+    assert_eq!(row.estimated, 0, "真实上游给了 usage → 不是估算值");
 
-        assert_eq!(row.status.as_deref(), Some("success"), "请求应成功");
-        assert!(
-            row.prompt_tokens > 0,
-            "{model}: 真实上游应报出输入 token（usage 解析没生效？）"
-        );
-        assert!(
-            row.completion_tokens > 0,
-            "{model}: 真实上游应报出输出 token（usage 解析没生效？）"
-        );
-        assert_eq!(row.estimated, 0, "真实上游给了 usage → 不是估算值");
-
-        // 独立复算（不调用生产代码的换算函数）
-        let expected = expected_cost_micros(
-            row.prompt_tokens,
-            row.completion_tokens,
-            row.cache_read_tokens,
-            row.cache_write_tokens,
-        );
-        assert_eq!(
-            row.cost_micros,
-            Some(expected),
-            "{model}: 成本应等于独立复算值（prompt={} completion={} cache_read={}）",
-            row.prompt_tokens,
-            row.completion_tokens,
-            row.cache_read_tokens
-        );
-        println!("[real-upstream] 独立复算 = {expected} micros ✅");
-        return;
-    }
-    panic!("所有候选免费模型都失败：{last_error}");
+    // 独立复算（不调用生产代码的换算函数）
+    let expected = expected_cost_micros(
+        row.prompt_tokens,
+        row.completion_tokens,
+        row.cache_read_tokens,
+        row.cache_write_tokens,
+    );
+    assert_eq!(
+        row.cost_micros,
+        Some(expected),
+        "{model}: 成本应等于独立复算值（prompt={} completion={} cache_read={}）",
+        row.prompt_tokens,
+        row.completion_tokens,
+        row.cache_read_tokens
+    );
+    println!("[real-upstream] 独立复算 = {expected} micros ✅");
 }
 
 /// 真实上游实测（第二轮，同一提示词）：观察 OpenRouter 是否报出**缓存命中** token。
@@ -339,17 +350,24 @@ async fn real_upstream_cost_micros_matches_independent_recompute() {
 async fn real_upstream_reports_cache_read_tokens_if_any() {
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .expect("需要环境变量 OPENROUTER_API_KEY（真实上游实测用）");
-    let model = std::env::var("OPENROUTER_MODEL")
-        .unwrap_or_else(|_| FREE_MODEL_CANDIDATES[0].to_string());
+    assert!(!api_key.trim().is_empty(), "OPENROUTER_API_KEY 不能为空");
 
-    let f = fixture();
-    seed_openrouter(&f, &model, &api_key);
-    // 同一段较长的提示词连发两次：若上游做前缀缓存，第二次可能报出 cached_tokens
+    // 同一段较长的提示词连发两次：若上游做前缀缓存，第二次可能报出 cached_tokens。
     let prompt = "请用三句话解释什么是向量数据库，并给出一个具体的使用场景。".repeat(8);
-    let _ = chat(&f, &prompt).await;
-    let _ = chat(&f, &prompt).await;
 
-    let rows = wait_rows(&f.store, 2).await;
+    // 先探一个能用的模型（探测本身也算一轮请求，故最终 3 行 usage_log）。
+    let (f, model) = first_working_fixture(&api_key, "ping").await;
+
+    for round in 1..=2 {
+        let (status, body) = chat(&f, &prompt).await;
+        assert_eq!(
+            status, 200,
+            "{model}: 第 {round} 轮应成功 → HTTP {status} {}",
+            truncate(&body, 200)
+        );
+    }
+
+    let rows = wait_rows(&f.store, 3).await;
     for (i, row) in rows.iter().enumerate() {
         println!(
             "[real-upstream] 第 {} 轮: prompt={} completion={} cache_read={} cost_micros={:?}",
@@ -358,6 +376,21 @@ async fn real_upstream_reports_cache_read_tokens_if_any() {
             row.completion_tokens,
             row.cache_read_tokens,
             row.cost_micros
+        );
+        // 失败轮（401/429）也会落一行，但 token 为 0 —— 必须显式判成功，
+        // 否则「上游全失败 + 成本恒为 0」会变成假绿。
+        assert_eq!(
+            row.status.as_deref(),
+            Some("success"),
+            "第 {} 轮应成功（失败轮 token 为 0，会让断言失去意义）",
+            i + 1
+        );
+        assert!(
+            row.prompt_tokens > 0 && row.completion_tokens > 0,
+            "第 {} 轮应报出真实 token（prompt={} completion={}）",
+            i + 1,
+            row.prompt_tokens,
+            row.completion_tokens
         );
         let expected = expected_cost_micros(
             row.prompt_tokens,
