@@ -57,9 +57,10 @@
 第 7 步：~~T6 流式管道 + fallback + 熔断~~ ✅（提交 `ad50996`，验收留档 `docs/reviews/T6-stream-fallback-circuit-verification.md`）
 第 8 步：~~T6 追加：熔断落库 + UI 展示 + 429/Retry-After 口径~~ ✅（头头裁决后落地，留档 `docs/reviews/T6-circuit-persistence-verification.md`）；同批追加二（熔断时长可配 + 手动解除）、追加三（429 冷却上限可配，提交 `96be851`）也已落地
 第 9 步：~~T7 usage 采集~~ ✅（提交 `59053b2`，留档 `docs/reviews/T7-usage-capture.md`）
-第 10 步：~~T8 A 类预设 + 自定义渠道~~ ✅（提交 `a340a29`，留档 `docs/reviews/T8-preset-and-custom-channel.md`）；下一步 T9 UI 第一轮（关键路径 T9→T10）
-第 11 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
-第 12 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
+第 10 步：~~T8 A 类预设 + 自定义渠道~~ ✅（提交 `a340a29`，留档 `docs/reviews/T8-preset-and-custom-channel.md`）
+第 11 步：~~T9 UI 第一轮~~ ✅（提交 `e70df27`，留档 `docs/reviews/T9-ui-first-round.md`）；下一步 T10 实测矩阵 → T11 安全验收
+第 12 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
+第 13 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
 ```
 
 排期基准 6 周（03 §4）。滞后处理按 03 §5 降级预案，不擅自砍范围。
@@ -122,6 +123,7 @@
 | ✅ | T7 usage 采集（流式**旁路 tee** 解析 usage 帧 + 记 TTFT + 非流式直读 + `estimated` 估算入口 + `usage_log` 落库（增 `account_id`，schema v7）+ per `(channel, account)` 的 RPM/RPD/TPM/TPD 计数 + 429 限额自学习回写 `quota_json`） | 提交 `59053b2`；留档 `docs/reviews/T7-usage-capture.md`；02 §8.1/§8.2（v0.6） |
 | ✅ | T7 账号口径（**头头 2026-11-26 认可**）：API Key 型渠道按需补建默认账号 `acct_default_<channel_id>`（"账号"在 v1 是统一概念，后续接账号池不改采集层）。02 §8.2 口径不变 | T7 留档 `docs/reviews/T7-usage-capture.md` §4 |
 | ✅ | T8 A 类预设 + 自定义渠道（02 §6.1 的 7 个 profile 全部接入 UI：每个预设带一条**默认模型建议值**（公开常识值，**未实测、可改**）→ 选中预设后**仅剩填 key 一步**；自定义 OpenAI 兼容渠道表单：base_url / 路径模板 / 鉴权样式（`bearer`｜`custom_header`）/ GroupId / include_usage 开关 / 额外固定头 / 模型别名 → 保存后别名**立即**出现在 `GET /v1/models`） | 提交 `a340a29`；留档 `docs/reviews/T8-preset-and-custom-channel.md`；截图 `docs/reviews/app-ui-channel.png`；02 §6.1.1/§6.1.2/§9（v0.7） |
+| ✅ | T9 UI 第一轮（渠道列表/编辑 + **模型别名多行管理** + 渠道启用/禁用 + 优先级；密钥录入与回看（**30s 自动遮蔽**）且与渠道面板**联动一致**；**client key 管理**（创建 + 标签/限额编辑）；**`/v1/models` 预览**（与网关同源）+ 客户端接入片段） | 提交 `e70df27`；留档 `docs/reviews/T9-ui-first-round.md`；截图 `docs/reviews/app-ui-t9-channels.png` / `app-ui-t9-preview.png`；02 §6.6（v0.8）；**判据实测：从零配置 DeepSeek 渠道 + client key = 7.1 秒（上限 3 分钟）** |
 | 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6，待头头裁决 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 02 §6.1 标题写"8 profile"但表体只有 7 行（03 T8 写"7 个 profile"） | T4 与 T8 均按 7 个落地（T8 的 §6.1.1 列出 7 条默认模型，UI 下拉也是 7 个）；是否回填标题待裁决，见 `docs/reviews/T4-outbound-adapter-verification.md` §6 |
