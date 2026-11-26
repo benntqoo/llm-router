@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.9（变更记录见 §13） |
+| 版本 | v0.10（变更记录见 §13） |
 | 日期 | 2026-11-26 |
 | 上游文档 | `01-architecture-and-feasibility.md`（可行性基线与竞品调研） |
 | 状态 | 待评审后进入开发。**本文档未改动任何代码或配置**。 |
@@ -122,6 +122,7 @@ src-tauri/src/
 scripts/
   channel_matrix.py     # 渠道实测矩阵执行器（02 §10.1）：经网关跑 6 项，产出 docs/reviews/channel-matrix-*.md
   pi_models.py          # 生成 pi 的 models.json / settings.json 片段（02 §6.5），别名从应用库直读
+  security_check.py     # M1 安全验收执行器（02 §10.2）：四条判据，只读
 src-tauri/examples/
   presets.rs            # 导出 A 类预设清单，供脚本侧引用（避免抄名单）
 ```
@@ -774,6 +775,41 @@ python scripts/channel_matrix.py --store "$env:APPDATA/llm-router/store.db"
 4. 监听 0.0.0.0 且无 client key → 启动拒绝并告警
 ```
 
+**执行口径（T11 落地）**
+
+判据 1 的原始正则**必然命中** DDL 注释与 `credential.kind` / `channel.kind` 的枚举值
+（`api_key`），无法区分"字段名"与"真实密钥明文"。因此命中项**分两类**：
+
+| 类别 | 判定 | 要求 |
+|---|---|---|
+| **明文凭证命中** | 命中已知密钥值（比对得出）或匹配凭证形态（`sk-…` / `llmr_…` / `Bearer …`） | **必须为 0**，否则判据不通过 |
+| **结构性命中** | DDL 注释、列名、`kind` 枚举值等字段名/取值 | 逐条列出供人工核对，**不静默忽略** |
+
+可复跑执行器（**只读**，不修改库与保险库）：
+
+```powershell
+python scripts/security_check.py `
+    --store "$env:APPDATA\llm-router\store.db" `
+    --vault "$env:APPDATA\llm-router\vault.bin" `
+    --log <应用 stdout 日志> --log <应用 stderr 日志> `
+    --secret "<渠道 key 明文>" --secret "<client key 明文>" `
+    --dump-out <dump.sql> `
+    --bind-check "<llm-router.exe>"
+```
+
+补充要求（均为本轮实跑确认的坑）：
+
+- **库要扫三层**：逻辑 dump + `store.db` 主库原始字节 + **`-wal` / `-shm` 原始字节**
+  （只扫主库会漏掉 WAL 里的新数据）；判据 1 要在**已实际录入过密钥**的库上跑，空库扫不出任何东西。
+- **判据 3 要有机制，不只是"没泄漏"**：02 §5.2 承诺的「日志中间件全局脱敏」由
+  `gateway::logging::request_log` 承担（敏感键值一律 `***`，请求体不落日志），
+  挂在 `gateway::server::router()` 上。
+- **判据 4 要做正反两例**：无 client key ⇒ 拒绝启动且端口不监听；有 client key ⇒ 允许改绑。
+  策略是"有 client key 才允许改绑"，不是"一律禁止 0.0.0.0"。
+
+> `AGENT.md` §9 的命令原文**未改**（按 §6-3 走提案流程）；上面的分类口径对应
+> `docs/reviews/T2-vault-verification.md` §6 的提案 1 + 提案 3，正式口径仍待头头裁决。
+
 ### 10.3 里程碑验收
 
 见交付计划文档（`03-delivery-plan.md`）。
@@ -819,3 +855,4 @@ python scripts/channel_matrix.py --store "$env:APPDATA/llm-router/store.db"
 | v0.7 | 2026-11-26 | T8 预设接入与自定义渠道回填：§6.1.1 预设的**默认模型建议值**（未实测，可改）、§6.1.2 **自定义 OpenAI 兼容渠道的表单字段**（base_url / 路径模板 / 鉴权样式 / GroupId / include_usage 开关 / 额外头 / 模型别名）、§9 `channel.meta_json` 增 `auth_style` 与 `extra_headers` |
 | v0.8 | 2026-11-26 | T9 UI 第一轮回填：§6.5 注明 pi 实连归 T10；新增 §6.6 **应用内 UI 面板口径**（各面板职责与权威数据源 + **模型预览必须与 `GET /v1/models` 同源** + **跨面板数据变更要广播**，防止 UI 与网关漂移） |
 | v0.9 | 2026-11-26 | T10 实测矩阵与 pi 实连回填：§6.5 **重写**为 pi 接入指引（安装 / 配置文件位置 / JSON 片段 / 环境变量插值 / 验证命令 / 实连结论，依据 pi 1.6.1 自带 schema 与官方文档）；§10.1 补**矩阵执行方式**（经网关打、预设名单单一权威、只读取库、client key 不落盘）与当前状态（**真实 7 列待 API Key**）；§1.2 补 `scripts/` 与 `src-tauri/examples/` 目录说明 |
+| v0.10 | 2026-11-26 | T11 安全验收回填：§10.2 补**执行口径**（命中项分"明文凭证命中"与"结构性命中"两类，前者必须为 0、后者逐条列出；判据 1 要扫 dump + 主库 + WAL/SHM 三层；判据 3 要有日志脱敏中间件机制；判据 4 做正反两例）+ 可复跑执行器 `scripts/security_check.py`；§1.2 补该脚本。**§5.2 的「日志中间件全局脱敏」此前未接入**（T2 §7 记着"随 T3 接入"，T3 已过但一直没接），本轮由 `gateway::logging::request_log` 补齐 |

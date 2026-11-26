@@ -61,7 +61,7 @@
 第 11 步：~~T9 UI 第一轮~~ ✅（提交 `e70df27`，留档 `docs/reviews/T9-ui-first-round.md`）
 第 12 步：~~T10 实测矩阵（A 类 7 列 + pi 接入）~~ 🟡 **pi 实连已通过**（留档 `docs/reviews/T10-channel-matrix-and-pi.md`）；**A 类 7 列真实矩阵经头头决定挂起**（先不测真实上游，见 §8 账本）
 第 13 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
-第 14 步：T11 安全验收 → 02 §10.2 四条判据全过，记录进 `docs/reviews/security-check-m1.md`
+第 14 步：~~T11 安全验收~~ ✅（02 §10.2 四条判据全过；补上了 §5.2 承诺但一直没接的日志脱敏中间件；留档 `docs/reviews/security-check-m1.md`）
 第 15 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
 ```
 
@@ -128,7 +128,8 @@
 | ✅ | T9 UI 第一轮（渠道列表/编辑 + **模型别名多行管理** + 渠道启用/禁用 + 优先级；密钥录入与回看（**30s 自动遮蔽**）且与渠道面板**联动一致**；**client key 管理**（创建 + 标签/限额编辑）；**`/v1/models` 预览**（与网关同源）+ 客户端接入片段） | 提交 `e70df27`；留档 `docs/reviews/T9-ui-first-round.md`；截图 `docs/reviews/app-ui-t9-channels.png` / `app-ui-t9-preview.png`；02 §6.6（v0.8）；**判据实测：从零配置 DeepSeek 渠道 + client key = 7.1 秒（上限 3 分钟）** |
 | 🟡 | **T10 实测矩阵（A 类 7 列 + pi 接入）**：**pi 实连已通过**（官方脚本装 Pi 1.6.1；`~/.pi/agent/models.json` 片段由 `scripts/pi_models.py` 从应用库直读生成；一轮带工具调用的对话经真网关成功——模型出 `read` tool_call → pi 执行真实工具 → 结果回传；网关 2 次请求 + 2 条 `usage_log status=success estimated=0`；上游侧看到的是渠道密钥）。**矩阵侧执行器已建成**（`scripts/channel_matrix.py` 经网关跑 6 项，预设名单由 `cargo run --example presets` 导出），在 mock 上**经真网关 6 项全绿**。**A 类 7 列真实数据仍缺真实 API Key**（本机无任何 A 类渠道密钥，`channel` 表为空），未测单元格一律标「· 未测」 | 留档 `docs/reviews/T10-channel-matrix-and-pi.md`；矩阵产物（框架自测）`docs/reviews/channel-matrix-2026-11-26-mock.md`；02 §6.5/§10.1/§1.2（v0.9） |
 | 🟡 | **T10 剩余项：A 类 7 列真实矩阵 + 预设 `stable`/`partial` 标注**。**头头 2026-11-26 决定「先不测真实上游」**，本项按**挂起**收口（非阻塞）：未测单元格一律标「· 未测」，**不猜测渠道能力**。解除条件 = 拿到任一 A 类渠道真实 API Key；到位后 `python scripts/channel_matrix.py --store "$env:APPDATA/llm-router/store.db"` 覆盖 `docs/reviews/channel-matrix-<日期>.md`，再按全绿/部分绿回填预设标注。**连带影响**：03 §1 的 M1 判据 ①「与 **DeepSeek** 完成一轮带工具调用的多轮对话」目前只有 **mock 上游**版本，真实 DeepSeek 版同样挂起 | 头头 2026-11-26 决定；执行器 `scripts/channel_matrix.py` 已就绪；留档 `docs/reviews/T10-channel-matrix-and-pi.md` §5 |
-| 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6，待头头裁决 |
+| ✅ | **T11 安全验收**（02 §10.2 四条判据全过）：① 库内明文（dump + 主库 + WAL/SHM 三层扫描，**明文凭证命中 0**）；② `vault.bin` 三重扫描 0 命中；③ 日志敏感键**全部脱敏为 `***`**（本轮补上了 §5.2 承诺但一直没接的 `gateway::logging::request_log` 中间件）；④ 绑定策略（无 client key ⇒ 拒绝启动且端口不监听；有 client key ⇒ 允许改绑）。四条判据固化为只读执行器 `scripts/security_check.py` | 留档 `docs/reviews/security-check-m1.md`；02 §10.2 执行口径 + §1.2（v0.10）；回归 `cargo test` 291 项全绿 |
+| 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径。**T11 已把"明文凭证命中 / 结构性命中"的分类口径写进 02 §10.2 并实现为 `scripts/security_check.py`（等价于提案 1+3）**，但 **AGENT.md §9 原文未改**（按 §6-3 走提案流程），正式口径仍待头头裁决 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6；T11 口径见 `docs/reviews/security-check-m1.md` §4 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 02 §6.1 标题写"8 profile"但表体只有 7 行（03 T8 写"7 个 profile"） | T4 与 T8 均按 7 个落地（T8 的 §6.1.1 列出 7 条默认模型，UI 下拉也是 7 个）；是否回填标题待裁决，见 `docs/reviews/T4-outbound-adapter-verification.md` §6 |
 | 🔴 | 统一错误体新增 `available_models` 字段是否回填 02 §4.4 | 02 §2.1 ③ 要求"响应体附可用别名"，§4.4 字段表未列；已按可选字段实现，见 `docs/reviews/T5-routing-alias-verification.md` §6 |
