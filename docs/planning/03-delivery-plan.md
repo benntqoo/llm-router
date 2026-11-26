@@ -71,6 +71,7 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 **T7 usage 采集** `1.5d` · 依赖 T6
 - 目标：tee 解析 usage 帧、R-4 注入、estimated 估算入口（估算器本身在 T12）、`usage_log` 落库、per `(channel, account)` 的 RPM/RPD/TPM/TPD 计数与 `quota_json` 回写（限额自学习，02 §8）。
 - 验收：流式/非流式各一条用例，usage_log 字段与上游返回一致；429 触发后 quota_json 记录更新。
+- 落地（2026-11-26）：一条 `usage_log` = **一次出站尝试**（fallback 试 N 个候选 = N 行；未到达任何候选的失败不写）；流式走**旁路 tee**（转发字节的同时在副本上扫 SSE 帧找 usage 帧、记 TTFT，不缓冲全量），非流式直读响应体 `usage`；上游没回 usage 才走估算入口（`estimated=1`，失败行不估 token；估算器本体在 T12）；`usage_log` 增 `account_id`（schema v7，幂等补列），API Key 型渠道按需补建默认账号 `acct_default_<channel_id>`；四个窗口（RPM/TPM 近 60s、RPD/TPD 按 UTC 日界）从 `usage_log` 派生；429 的 `x-ratelimit-limit-*` 学进 `account.quota_json`（**只收紧不放宽**，`last_rate_limit` 记上游报的事实）。口径见 02 §8.1/§8.2（v0.6），验收留档 `docs/reviews/T7-usage-capture.md`。
 
 **T8 A 类预设 + 自定义渠道** `1.5d` · 依赖 T4
 - 目标：02 §6.1 的 7 个 profile 数据 + "自定义 OpenAI 兼容渠道"表单（base_url/路径模板/鉴权样式/group_id）。

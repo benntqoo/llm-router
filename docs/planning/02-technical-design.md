@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.5（变更记录见 §13） |
+| 版本 | v0.6（变更记录见 §13） |
 | 日期 | 2026-11-26 |
 | 上游文档 | `01-architecture-and-feasibility.md`（可行性基线与竞品调研） |
 | 状态 | 待评审后进入开发。**本文档未改动任何代码或配置**。 |
@@ -482,6 +482,64 @@ pub trait ProviderAdapter: Send + Sync {
 - 配额监控：对支持额度查询的渠道（GLM/Kimi/MiniMax 包月等）定时 probe，展示剩余与重置时间。
 - **限额自学习**：per `(channel, account)` 维护 RPM/RPD/TPM/TPD 计数；429 响应的 `Retry-After` 与 `x-ratelimit-*` 头、以及渠道文档上报值，写入 `account.quota_json`，作为熔断冷却时长与调度排序依据。（源自 FreeLLMAPI 参考实现，见 `docs/reviews/freellmapi-analysis.md` §4-2）
 
+### 8.1 采集口径（T7）
+
+**一条 `usage_log` 记录 = 一次出站尝试**（不是一次入站请求）。fallback 链试了 3 个候选就是 3 行——每个候选都真实消耗了上游额度。请求在到达任何候选之前就失败（鉴权失败 / 别名未命中 / 全部候选被跳过）**不写** `usage_log`（没有渠道上下文）。
+
+| 字段 | 来源 |
+|---|---|
+| `ts` | 记录写入时刻（Unix 秒） |
+| `client_key_id` | 入站 client key id |
+| `channel_id` / `account_id` | 出站候选的渠道 / 账号（见 §8.2 的账号口径） |
+| `model_alias` | 入站别名（客户端看到的那个名字） |
+| `upstream_model` | 上游真实模型名（R-1 替换后的） |
+| `protocol` | 入站协议，v1 恒为 `openai` |
+| `prompt_tokens` / `completion_tokens` | 上游 `usage`；缺失时由估算器补 |
+| `cache_read_tokens` | 上游 `usage.prompt_tokens_details.cached_tokens` |
+| `cache_write_tokens` | 上游 `usage.cache_creation_input_tokens` |
+| `reasoning_tokens` | 上游 `usage.completion_tokens_details.reasoning_tokens`（MiniMax 特例，§4.2） |
+| `estimated` | 1 = 本地估算值（上游没回 usage），0 = 上游精确值 |
+| `ttft_ms` | 首个 token 到达时刻（流式才有；非流式为 NULL） |
+| `duration_ms` | 出站尝试耗时 |
+| `status` | `success` / `error` / `aborted`（客户端中途断连） |
+| `error_kind` | 失败时的错误类别（02 §4.4 的 `ErrorKind`） |
+| `cost_micros` | **T13 负责**（价目表换算），T7 恒为 NULL |
+
+**流式采集**：在 SSE 通路上**旁路 tee**——转发字节的同时在**副本**上扫 `data:` 帧：找 `usage` 帧（`stream_options.include_usage` 注入后由上游主动下发，R-4），并记录**首个 token**时刻（TTFT）与输出字符数。tee 不得缓冲全量（§2.2 的零缓冲直通不变）。
+
+**非流式采集**：响应体已整块缓冲，直接从 JSON 的 `usage` 字段解析。
+
+**估算入口**：上游没回 usage 时，走 `TokenEstimator` 估算并标 `estimated=1`。T7 只提供**入口**与启发式实现（字符数 / 4）；T12 用 tiktoken-rs 替换实现。**失败尝试不估 token**——失败的调用没有产出，token 全 0 且 `estimated=0`。
+
+### 8.2 账号口径与限额自学习（T7）
+
+**账号（account）**：v1 的 `account` 表原本只服务 OAuth / 登录态型渠道。但限额自学习要 per `(channel, account)` 计数、`quota_json` 要有唯一的落点，因此 **每个渠道至少有一个账号**：
+
+| 渠道类型 | 账号 |
+|---|---|
+| API Key 型 | **默认账号**，id = `acct_default_<channel_id>`（确定性生成），首次需要写限额状态时自动补建 |
+| OAuth / 登录态型 | 账号池里的真实账号（T8/T9 落地） |
+
+这样"账号"在 v1 是个统一概念，后续接账号池不需要改采集层。
+
+**四个窗口**（计数从 `usage_log` 派生，不另设计数器表——流水就是唯一真值）：
+
+| 窗口 | 口径 |
+|---|---|
+| RPM | 最近 60 秒内该 `(channel, account)` 的**尝试次数** |
+| RPD | 当日（UTC 日界）内的尝试次数 |
+| TPM | 最近 60 秒内该 `(channel, account)` 的 token 总数 |
+| TPD | 当日内的 token 总数 |
+
+**已知局限**：流水只在**尝试结束时**写入，因此**在途请求不计**——并发突发时窗口计数会偏低（FreeLLMAPI 用 in-flight lease 规避，v1 未做）。若日后要做精确的速率准入，应另加在途计数。
+
+**学习规则**（源自 FreeLLMAPI 的 "learn real limits from error bodies"）：从 429 响应的 `x-ratelimit-limit-requests` / `x-ratelimit-limit-tokens` 学到上游的**上限**，写进 `account.quota_json`：
+
+- **只收紧，不放宽**：新学到的上限低于已记录值才覆盖。撞到上限说明我们的预检放行了太多，放宽上限只会更糟。
+- `Retry-After` 与 `x-ratelimit-reset-*` / `x-ratelimit-remaining-*` 记进 `quota_json` 的 `last_rate_limit` 段（这是**事实**，不是推断）。
+- "渠道文档上报值"（用户按渠道文档手填的上限）与学习值写进同一组字段，学习只会把它压低、不会抬高。
+- `quota_json` 是**人工可编辑**的 JSON；用户改小它同样被视为上限，自学习不会把它改大。
+
 ---
 
 ## 9. 数据模型（增量修订）
@@ -509,6 +567,10 @@ pub trait ProviderAdapter: Send + Sync {
 -- app_setting：应用级设置（键值对；02 §2.3 熔断时长等）
 --   当前取值：circuit_open_secs = 连续失败熔断时长（秒，默认 60，最小 1）
 --              rate_limit_cooldown_cap_secs = 429 冷却上限（秒，默认 60，最小 1）
+
+-- usage_log 增加 account_id（T7 限额自学习：per (channel, account) 计数）
+--   account_id：账号 id；API Key 型渠道用默认账号 acct_default_<channel_id>（02 §8.2）
+--   计数（RPM/RPD/TPM/TPD）直接由 usage_log 派生，不另设计数器表
 ```
 
 其余表结构沿用 01 文档，不重复。
@@ -582,3 +644,4 @@ pub trait ProviderAdapter: Send + Sync {
 | v0.3 | 2026-11-26 | 头头裁决两项：① 限流冷却期内回 **429 + `Retry-After`**（§4.4 回填，错误体字段表不变）；② 熔断状态由"只存内存、重启清零"改为**落库 + 重启恢复**（§2.3），新增 `circuit_state` 表（§9）与 UI 展示 |
 | v0.4 | 2026-11-26 | 头头裁决：③ 熔断**时长可配置**（默认 60s、最小单位 1s、存 `app_setting` 表，§2.3/§9）；④ UI 增加**手动解除熔断**（`circuit_reset`，§2.3） |
 | v0.5 | 2026-11-26 | 头头裁决：⑤ **429 冷却上限可配置**（默认 60s、最小 1s；冷却 = `min(max(退避, Retry-After), 上限)`，上限可缩短上游要求的等待，§2.3/§4.4/§9） |
+| v0.6 | 2026-11-26 | T7 用量采集口径回填：§8.1 采集口径（一条记录 = 一次出站尝试；流式 tee / 非流式直读；估算入口；**失败尝试不估 token**）、§8.2 账号口径（API Key 型渠道用默认账号 `acct_default_<channel_id>`）与限额自学习细则（四个窗口从 `usage_log` 派生、**在途请求不计**；只收紧不放宽）、§9 `usage_log` 增 `account_id` |
