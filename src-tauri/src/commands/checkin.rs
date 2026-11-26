@@ -57,6 +57,61 @@ pub struct SiteSummary {
     pub enabled: bool,
     pub schedule: Option<String>,
     pub template: Option<TemplateSummary>,
+    /// 下一次应触发时刻（Unix 秒；没有 cron 则为 `None`）。
+    pub next_run_at: Option<i64>,
+    /// 最近一次尝试（不论成败）的时刻（Unix 秒）。
+    pub last_attempt_at: Option<i64>,
+    /// 最近一次尝试是否成功。
+    pub last_ok: Option<bool>,
+    /// 系统兜底任务名（Windows 计划任务 / macOS launchd）。
+    pub system_task: Option<String>,
+    /// 系统兜底任务是否已注册。
+    pub system_task_registered: bool,
+    /// 系统兜底任务的频率描述。
+    pub system_task_frequency: Option<String>,
+    /// 系统兜底同步时的错误（注册失败等）。
+    pub system_task_error: Option<String>,
+}
+
+/// 一次执行的摘要（IPC 返回）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub site_id: String,
+    pub site_name: String,
+    pub ok: bool,
+    /// 错误分类（`success` / `assert_failed` / …）。
+    pub class: String,
+    pub message: String,
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
+    pub retryable: bool,
+}
+
+/// 一次签到结果的展示视图。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultView {
+    pub id: i64,
+    pub site_id: String,
+    pub ts: i64,
+    pub ok: bool,
+    pub reward_json: Option<String>,
+    pub message: Option<String>,
+}
+
+/// 系统兜底同步的摘要。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemSyncSummary {
+    /// 已注册的任务名。
+    pub registered: Vec<String>,
+    /// 已注销的任务名。
+    pub unregistered: Vec<String>,
+    /// 出错的站点（站点名 + 原因）。
+    pub errors: Vec<String>,
+    /// 当前平台是否支持。
+    pub supported: bool,
 }
 
 /// 导入一个 HAR 文件（**敏感值掩码**）。
@@ -121,13 +176,15 @@ pub fn checkin_save_template_of(
     }
     drop(vault);
 
-    // 5) 落库前自检：模板里不得残留敏感原值
-    let config_json = serde_json::to_string(&template).map_err(|e| e.to_string())?;
+    // 5) 落库前自检：模板里不得残留敏感原值（**只查可能含密文的请求面**，
+    //    不查整段 JSON——随机 `credential_id` 会让短密文假阳性）
+    let surface = har::sensitive_surface(&template);
     for (variable, original) in &originals {
-        if variable.sensitive && !original.is_empty() && config_json.contains(original.as_str()) {
+        if variable.sensitive && !original.is_empty() && surface.contains(original.as_str()) {
             return Err("模板里残留了敏感原值，已拒绝保存（防密文泄漏）".to_string());
         }
     }
+    let config_json = serde_json::to_string(&template).map_err(|e| e.to_string())?;
 
     // 6) 同名站点 → 复用同一行（重录 HAR 覆盖模板）；旧凭据在模板更新后清理
     let existing = state
@@ -182,7 +239,7 @@ pub fn checkin_save_template_of(
         }
     }
 
-    summarize(&row)
+    summarize(state, &row)
 }
 
 /// 列出全部签到站点。
@@ -197,7 +254,9 @@ pub fn checkin_list_sites_of(state: &AppState) -> Result<Vec<SiteSummary>, Strin
         .store
         .with_conn(|conn| checkin::list_sites(conn))
         .map_err(|e| e.to_string())?;
-    rows.iter().map(summarize).collect()
+    rows.iter()
+        .map(|row| summarize(state, row))
+        .collect()
 }
 
 /// 删一个签到站点（连同它在保险库里的凭据）。
@@ -233,6 +292,175 @@ pub fn checkin_delete_site_of(state: &AppState, id: &str) -> Result<bool, String
     Ok(removed)
 }
 
+// ────────────────────────────── 调度（T17） ──────────────────────────────
+
+/// 设站点的 cron 表达式与启用开关，并**同步系统兜底任务**。
+///
+/// 口径（02 §7.2.1 §4）：启用且有 cron → 注册系统兜底任务；否则 → 注销。
+#[tauri::command]
+pub fn checkin_set_schedule(
+    state: State<'_, AppState>,
+    id: String,
+    schedule: Option<String>,
+    enabled: bool,
+) -> Result<SiteSummary, String> {
+    checkin_set_schedule_of(&state, &id, schedule, enabled)
+}
+
+/// 设 cron 与启用开关（可测版本）。
+pub fn checkin_set_schedule_of(
+    state: &AppState,
+    id: &str,
+    schedule: Option<String>,
+    enabled: bool,
+) -> Result<SiteSummary, String> {
+    let row = state
+        .store
+        .with_conn(|conn| checkin::get_site(conn, id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("站点不存在: {id}"))?;
+    let schedule = schedule
+        .map(|expr| expr.trim().to_string())
+        .filter(|expr| !expr.is_empty());
+    // cron 表达式非法 → 直接报错（不让用户存一个永远不触发的表达式）
+    if let Some(expr) = schedule.as_deref() {
+        crate::checkin::cron::parse(expr).map_err(|err| err.to_string())?;
+    }
+    let mut updated = row.clone();
+    updated.schedule = schedule;
+    updated.enabled = enabled;
+    state
+        .store
+        .with_conn(|conn| checkin::upsert_site(conn, &updated))
+        .map_err(|e| e.to_string())?;
+
+    // 同步系统兜底任务
+    let mut error = None;
+    let should_register = updated.enabled && updated.schedule.is_some();
+    if should_register {
+        let expr = updated.schedule.clone().unwrap_or_default();
+        if let Err(err) = crate::checkin::system::register(id, &expr) {
+            error = Some(err);
+        }
+    } else {
+        if let Err(err) = crate::checkin::system::unregister(id) {
+            error = Some(err);
+        }
+    }
+
+    let mut summary = summarize(state, &updated)?;
+    summary.system_task_error = error;
+    Ok(summary)
+}
+
+/// 立即执行一次（**忽略去重**）。
+#[tauri::command]
+pub async fn checkin_run_now(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<RunSummary, String> {
+    checkin_run_now_of(&state, &id).await
+}
+
+/// 立即执行一次（可测版本）。
+pub async fn checkin_run_now_of(state: &AppState, id: &str) -> Result<RunSummary, String> {
+    let engine = crate::checkin::replay::ReplayEngine::new().map_err(|e| e.to_string())?;
+    let outcome = crate::checkin::scheduler::run_now(&state.store, &state.vault, &engine, id).await?;
+    let name = state
+        .store
+        .with_conn(|conn| checkin::get_site(conn, id))
+        .map_err(|e| e.to_string())?
+        .map(|row| row.name)
+        .unwrap_or_else(|| id.to_string());
+    Ok(RunSummary {
+        site_id: id.to_string(),
+        site_name: name,
+        ok: outcome.ok,
+        class: outcome.class.as_str().to_string(),
+        message: outcome.message.clone(),
+        status: outcome.status,
+        elapsed_ms: outcome.elapsed_ms,
+        retryable: outcome.retryable,
+    })
+}
+
+/// 列签到结果（最近 N 条）。
+#[tauri::command]
+pub fn checkin_results(
+    state: State<'_, AppState>,
+    id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<ResultView>, String> {
+    checkin_results_of(&state, id.as_deref(), limit.unwrap_or(50))
+}
+
+/// 列签到结果（可测版本）。
+pub fn checkin_results_of(
+    state: &AppState,
+    id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ResultView>, String> {
+    let rows = state
+        .store
+        .with_conn(|conn| checkin::list_results(conn, id, limit))
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ResultView {
+            id: row.id,
+            site_id: row.site_id,
+            ts: row.ts,
+            ok: row.ok,
+            reward_json: row.reward_json,
+            message: row.message,
+        })
+        .collect())
+}
+
+/// 同步系统兜底任务（按当前站点状态全量对齐）。
+///
+/// 启用且有 cron → 注册；停用 / 没 cron / 站点已删 → 注销。
+#[tauri::command]
+pub fn checkin_system_sync(state: State<'_, AppState>) -> Result<SystemSyncSummary, String> {
+    checkin_system_sync_of(&state)
+}
+
+/// 同步系统兜底任务（可测版本）。
+pub fn checkin_system_sync_of(state: &AppState) -> Result<SystemSyncSummary, String> {
+    let mut summary = SystemSyncSummary {
+        registered: Vec::new(),
+        unregistered: Vec::new(),
+        errors: Vec::new(),
+        supported: crate::checkin::system::SUPPORTED,
+    };
+    if !summary.supported {
+        summary
+            .errors
+            .push("当前平台没有系统兜底实现（只支持 Windows 计划任务 / macOS launchd）".to_string());
+        return Ok(summary);
+    }
+    let rows = state
+        .store
+        .with_conn(|conn| checkin::list_sites(conn))
+        .map_err(|e| e.to_string())?;
+    for row in &rows {
+        let expr = row.schedule.as_deref().map(str::trim).unwrap_or("");
+        if row.enabled && !expr.is_empty() {
+            match crate::checkin::system::register(&row.id, expr) {
+                Ok(task) => summary.registered.push(task.name),
+                Err(err) => summary.errors.push(format!("{}: {err}", row.name)),
+            }
+        } else {
+            match crate::checkin::system::unregister(&row.id) {
+                Ok(true) => summary.unregistered.push(crate::checkin::system::task_name(&row.id)),
+                Ok(false) => {}
+                Err(err) => summary.errors.push(format!("{}: {err}", row.name)),
+            }
+        }
+    }
+    Ok(summary)
+}
+
 /// 解析归属渠道：给 id 用它；给名字就按名字找/建。
 fn resolve_channel(state: &AppState, input: &SaveTemplateInput) -> Result<String, String> {
     if let Some(channel_id) = input.channel_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
@@ -263,8 +491,8 @@ fn resolve_channel(state: &AppState, input: &SaveTemplateInput) -> Result<String
     vault.ensure_channel(name).map_err(|e| e.to_string())
 }
 
-/// 站点行 → 展示摘要。
-fn summarize(row: &SiteRow) -> Result<SiteSummary, String> {
+/// 站点行 → 展示摘要（含调度信息）。
+fn summarize(state: &AppState, row: &SiteRow) -> Result<SiteSummary, String> {
     let template = row
         .config_json
         .as_deref()
@@ -281,6 +509,25 @@ fn summarize(row: &SiteRow) -> Result<SiteSummary, String> {
                 .map(|v| v.name.clone())
                 .collect(),
         });
+
+    // 调度信息：下一次触发 / 最近一次尝试 / 系统兜底任务
+    let now = chrono::Local::now();
+    let next_run_at = row
+        .schedule
+        .as_deref()
+        .map(str::trim)
+        .filter(|expr| !expr.is_empty())
+        .and_then(|expr| crate::checkin::cron::parse(expr).ok())
+        .and_then(|schedule| crate::checkin::cron::next_due_at(&schedule, now))
+        .map(|next| next.timestamp());
+    let last_attempt_at = crate::checkin::scheduler::last_attempt_at(&state.store, &row.id);
+    let last_ok = state
+        .store
+        .with_conn(|conn| crate::store::checkin::list_results(conn, Some(&row.id), 1))
+        .ok()
+        .and_then(|rows| rows.first().map(|row| row.ok));
+    let task = crate::checkin::system::query(&row.id).ok();
+
     Ok(SiteSummary {
         id: row.id.clone(),
         name: row.name.clone(),
@@ -288,6 +535,13 @@ fn summarize(row: &SiteRow) -> Result<SiteSummary, String> {
         enabled: row.enabled,
         schedule: row.schedule.clone(),
         template,
+        next_run_at,
+        last_attempt_at,
+        last_ok,
+        system_task: task.as_ref().map(|task| task.name.clone()),
+        system_task_registered: task.as_ref().map(|task| task.registered).unwrap_or(false),
+        system_task_frequency: task.and_then(|task| task.frequency),
+        system_task_error: None,
     })
 }
 
@@ -556,8 +810,37 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_channel_is_rejected() {
+    fn leak_check_ignores_random_credential_ids() {
+        // **回归**：泄漏自检必须只查"可能含密文的请求面"，不能查整段 JSON——
+        // 整段 JSON 里有随机生成的 32 位 hex `credential_id`，短密文（如 `abc`）
+        // 会偶然出现在里面 → 正常保存被**随机**拒绝（本项目实测踩到过）。
         let (dir, state) = app_state();
+        let path = write_har(dir.path());
+        let summary =
+            checkin_save_template_of(&state, &save_input(&path, "ModelScope·签到"))
+                .expect("保存模板失败");
+
+        let row = state
+            .store
+            .with_conn(|conn| checkin::get_site(conn, &summary.id))
+            .expect("读站点")
+            .expect("站点应存在");
+        let config = row.config_json.expect("模板 JSON");
+        let template: SiteTemplate = serde_json::from_str(&config).expect("模板应能解析");
+        let surface = har::sensitive_surface(&template);
+        for variable in &template.variables {
+            if let Some(id) = &variable.credential_id {
+                assert!(
+                    !surface.contains(id),
+                    "自检范围不该包含 credential_id（否则短密文会假阳性）"
+                );
+            }
+        }
+        assert!(surface.contains("{{cookie}}"), "请求面要在自检范围内");
+    }
+
+    #[test]
+    fn a_missing_channel_is_rejected() {        let (dir, state) = app_state();
         let path = write_har(dir.path());
         let mut input = save_input(&path, "任意");
         input.channel_name = None;

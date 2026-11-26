@@ -43,6 +43,10 @@ async-trait = "0.1.92"
 # 不用 default-features：native-tls 需要系统 OpenSSL；rustls 纯 Rust 且本地缓存齐全。
 # 不开 http2：本地 cargo 缓存无 h2 crate，HTTP/1.1 足够各 OpenAI 兼容上游。
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+# cron 表达式解析与匹配（T17：调度器，02 §7.2）
+cron = "0.12"
+# 本地时区（cron 表达式按用户所在时区解释；02 §7.2.1）
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 流式管道：Stream 组合（stream.rs 的逐帧转发与错误收尾）
 futures-util = "0.3"
 bytes = "1"
@@ -50,7 +54,7 @@ tiktoken-rs = "0.12.1"
 
 # Windows DPAPI（主密钥由 OS 原生保护，绑定当前用户）
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+windows = { version = "0.62.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Globalization"] }
 
 # macOS Keychain（主密钥由 OS 原生保护）
 [target.'cfg(target_os = "macos")'.dependencies]

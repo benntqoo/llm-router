@@ -592,6 +592,27 @@ pub fn validate_var_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// 模板里**可能含密文**的部分（请求头值 / 查询参数值 / 请求体）拼成一段文本。
+///
+/// **泄漏自检只查这一段，不查整段 JSON**：整段 JSON 里还有随机生成的 `credential_id`
+/// （32 位十六进制），**短密文（例如 `abc`）会偶然出现在 id 里** → 整段搜会假阳性，
+/// 把一次正常的保存随机地拒掉（本项目实测踩到过）。
+pub fn sensitive_surface(template: &SiteTemplate) -> String {
+    let mut surface = String::new();
+    for header in &template.request.headers {
+        surface.push_str(&header.value);
+        surface.push('\n');
+    }
+    for param in &template.request.query {
+        surface.push_str(&param.value);
+        surface.push('\n');
+    }
+    if let Some(post) = &template.request.post_data {
+        surface.push_str(&post.text);
+    }
+    surface
+}
+
 /// 占位符文本。
 pub fn placeholder(name: &str) -> String {
     format!("{{{{{name}}}}}")
@@ -889,9 +910,9 @@ pub fn build_template(
     };
 
     // 落库前自检：模板里不得残留敏感原值（防密文泄漏）
-    let json = serde_json::to_string(&template).map_err(|e| HarError::Structure(e.to_string()))?;
+    let surface = sensitive_surface(&template);
     for (variable, original) in &originals {
-        if variable.sensitive && !original.is_empty() && json.contains(original.as_str()) {
+        if variable.sensitive && !original.is_empty() && surface.contains(original.as_str()) {
             return Err(HarError::SecretLeak);
         }
     }

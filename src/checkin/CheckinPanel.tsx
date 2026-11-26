@@ -8,24 +8,38 @@ import {
   filterEntries,
   isValidVarName,
   sensitiveCount,
+  shortUrl,
   suggestEntryIndex,
   suggestVarName,
   targetKey,
   targetLabel,
 } from "./format";
+import {
+  describeCron,
+  describeSystemTask,
+  formatClock,
+  formatRelative,
+  validateCron,
+} from "./schedule";
 import type {
   ChannelOption,
   FieldView,
   HarImport,
   MarkedVariable,
+  ResultView,
+  RunSummary,
   SaveTemplateInput,
   SiteSummary,
+  SystemSyncSummary,
 } from "./types";
 
 /**
- * 签到站点面板（T15；02 §7.1.1 / §7.1.2）。
+ * 签到站点面板（T15 HAR 导入与模板化 · T17 调度器与系统兜底）。
  *
- * 导入向导四步：**选 HAR 文件 → 选一条 entry → 标记变量 → 保存模板**。
+ * 两块：
+ * 1. **站点调度**（T17）：给站点设 cron / 启用开关 / 立即执行一次 /
+ *    同步系统兜底任务 + 看最近执行记录；
+ * 2. **导入向导**（T15）：**选 HAR 文件 → 选一条 entry → 标记变量 → 保存模板**。
  *
  * 密文边界（AGENT.md §5.3）：
  * - 导入回来的**敏感值已经是掩码**（后端在 IPC 边界就掩掉了），前端拿不到原值；
@@ -47,22 +61,58 @@ export default function CheckinPanel() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // ── T17 调度 ──
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [results, setResults] = useState<ResultView[]>([]);
+  const [systemSummary, setSystemSummary] = useState<SystemSyncSummary | null>(null);
+  const [busySite, setBusySite] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
 
   const refreshSites = useCallback(async () => {
     try {
       const rows = await invoke<SiteSummary[]>("checkin_list_sites");
       setSites(rows);
+      // 草稿跟库里的一致（用户正在改的除外——草稿存在 drafts 里，改完才写回）
+      setDrafts((current) => {
+        const next: Record<string, string> = {};
+        for (const row of rows) {
+          next[row.id] = current[row.id] ?? row.schedule ?? "";
+        }
+        return next;
+      });
     } catch (e) {
       setError(String(e));
     }
   }, []);
 
+  const refreshResults = useCallback(async () => {
+    try {
+      const rows = await invoke<ResultView[]>("checkin_results", {
+        id: null,
+        limit: 20,
+      });
+      setResults(rows);
+    } catch {
+      setResults([]);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshSites();
+    void refreshResults();
     invoke<ChannelOption[]>("channel_list")
       .then((rows) => setChannels(rows))
       .catch(() => setChannels([]));
-  }, [refreshSites]);
+  }, [refreshSites, refreshResults]);
+
+  // 相对时间要自己走（不然「下次：3 分钟后」会一直停在旧值）
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => setNow(Math.floor(Date.now() / 1000)),
+      30_000,
+    );
+    return () => window.clearInterval(timer);
+  }, []);
 
   const filtered = useMemo(
     () => (imported ? filterEntries(imported.entries, keyword) : []),
@@ -73,6 +123,14 @@ export default function CheckinPanel() {
     () => imported?.entries.find((entry) => entry.index === selectedIndex) ?? null,
     [imported, selectedIndex],
   );
+
+  const siteNameOf = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const site of sites) {
+      map.set(site.id, site.name);
+    }
+    return map;
+  }, [sites]);
 
   const importHar = useCallback(async (path: string) => {
     setBusy(true);
@@ -193,12 +251,117 @@ export default function CheckinPanel() {
       try {
         await invoke<boolean>("checkin_delete_site", { id });
         await refreshSites();
+        await refreshResults();
       } catch (e) {
         setError(String(e));
       }
     },
-    [refreshSites],
+    [refreshSites, refreshResults],
   );
+
+  /** 合并后端返回的站点摘要（保留别的站点的行）。 */
+  const applySummary = useCallback((summary: SiteSummary) => {
+    setSites((current) => {
+      const index = current.findIndex((site) => site.id === summary.id);
+      if (index < 0) {
+        return [...current, summary];
+      }
+      const next = [...current];
+      next[index] = summary;
+      return next;
+    });
+  }, []);
+
+  /** 保存 cron / 启用开关（两者一起提交，后端据此同步系统兜底任务）。 */
+  const saveSchedule = useCallback(
+    async (site: SiteSummary, enabled: boolean) => {
+      setError(null);
+      setNotice(null);
+      const draft = (drafts[site.id] ?? "").trim();
+      const problem = validateCron(draft);
+      if (problem) {
+        setError(problem);
+        return;
+      }
+      setBusySite(site.id);
+      try {
+        const summary = await invoke<SiteSummary>("checkin_set_schedule", {
+          id: site.id,
+          schedule: draft === "" ? null : draft,
+          enabled,
+        });
+        applySummary(summary);
+        setDrafts((current) => ({
+          ...current,
+          [site.id]: summary.schedule ?? "",
+        }));
+        if (summary.systemTaskError) {
+          setError(`系统兜底任务没注册上：${summary.systemTaskError}`);
+        } else {
+          setNotice(
+            enabled && summary.schedule
+              ? `「${summary.name}」已按 ${describeCron(summary.schedule)} 调度` +
+                (summary.systemTaskRegistered
+                  ? "（系统兜底任务已注册，关掉应用也能签到）"
+                  : "（系统兜底任务没注册上——见下方提示）")
+              : `「${summary.name}」已停用`,
+          );
+        }
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusySite(null);
+      }
+    },
+    [drafts, applySummary],
+  );
+
+  /** 立即执行一次（忽略「本周期已跑过」的去重）。 */
+  const runNow = useCallback(
+    async (site: SiteSummary) => {
+      setError(null);
+      setNotice(null);
+      setBusySite(site.id);
+      try {
+        const summary = await invoke<RunSummary>("checkin_run_now", { id: site.id });
+        setNotice(
+          `「${summary.siteName}」${summary.ok ? "签到成功" : "签到失败"}` +
+            `（${summary.class}）：${summary.message}` +
+            `　耗时 ${summary.elapsedMs} ms`,
+        );
+        await refreshSites();
+        await refreshResults();
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusySite(null);
+      }
+    },
+    [refreshSites, refreshResults],
+  );
+
+  /** 同步系统兜底任务（按当前站点状态全量对齐）。 */
+  const syncSystem = useCallback(async () => {
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      const summary = await invoke<SystemSyncSummary>("checkin_system_sync");
+      setSystemSummary(summary);
+      if (summary.errors.length > 0) {
+        setError(`系统兜底同步有 ${summary.errors.length} 处失败：${summary.errors.join("；")}`);
+      } else {
+        setNotice(
+          `系统兜底已同步：注册 ${summary.registered.length} 个、注销 ${summary.unregistered.length} 个`,
+        );
+      }
+      await refreshSites();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [refreshSites]);
 
   const unmarkedSensitive = useMemo(() => {
     if (!selected) {
@@ -211,58 +374,171 @@ export default function CheckinPanel() {
 
   return (
     <section className="card">
-      <h2>签到站点（T15：HAR 导入与模板化）</h2>
+      <h2>签到站点（T15 模板化 · T17 调度）</h2>
+      <p className="muted">
+        上半部分是调度（cron / 启用 / 立即执行 / 系统兜底），下半部分是 HAR 导入向导。
+        调度口径见 02 §7.2.1：cron 写<b>经典 5 字段</b>（分 时 日 月 周），
+        按本地时区解释；应用关着期间漏掉的周期会自动补签。
+      </p>
+
+      {error && <p className="error">{error}</p>}
+      {notice && <p className="ok">{notice}</p>}
+
+      <h3>站点调度</h3>
+      {sites.length === 0 ? (
+        <p className="muted">还没有签到站点——先用下面的导入向导建一个。</p>
+      ) : (
+        <table className="usage-table">
+          <thead>
+            <tr>
+              <th>站点</th>
+              <th>调度（cron）</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sites.map((site) => {
+              const draft = drafts[site.id] ?? site.schedule ?? "";
+              const pending = busySite === site.id;
+              return (
+                <tr key={site.id}>
+                  <td>
+                    <strong>{site.name}</strong>
+                    <div className="muted">
+                      {site.template
+                        ? `${site.template.method} ${shortUrl(site.template.url, 56)}`
+                        : "—"}
+                    </div>
+                    <div className="muted">
+                      变量：{site.template?.variableNames.join("、") ?? "—"}
+                    </div>
+                  </td>
+                  <td>
+                    <div className="row-inline">
+                      <input
+                        type="text"
+                        value={draft}
+                        placeholder="分 时 日 月 周，例如 0 9 * * *"
+                        onChange={(e) =>
+                          setDrafts((current) => ({
+                            ...current,
+                            [site.id]: e.target.value,
+                          }))
+                        }
+                      />
+                      <button
+                        onClick={() => void saveSchedule(site, site.enabled)}
+                        disabled={pending}
+                      >
+                        保存
+                      </button>
+                    </div>
+                    <div className="muted">{describeCron(draft)}</div>
+                    <div className="muted">
+                      {describeSystemTask(
+                        site.systemTaskRegistered,
+                        site.systemTaskFrequency,
+                      )}
+                    </div>
+                    {site.systemTaskError && (
+                      <div className="error">{site.systemTaskError}</div>
+                    )}
+                  </td>
+                  <td>
+                    <label className="checkbox">
+                      <input
+                        type="checkbox"
+                        checked={site.enabled}
+                        disabled={pending}
+                        onChange={(e) =>
+                          void saveSchedule(site, e.target.checked)
+                        }
+                      />
+                      启用
+                    </label>
+                    <div className="muted">
+                      下次：{formatRelative(site.nextRunAt, now)}
+                    </div>
+                    <div className="muted">
+                      最近：
+                      {site.lastAttemptAt === null
+                        ? "—"
+                        : `${formatClock(site.lastAttemptAt)}（${
+                            site.lastOk ? "成功" : "失败"
+                          }）`}
+                    </div>
+                  </td>
+                  <td>
+                    <button
+                      onClick={() => void runNow(site)}
+                      disabled={pending}
+                    >
+                      立即执行
+                    </button>
+                    <button onClick={() => void removeSite(site.id)}>删除</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+
+      <div className="row-inline">
+        <button onClick={() => void syncSystem()} disabled={busy}>
+          同步系统兜底任务
+        </button>
+        <span className="muted">
+          应用关着也能签到：每个「启用 + 有 cron」的站点注册一个系统计划任务
+          （Windows 计划任务 / macOS launchd），触发时走同一套「该跑没跑」判定。
+        </span>
+      </div>
+      {systemSummary && (
+        <p className="muted">
+          上次同步：注册 {systemSummary.registered.length} 个
+          {systemSummary.registered.map((name) => `（${name}）`).join("")} ·
+          注销 {systemSummary.unregistered.length} 个
+          {systemSummary.errors.length > 0 &&
+            ` · 出错 ${systemSummary.errors.length} 处：${systemSummary.errors.join("；")}`}
+        </p>
+      )}
+
+      {results.length > 0 && (
+        <>
+          <h3>最近执行记录</h3>
+          <table className="usage-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>站点</th>
+                <th>结果</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((row) => (
+                <tr key={row.id}>
+                  <td>{formatClock(row.ts)}</td>
+                  <td>{siteNameOf.get(row.siteId) ?? row.siteId}</td>
+                  <td className={row.ok ? "ok" : "error"}>
+                    {row.ok ? "成功" : "失败"}
+                  </td>
+                  <td>{row.message ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      <h3>导入向导</h3>
       <p className="muted">
         浏览器 F12 录制一次签到请求 → 导出 HAR → 在这里导入 → 选一条请求 →
         标记变量 → 保存成站点模板。模板里只留 <code>{"{{变量名}}"}</code>{" "}
         占位符，敏感取值（cookie / csrf / token）进加密保险库（02 §7.1.2）。
       </p>
 
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="ok">{notice}</p>}
-
-      {sites.length > 0 && (
-        <table className="usage-table">
-          <thead>
-            <tr>
-              <th>站点</th>
-              <th>插件</th>
-              <th>请求</th>
-              <th>变量</th>
-              <th>状态</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {sites.map((site) => (
-              <tr key={site.id}>
-                <td>{site.name}</td>
-                <td>{site.plugin}</td>
-                <td>
-                  {site.template ? (
-                    <span className="checkin-url">
-                      {site.template.method} {site.template.url}
-                    </span>
-                  ) : (
-                    "—"
-                  )}
-                </td>
-                <td>
-                  {site.template
-                    ? site.template.variableNames.join("、")
-                    : "—"}
-                </td>
-                <td>{site.enabled ? "已启用" : "默认关"}</td>
-                <td>
-                  <button onClick={() => void removeSite(site.id)}>删除</button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      <h3>导入向导</h3>
       <div className="row-inline">
         <button onClick={() => void pickHar()} disabled={busy}>
           导入 HAR 文件

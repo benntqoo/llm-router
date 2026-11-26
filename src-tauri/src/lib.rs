@@ -140,6 +140,15 @@ pub fn run() {
                 limiter,
                 circuit,
             });
+
+            // 调度器：每分钟 tick 一次；**启动时先跑一遍**（错过补签；T17 / 02 §7.2.1）
+            if let Ok(engine) = checkin::replay::ReplayEngine::new() {
+                let ticker_store = Arc::clone(&store);
+                let ticker_vault = Arc::clone(&vault);
+                tauri::async_runtime::spawn(async move {
+                    checkin::scheduler::run_ticker(ticker_store, ticker_vault, engine).await;
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -183,6 +192,10 @@ pub fn run() {
             commands::checkin::checkin_save_template,
             commands::checkin::checkin_list_sites,
             commands::checkin::checkin_delete_site,
+            commands::checkin::checkin_set_schedule,
+            commands::checkin::checkin_run_now,
+            commands::checkin::checkin_results,
+            commands::checkin::checkin_system_sync,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

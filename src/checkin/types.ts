@@ -59,7 +59,7 @@ export type TemplateSummary = {
   variableNames: string[];
 };
 
-/** 签到站点摘要。 */
+/** 签到站点摘要（T17 扩展：调度信息）。 */
 export type SiteSummary = {
   id: string;
   name: string;
@@ -67,6 +67,55 @@ export type SiteSummary = {
   enabled: boolean;
   schedule: string | null;
   template: TemplateSummary | null;
+  /** 下一次应触发时刻（Unix 秒；没有 cron 则为 `null`）。 */
+  nextRunAt: number | null;
+  /** 最近一次尝试（不论成败）的时刻（Unix 秒）。 */
+  lastAttemptAt: number | null;
+  /** 最近一次尝试是否成功。 */
+  lastOk: boolean | null;
+  /** 系统兜底任务名（Windows 计划任务 / macOS launchd）。 */
+  systemTask: string | null;
+  /** 系统兜底任务是否已注册。 */
+  systemTaskRegistered: boolean;
+  /** 系统兜底任务的频率描述。 */
+  systemTaskFrequency: string | null;
+  /** 系统兜底同步时的错误（注册失败等）。 */
+  systemTaskError: string | null;
+};
+
+/** 一次执行的摘要（「立即执行一次」的返回）。 */
+export type RunSummary = {
+  siteId: string;
+  siteName: string;
+  ok: boolean;
+  /** 错误分类（`success` / `assert_failed` / …）。 */
+  class: string;
+  message: string;
+  status: number | null;
+  elapsedMs: number;
+  retryable: boolean;
+};
+
+/** 一条签到结果的展示视图。 */
+export type ResultView = {
+  id: number;
+  siteId: string;
+  ts: number;
+  ok: boolean;
+  rewardJson: string | null;
+  message: string | null;
+};
+
+/** 系统兜底同步的摘要。 */
+export type SystemSyncSummary = {
+  /** 已注册的任务名。 */
+  registered: string[];
+  /** 已注销的任务名。 */
+  unregistered: string[];
+  /** 出错的站点（站点名 + 原因）。 */
+  errors: string[];
+  /** 当前平台是否支持系统兜底。 */
+  supported: boolean;
 };
 
 /** 渠道摘要（只取向导要用的字段）。 */

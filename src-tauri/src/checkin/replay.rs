@@ -164,7 +164,9 @@ pub enum ResolveError {
 }
 
 /// 敏感变量的取值来源（由调用方接到保险库上）。
-pub trait SecretResolver {
+///
+/// `Send + Sync`：重放是异步的，解析器要能跨线程（tokio 的任务要求 future 是 `Send`）。
+pub trait SecretResolver: Send + Sync {
     /// 取一个凭据的真实值；`Err` 表示拿不到（**不区分原因给调用方看**，只给调用方看错误信息）。
     fn resolve(&self, credential_id: &str) -> Result<String, ResolveError>;
 }
