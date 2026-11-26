@@ -616,6 +616,59 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 
 **HAR 模板化规范**：导入 HAR → 交互式标记变量（如 `{{cookie}}`、`{{csrf}}`）→ 保存为站点模板（`checkin_site.config_json`）。用户可自建站点插件，无需写代码（区别于签到盒类框架：模板即配置）。
 
+### 7.1.1 HAR 1.2 子集与模板结构（T15 落地）
+
+**自写解析**（02 §1.3），只取 HAR 1.2 的下列字段，其余（`timings` / `cache` / `pages` / `browser` / **响应体**）**一律丢弃**：
+
+| 来源 | 保留 | 丢弃 |
+|---|---|---|
+| `log.entries[].request` | `method` / `url` / `headers` / `queryString` / `postData.text` + `mimeType` | `cookies` 数组（与 `headers` 里的 `Cookie` 重复）、`postData.params` |
+| `log.entries[].response` | **只留 `status`** | 响应体、响应头（实测 ModelScope 签到响应的 `Set-Cookie` 带 `csrf_session` / `csrf_token`，属密文） |
+
+**模板结构**（`checkin_site.config_json`；`version` 用于将来改格式）：
+
+```json
+{
+  "version": 1,
+  "source": "modelscope.har",
+  "entryCount": 167,
+  "request": {
+    "method": "GET",
+    "url": "https://www.modelscope.cn/api/v1/users/login/info",
+    "headers": [{ "name": "Cookie", "value": "acw_tc={{auto_acw_tc}}; csrf_session={{cookie}}; csrf_token={{csrf}}" }],
+    "query": [],
+    "postData": null
+  },
+  "variables": [
+    { "name": "cookie", "target": { "kind": "headerPart", "field": "Cookie", "part": "csrf_session" }, "sensitive": true, "auto": false, "credentialId": "cred_xxx", "default": null },
+    { "name": "csrf", "target": { "kind": "headerPart", "field": "Cookie", "part": "csrf_token" }, "sensitive": true, "auto": false, "credentialId": "cred_yyy", "default": null },
+    { "name": "auto_acw_tc", "target": { "kind": "headerPart", "field": "Cookie", "part": "acw_tc" }, "sensitive": true, "auto": true, "credentialId": "cred_zzz", "default": null }
+  ],
+  "assert": { "status": 401 }
+}
+```
+
+- **占位符语法**：`{{name}}`；`name` 只允许 `[A-Za-z0-9_-]`，同一模板内全局唯一。
+- **替换发生在"值内部"**：标记 `Cookie` 里的某个子项时，模板保留整条 Cookie 的其余部分，只把该子项的值换成占位符（`headerPart`）；标记整个头换整条值（`header`）；查询参数同理（`query`）；JSON 请求体按点路径替换字符串叶子（`body`）。
+- 导入的模板 **`enabled = 0`**（02 §7.3：站点插件默认全关）。
+
+### 7.1.2 变量标记与密文边界（T15 落地）
+
+**向导四步**：选 HAR 文件 → 解析并列出 entry → 选一条作为签到请求 → 逐字段标记变量 → 保存模板。
+
+- **候选自动识别**：
+  - **`Cookie` 头的所有子项一律按敏感处理**（cookie = 会话凭据，**不靠名字猜**）——实测 ModelScope 的 Cookie 里 `cna`、`ssxmod_itna` 这类名字不含关键词，但同样是会话态数据；
+  - 其它字段按**键名关键词**（大小写不敏感，命中即默认建议标记）：
+    `cookie`、`set-cookie`、`authorization`、`x-csrf-token`、`csrf`、`token`、`session`、`jwt`、`acw_tc`、`x-xsrf-token`。
+- **未标记的敏感字段自动补齐**：敏感但用户没标的字段，系统自动补成 `auto_<字段名>` 变量（`auto = true`）——**不能留在模板里**（会明文泄漏），**也不能丢掉**（重放会失效）。
+- **密文边界（AGENT.md §5.3）**：
+  - `checkin_site.config_json` 存**模板**：被标记的值在模板里是占位符，**不含任何真实密文**；落库前自检——若模板里仍出现被标记字段的原始值，**拒绝保存**。
+  - 变量的**真实取值**存**保险库**（`credential` 表，AES-256-GCM 密文）：Cookie 子项用 `kind = 'cookie'`，其它敏感头/参数用 `kind = 'access_token'`（01 §4.4 的 kind 取值）。
+  - **归属渠道**（头头 2026-11-27 裁决 · 方案 A）：`credential.channel_id` 是 NOT NULL 外键，而签到站点在数据模型里没有渠道 → 每个站点归属一个渠道：导入时**选一个已有渠道**，或**用站点名新建一个**（`provider = 'custom'`）。与 02 §7.2「积分回写 `account.quota_json`」同源（`account` 属于渠道）。
+  - **非敏感变量**（如固定 ID、日期、结构类请求头）可**直接留在模板里**，不入保险库。
+- **变量取值更新**：重录 HAR 后同名变量覆盖旧凭据（删旧 `credential` 行、写新行），模板里的 `credential_id` 同步更新。
+- **IPC 只传掩码值**：导入返回给 UI 的是**敏感值掩码**（`***`），真实值不出 Rust 进程；保存时前端回传**文件路径 + 标记清单**，Rust 重新读取并解析（无导入态驻留内存）。
+
 ### 7.2 调度与通知
 
 - 应用内：tokio 定时器（cron 语义，`cron` crate）。
@@ -835,6 +888,8 @@ cost_micros = round( ( 可计费输入   × input_per_1m
 -- credential 增加_oauth 型两类凭据（同 channel 下并存）
 --   kind: 'api_key' | 'oauth_gh_token' | 'oauth_copilot_token' | 'session_workbuddy'
 --   oauth_copilot_token.expires_at 精确到秒；刷新由 copilot adapter 负责
+-- credential.kind 另增签到站点的会话取值（02 §7.1.2；挂站点的归属渠道上）
+--   kind: 'cookie'（Cookie 头里的子项） | 'access_token'（其它敏感头 / 查询参数）
 
 -- account 增加登录态路径引用（WorkBuddy）
 --   meta_json: { "users_dir": "C:/Users/<u>/.workbuddy/app/users/<hash>",
@@ -989,3 +1044,4 @@ python scripts/security_check.py `
 | v0.12 | 2026-11-26 | 账本清理三项回填（头头 2026-11-26 裁决）：① **任务编号交叉引用对齐**——以 03 任务卡为唯一真值源，改 §6.1.1「T9/T10→T10」、§6.2「T17→T21」、§6.3 三处与 §11 风险表「T18a→T22」，并修 §6.5 指向不存在文件的坏引用（`T10-pi-integration.md` → `T10-channel-matrix-and-pi.md`）；② **§4.4 统一错误结构补 `available_models`**——写明该键只在**别名未命中**（`code = "model_not_found"`）时出现、缺失时**整个键不出现**（不出现 `null`），别名命中但无可用候选的路径**不带**该字段；③ **T18 签到站点清单已指定**（ModelScope + MiniMax Code，见 03 T18 卡片） |
 | v0.13 | 2026-11-26 | T13 价目表与成本换算回填：**新增 §8.3 成本换算口径**——`price` 表的匹配规则（`*` 通配、命中多条取最具体）、**三价换算公式**（可计费输入 = `prompt_tokens - cache_read_tokens`；缓存命中**只按缓存价计一次**；缓存写按输入价；**总额**四舍五入一次）、**空值语义**（单价 `NULL` ≡ 0 = 该档不计费；**没命中价目 → `cost_micros` 为 NULL（未知），与"免费 0"必须可区分**）、估算行（`estimated=1`）照样算成本但**不参与预算告警**、**改价/删价后该 provider 的历史行一并重算**；并给出**预填牌价快照（2026-11-26）的六家官方来源与取价规则**（取主列表价）与已知限制（多档定价表达不了、`minimax_intl` 按 USD 计价不折算、假定 `prompt_tokens` 含缓存命中 token 的 OpenAI 语义）。§8 的成本条目与 §8.1 的 `cost_micros` 字段来源同步指向 §8.3 |
 | v0.14 | 2026-11-26 | T14 聚合与图表回填：**新增 §8.4 聚合与图表口径**——把 §8 的「按 日/渠道/模型/client_key 四维；TTFT P50/P95；输出 tokens/s」细化为可实现的定义：四维的**分桶键与可读名**（渠道名 / client key 标签查不到时回退为 id）、**时间范围**（`since` 含 / `until` 不含，默认近 30 天）、**每个桶的 13 项指标**（请求数 / 三态计数 / 五类 token / 总 token / 已知成本合计 / **成本未知行数** / 估算行数 / TTFT P50·P95 / 输出速度）、**分位数用最近秩法**、**输出速度的单行与桶级公式**（耗时为 0 → `NULL`，不是 0 也不是无穷大）、估算行照常计入但 UI 须标注、**最近请求明细**（M2 判据的落地载体）。并明确**已知成本合计为 0 ≠ 不花钱**（未配牌价的行单独计数，延续 §8.3 的 `0`/`NULL` 语义） |
+| v0.15 | 2026-11-27 | T15 HAR 导入与模板化回填：**新增 §7.1.1 HAR 1.2 子集与模板结构**（只取 `request` 的 method/url/headers/queryString/postData 与 `response.status`；**响应体与响应头一律丢弃**——实测签到响应的 `Set-Cookie` 带 csrf 密文；模板落 `checkin_site.config_json`，占位符语法 `{{name}}`，替换发生在"值内部"（`header` / `header_part` / `query` / `body` 四种 target），导入模板 `enabled = 0`）与 **§7.1.2 变量标记与密文边界**（候选自动识别清单；**模板零密文**，变量真实取值进保险库 `credential`（`kind = 'cookie' | 'access_token'`）；**归属渠道**——因 `credential.channel_id` 为 NOT NULL 外键而站点无渠道，按头头 2026-11-27 裁决取方案 A：站点归属一个渠道（选已有或按站点名新建），与 §7.2 积分回写 `account.quota_json` 同源；落库前自检模板不得残留被标记字段原值；IPC 只传掩码值，保存时回传路径重新解析）；§9 补 `credential.kind` 的签到取值 |
