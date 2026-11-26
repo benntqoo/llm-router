@@ -12,7 +12,9 @@
 use tauri::State;
 
 use crate::providers::presets::PresetView;
-use crate::store::channels::{self, ChannelInput, ChannelSummary, ModelInput, CUSTOM_PROVIDER};
+use crate::store::channels::{
+    self, ChannelInput, ChannelSummary, ModelInput, PublishedModel, CUSTOM_PROVIDER,
+};
 use crate::vault::crypto::SecretBytes;
 use crate::vault::CredentialMeta;
 use crate::AppState;
@@ -102,6 +104,33 @@ pub fn channel_put_key_of(
         .into_iter()
         .find(|m| m.id == id)
         .ok_or_else(|| "凭证写入后未能读取元信息".to_string())
+}
+
+/// 模型预览（与网关 `GET /v1/models` **同源**）。
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ModelsPreview {
+    /// 客户端应填的 base_url（`http://127.0.0.1:<port>/v1`）
+    pub base_url: String,
+    /// 对外发布的别名（= 网关会返回的列表）
+    pub models: Vec<PublishedModel>,
+}
+
+/// 预览网关当前对外发布的模型别名。
+///
+/// 数据源与 `GET /v1/models` 是同一份查询（`store::channels::list_published_models`），
+/// 所以 UI 里看到的**就是**客户端能调到的。
+#[tauri::command]
+pub fn models_preview(state: State<'_, AppState>) -> Result<ModelsPreview, String> {
+    models_preview_of(&state)
+}
+
+/// 模型预览（可测版本）。
+pub fn models_preview_of(state: &AppState) -> Result<ModelsPreview, String> {
+    let models = channels::list_published_models(&state.store).map_err(|e| e.to_string())?;
+    Ok(ModelsPreview {
+        base_url: state.gateway_base_url.clone(),
+        models,
+    })
 }
 
 /// 校验 provider：必须是已知预设或 `custom`。
@@ -285,6 +314,29 @@ mod tests {
         let summary = channel_save_of(&state, payload).expect("保存失败");
         assert!(channel_delete_of(&state, &summary.id).expect("删除失败"));
         assert!(channel_list_of(&state).expect("列表失败").is_empty());
+    }
+
+    #[test]
+    fn models_preview_lists_published_aliases() {
+        let (_dir, state) = state();
+        let payload = ChannelInput {
+            name: "DeepSeek 官方".to_string(),
+            provider: "deepseek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            models: vec![ModelInput {
+                alias: "deepseek-chat".to_string(),
+                upstream_id: "deepseek-chat".to_string(),
+                enabled: true,
+            }],
+            ..ChannelInput::default()
+        };
+        channel_save_of(&state, payload).expect("保存失败");
+
+        let preview = models_preview_of(&state).expect("预览失败");
+        assert_eq!(preview.base_url, "http://127.0.0.1:8787/v1");
+        assert_eq!(preview.models.len(), 1);
+        assert_eq!(preview.models[0].alias, "deepseek-chat");
+        assert_eq!(preview.models[0].owned_by, "DeepSeek 官方");
     }
 
     #[test]

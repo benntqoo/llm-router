@@ -21,15 +21,23 @@ function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
-/**
- * client key 面板（T3 的最小前端接入）。
- *
- * T9 将把它并入完整 UI；此处只保证 T3 的 client key 功能在应用里可用。
- */
+/** 把空字符串换成 undefined（= 不限）。 */
+function toLimit(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
+}
+
 export default function ClientKeyPanel() {
   const [keys, setKeys] = useState<ClientKeyMeta[]>([]);
   const [label, setLabel] = useState("pi");
   const [created, setCreated] = useState<CreatedClientKey | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editLabel, setEditLabel] = useState("");
+  const [editRpm, setEditRpm] = useState("");
+  const [editTokens, setEditTokens] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,9 +67,37 @@ export default function ClientKeyPanel() {
     }
   };
 
+  const startEdit = (k: ClientKeyMeta) => {
+    setEditingId(k.id);
+    setEditLabel(k.label);
+    setEditRpm(k.rpm_limit === null ? "" : String(k.rpm_limit));
+    setEditTokens(k.daily_tokens === null ? "" : String(k.daily_tokens));
+    setMessage(null);
+    setError(null);
+  };
+
+  const handleSaveEdit = async (id: string) => {
+    try {
+      await invoke<boolean>("client_key_update_meta", {
+        id,
+        label: editLabel,
+        rpmLimit: toLimit(editRpm),
+        dailyTokens: toLimit(editTokens),
+        expiresAt: null,
+      });
+      setEditingId(null);
+      setError(null);
+      setMessage("已保存");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const handleDelete = async (id: string) => {
     try {
       await invoke<boolean>("client_key_delete", { id });
+      if (editingId === id) setEditingId(null);
       setError(null);
       setMessage("已删除");
       await refresh();
@@ -92,9 +128,17 @@ export default function ClientKeyPanel() {
         <div className="export-plain">
           <p className="ok">新 key（仅显示一次）：</p>
           <pre>{created.key}</pre>
-          <button type="button" onClick={() => setCreated(null)}>
-            我已保存，隐藏
-          </button>
+          <div className="row-inline">
+            <button type="button" onClick={() => setCreated(null)}>
+              我已保存，隐藏
+            </button>
+            <button
+              type="button"
+              onClick={() => navigator.clipboard?.writeText(created.key)}
+            >
+              复制
+            </button>
+          </div>
         </div>
       )}
 
@@ -108,13 +152,48 @@ export default function ClientKeyPanel() {
                 <span className="cred-meta">
                   <code>{k.key_prefix}…</code> · {k.label} · {formatTime(k.created_at)}
                   {k.rpm_limit ? ` · ${k.rpm_limit} rpm` : ""}
+                  {k.daily_tokens ? ` · ${k.daily_tokens} tokens/日` : ""}
                 </span>
                 <span className="cred-actions">
+                  <button type="button" onClick={() => startEdit(k)}>
+                    {editingId === k.id ? "收起" : "编辑"}
+                  </button>
                   <button type="button" onClick={() => handleDelete(k.id)}>
                     删除
                   </button>
                 </span>
               </div>
+              {editingId === k.id && (
+                <div className="row-inline alias-row">
+                  <label className="field">
+                    <span>标签</span>
+                    <input
+                      type="text"
+                      value={editLabel}
+                      onChange={(e) => setEditLabel(e.target.value)}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>每分钟请求上限（留空 = 不限）</span>
+                    <input
+                      type="number"
+                      value={editRpm}
+                      onChange={(e) => setEditRpm(e.target.value)}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>每日 token 上限（留空 = 不限）</span>
+                    <input
+                      type="number"
+                      value={editTokens}
+                      onChange={(e) => setEditTokens(e.target.value)}
+                    />
+                  </label>
+                  <button type="button" onClick={() => handleSaveEdit(k.id)}>
+                    保存
+                  </button>
+                </div>
+              )}
             </li>
           ))}
         </ul>

@@ -9,6 +9,7 @@ import {
   revealNow,
   visibleSecret,
 } from "./vault/reveal";
+import { notifyDataChanged, onDataChanged } from "./panels/bus";
 
 type VaultStatus = {
   path: string;
@@ -28,6 +29,13 @@ type CredentialMeta = {
   key_version: number;
 };
 
+type ChannelLite = {
+  id: string;
+  name: string;
+  provider: string;
+  has_credential: boolean;
+};
+
 function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
@@ -35,7 +43,8 @@ function formatTime(ts: number): string {
 export default function VaultPanel() {
   const [status, setStatus] = useState<VaultStatus | null>(null);
   const [credentials, setCredentials] = useState<CredentialMeta[]>([]);
-  const [channelName, setChannelName] = useState("DeepSeek 官方");
+  const [channels, setChannels] = useState<ChannelLite[]>([]);
+  const [channelId, setChannelId] = useState("");
   const [secretInput, setSecretInput] = useState("");
   const [unlockPassword, setUnlockPassword] = useState("");
   const [masterPassword, setMasterPassword] = useState("");
@@ -55,6 +64,8 @@ export default function VaultPanel() {
         channelName: null,
       });
       setCredentials(list);
+      const chans = await invoke<ChannelLite[]>("channel_list");
+      setChannels(chans);
     } catch (e) {
       setError(String(e));
     }
@@ -62,6 +73,21 @@ export default function VaultPanel() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  // 数据变更（渠道面板存/删密钥）+ 5s 轮询兜底：
+  // 否则会出现"渠道显示密钥已录入，保险库却显示 0 条凭据"的自相矛盾。
+  useEffect(() => {
+    const unsubscribe = onDataChanged(() => {
+      void refresh();
+    });
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, 5000);
+    return () => {
+      unsubscribe();
+      window.clearInterval(timer);
+    };
   }, [refresh]);
 
   // 倒计时：仅在有展示中的明文时运行
@@ -85,26 +111,38 @@ export default function VaultPanel() {
   const revealing = isRevealing(revealed, now);
   const seconds = remainingSeconds(revealed, now);
 
+  // 渠道 id → 渠道名（凭据列表要显示归属渠道，而不是内部 id）
+  const channelName = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const c of channels) map.set(c.id, c.name);
+    return map;
+  }, [channels]);
+
   const fail = (e: unknown) => {
     setError(String(e));
     setMessage(null);
   };
 
   const handleSave = async () => {
+    if (!channelId) {
+      setError("请选择渠道（先在「渠道」面板建好渠道）");
+      return;
+    }
     if (!secretInput.trim()) {
       setError("请输入要保存的密钥");
       return;
     }
     try {
-      await invoke<CredentialMeta>("vault_put_secret", {
-        channelName: channelName.trim(),
+      await invoke<CredentialMeta>("vault_put_secret_for_channel", {
+        channelId,
         kind: "api_key",
         secret: secretInput,
       });
       setSecretInput("");
       setError(null);
-      setMessage("已加密保存");
+      setMessage(`已加密保存到「${channelName.get(channelId) ?? channelId}」`);
       await refresh();
+      notifyDataChanged();
     } catch (e) {
       fail(e);
     }
@@ -137,6 +175,7 @@ export default function VaultPanel() {
       setError(null);
       setMessage("已删除");
       await refresh();
+      notifyDataChanged();
     } catch (e) {
       fail(e);
     }
@@ -239,13 +278,28 @@ export default function VaultPanel() {
         </div>
       )}
 
-      <h3>录入密钥</h3>
       <div className="row-inline">
-        <input
-          value={channelName}
-          onChange={(e) => setChannelName(e.target.value)}
-          placeholder="渠道名"
-        />
+        <h3>录入密钥</h3>
+        <button type="button" onClick={refresh}>
+          刷新
+        </button>
+      </div>
+      <div className="row-inline">
+        <label className="field">
+          <span>渠道</span>
+          <select
+            value={channelId}
+            onChange={(e) => setChannelId(e.target.value)}
+          >
+            <option value="">（选择渠道）</option>
+            {channels.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+                {c.has_credential ? " · 已有密钥" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
         <input
           type="password"
           value={secretInput}
@@ -256,6 +310,9 @@ export default function VaultPanel() {
           保存
         </button>
       </div>
+      {channels.length === 0 && (
+        <p className="muted">还没有渠道——先到「渠道」面板新建一个再来录密钥。</p>
+      )}
 
       <h3>已存凭据</h3>
       {credentials.length === 0 && <p className="muted">暂无凭据。</p>}
@@ -264,7 +321,9 @@ export default function VaultPanel() {
           <li key={c.id}>
             <div className="cred-row">
               <span className="cred-meta">
-                <code>{c.kind}</code> · {c.id.slice(0, 12)}… · {formatTime(c.created_at)}
+                <code>{c.kind}</code> ·{" "}
+                {channelName.get(c.channel_id) ?? c.channel_id} ·{" "}
+                {formatTime(c.created_at)}
               </span>
               <span className="cred-actions">
                 <button type="button" onClick={() => handleReveal(c.id)}>

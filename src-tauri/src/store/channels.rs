@@ -209,6 +209,36 @@ pub fn save_channel(store: &Store, input: &ChannelInput) -> Result<ChannelSummar
     let meta_json = serde_json::to_string(&input.meta)
         .map_err(|e| StoreError::Invalid(format!("渠道参数序列化失败: {e}")))?;
 
+    // 渠道名唯一：先自查一遍，给出可读错误，而不是让 UNIQUE 约束把原始 SQL 错误抛给 UI
+    {
+        let current_id = input
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let taken: Option<String> = store.with_conn(|conn| {
+            let mut stmt = match current_id {
+                Some(_) => conn
+                    .prepare("SELECT name FROM channel WHERE name = ?1 AND id <> ?2 LIMIT 1")
+                    .map_err(StoreError::Sqlite)?,
+                None => conn
+                    .prepare("SELECT name FROM channel WHERE name = ?1 LIMIT 1")
+                    .map_err(StoreError::Sqlite)?,
+            };
+            let mut rows = match current_id {
+                Some(id) => stmt.query(rusqlite::params![name, id]).map_err(StoreError::Sqlite)?,
+                None => stmt.query(rusqlite::params![name]).map_err(StoreError::Sqlite)?,
+            };
+            match rows.next().map_err(StoreError::Sqlite)? {
+                Some(row) => Ok(Some(row.get::<_, String>(0).map_err(StoreError::Sqlite)?)),
+                None => Ok(None),
+            }
+        })?;
+        if taken.is_some() {
+            return Err(StoreError::Invalid(format!("渠道名已存在：{name}")));
+        }
+    }
+
     let channel_id = store.with_conn(|conn| {
         let tx = conn
             .unchecked_transaction()
@@ -365,6 +395,49 @@ pub fn list_channels(store: &Store) -> Result<Vec<ChannelSummary>> {
     Ok(out)
 }
 
+/// 对外发布的模型条目（与网关 `GET /v1/models` **同源**）。
+///
+/// 别名 = `model.alias`（单别名）∪ `route_group.alias`（路由组对外名）；
+/// 只包含**模型与渠道都启用**的条目（被禁用的不出现在列表里）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedModel {
+    /// 对外别名
+    pub alias: String,
+    /// 归属（渠道名 / `route_group`）
+    pub owned_by: String,
+}
+
+/// 列出对外发布的别名（网关 `/v1/models` 与 UI 预览的唯一数据源）。
+pub fn list_published_models(store: &Store) -> Result<Vec<PublishedModel>> {
+    store.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT alias, owned_by FROM (
+                     SELECT m.alias AS alias, c.name AS owned_by
+                     FROM model m JOIN channel c ON c.id = m.channel_id
+                     WHERE m.enabled = 1 AND c.enabled = 1
+                     UNION
+                     SELECT rg.alias AS alias, 'route_group' AS owned_by
+                     FROM route_group rg
+                 ) ORDER BY alias",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PublishedModel {
+                    alias: row.get(0)?,
+                    owned_by: row.get(1)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(StoreError::Sqlite)?);
+        }
+        Ok(out)
+    })
+}
+
 /// 取单个渠道摘要。
 pub fn channel_summary(store: &Store, channel_id: &str) -> Result<ChannelSummary> {
     store.with_conn(|conn| {
@@ -472,6 +545,75 @@ mod tests {
             }],
             ..ChannelInput::default()
         }
+    }
+
+    #[test]
+    fn duplicate_channel_name_is_rejected_with_readable_error() {
+        let (_dir, store) = store();
+        save_channel(&store, &input("我的渠道", "custom")).expect("保存失败");
+        let err = save_channel(&store, &input("我的渠道", "custom")).expect_err("同名应报错");
+        assert!(
+            err.to_string().contains("渠道名已存在"),
+            "实际 {err}"
+        );
+    }
+
+    #[test]
+    fn updating_channel_may_keep_its_own_name() {
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &input("我的渠道", "custom")).expect("保存失败");
+
+        // 编辑同一条渠道（名字不变、别名增加）必须成功——这是"再加一条别名"的路径
+        let mut second = input("我的渠道", "custom");
+        second.id = Some(summary.id.clone());
+        second.models.push(ModelInput {
+            alias: "chat-b".to_string(),
+            upstream_id: "chat-b".to_string(),
+            enabled: true,
+        });
+        let updated = save_channel(&store, &second).expect("更新失败");
+        assert_eq!(updated.id, summary.id);
+        assert_eq!(updated.models.len(), 2);
+    }
+
+    #[test]
+    fn published_models_only_include_enabled_entries() {
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &input("我的渠道", "custom")).expect("保存失败");
+
+        let published = list_published_models(&store).expect("查询失败");
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].alias, "chat-a");
+        assert_eq!(published[0].owned_by, "我的渠道");
+
+        // 禁用模型 → 不再对外发布
+        let mut second = input("我的渠道", "custom");
+        second.id = Some(summary.id.clone());
+        second.models = vec![ModelInput {
+            alias: "chat-a".to_string(),
+            upstream_id: "chat-a".to_string(),
+            enabled: false,
+        }];
+        save_channel(&store, &second).expect("更新失败");
+        assert!(
+            list_published_models(&store).expect("查询失败").is_empty(),
+            "禁用的模型不应出现在对外列表里"
+        );
+
+        // 禁用渠道 → 同样不对外发布
+        let mut third = input("我的渠道", "custom");
+        third.id = Some(summary.id.clone());
+        third.enabled = false;
+        third.models = vec![ModelInput {
+            alias: "chat-a".to_string(),
+            upstream_id: "chat-a".to_string(),
+            enabled: true,
+        }];
+        save_channel(&store, &third).expect("更新失败");
+        assert!(
+            list_published_models(&store).expect("查询失败").is_empty(),
+            "禁用的渠道不应出现在对外列表里"
+        );
     }
 
     #[test]

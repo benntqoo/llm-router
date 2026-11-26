@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+import { notifyDataChanged } from "./panels/bus";
+
 type ModelSuggestion = {
   upstream_id: string;
   alias: string;
@@ -47,7 +49,7 @@ type ChannelSummary = {
   has_credential: boolean;
 };
 
-type ModelInput = {
+type ModelRow = {
   alias: string;
   upstream_id: string;
   enabled: boolean;
@@ -62,7 +64,7 @@ type ChannelInput = {
   enabled: boolean;
   priority: number | null;
   meta: ChannelSummary["meta"];
-  models: ModelInput[];
+  models: ModelRow[];
 };
 
 const CUSTOM_PROVIDER = "custom";
@@ -98,8 +100,9 @@ export default function ChannelPanel() {
   const [supportsGroupId, setSupportsGroupId] = useState(false);
   const [injectUsage, setInjectUsage] = useState(true);
   const [extraHeaders, setExtraHeaders] = useState("");
-  const [alias, setAlias] = useState("");
-  const [upstreamId, setUpstreamId] = useState("");
+  const [priority, setPriority] = useState(100);
+  const [enabled, setEnabled] = useState(true);
+  const [rows, setRows] = useState<ModelRow[]>([]);
   const [secret, setSecret] = useState("");
 
   const [message, setMessage] = useState<string | null>(null);
@@ -140,8 +143,13 @@ export default function ChannelPanel() {
     setInjectUsage(preset.inject_stream_usage);
     setExtraHeaders("");
     const first = preset.default_models[0];
-    setAlias((prev) => (prev.trim() ? prev : (first?.alias ?? "")));
-    setUpstreamId((prev) => (prev.trim() ? prev : (first?.upstream_id ?? "")));
+    setRows((prev) =>
+      prev.length > 0
+        ? prev
+        : first
+          ? [{ alias: first.alias, upstream_id: first.upstream_id, enabled: true }]
+          : [],
+    );
   }
 
   const selectedPreset = useMemo(
@@ -160,8 +168,9 @@ export default function ChannelPanel() {
     setSupportsGroupId(false);
     setInjectUsage(true);
     setExtraHeaders("");
-    setAlias("");
-    setUpstreamId("");
+    setPriority(100);
+    setEnabled(true);
+    setRows([]);
     setSecret("");
   }
 
@@ -186,10 +195,33 @@ export default function ChannelPanel() {
         .map(([k, v]) => `${k}=${v}`)
         .join("\n"),
     );
-    const first = channel.models[0];
-    setAlias(first?.alias ?? "");
-    setUpstreamId(first?.upstream_id ?? "");
+    setPriority(channel.priority);
+    setEnabled(channel.enabled);
+    setRows(
+      channel.models.map((m) => ({
+        alias: m.alias,
+        upstream_id: m.upstream_id,
+        enabled: m.enabled,
+      })),
+    );
     setSecret("");
+  }
+
+  function updateRow(index: number, patch: Partial<ModelRow>) {
+    setRows((prev) =>
+      prev.map((row, i) => (i === index ? { ...row, ...patch } : row)),
+    );
+  }
+
+  function removeRow(index: number) {
+    setRows((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function addRow() {
+    setRows((prev) => [
+      ...prev,
+      { alias: "", upstream_id: "", enabled: true },
+    ]);
   }
 
   const handleSave = async () => {
@@ -201,8 +233,9 @@ export default function ChannelPanel() {
       setError("base_url 不能为空");
       return;
     }
-    if (!alias.trim() || !upstreamId.trim()) {
-      setError("模型别名与上游模型名都要填");
+    const models = rows.filter((r) => r.alias.trim() || r.upstream_id.trim());
+    if (models.length === 0) {
+      setError("至少要有一个模型别名（否则渠道不会出现在 /v1/models）");
       return;
     }
     if (authStyle === "custom_header" && !authHeaderName.trim()) {
@@ -217,8 +250,8 @@ export default function ChannelPanel() {
       provider,
       base_url: baseUrl.trim(),
       kind: "api_key",
-      enabled: true,
-      priority: 100,
+      enabled,
+      priority,
       meta: {
         path_chat: chatPath.trim() || null,
         auth_style: authStyle,
@@ -229,29 +262,33 @@ export default function ChannelPanel() {
         inject_stream_usage: injectUsage,
         extra_headers: parseHeaders(extraHeaders),
       },
-      models: [
-        {
-          alias: alias.trim(),
-          upstream_id: upstreamId.trim(),
-          enabled: true,
-        },
-      ],
+      models: models.map((m) => ({
+        alias: m.alias.trim(),
+        upstream_id: m.upstream_id.trim(),
+        enabled: m.enabled,
+      })),
     };
     try {
       const saved = await invoke<ChannelSummary>("channel_save", { payload });
+      // 保存后进入"编辑态"：再改别名、再点保存是**更新**同一条渠道，
+      // 而不是新建一条同名渠道（那会撞 UNIQUE(channel.name)）
+      setEditingId(saved.id);
       if (secret.trim()) {
         await invoke("channel_put_key", {
           channelId: saved.id,
           secret: secret.trim(),
         });
       }
+      const aliasNames = payload.models.map((m) => m.alias).join("、");
       setSecret("");
       setError(null);
       setMessage(
-        `已保存渠道「${saved.name}」，别名 ${alias.trim()} 已出现在 /v1/models` +
+        `已保存渠道「${saved.name}」，别名 ${aliasNames} 已出现在 /v1/models` +
           (secret.trim() ? "（密钥已加密入库）" : ""),
       );
       await refresh();
+      // 保险库面板与模型预览面板要同步（否则一个说"密钥已录入"、另一个说"0 条凭据"）
+      notifyDataChanged();
     } catch (e) {
       setError(String(e));
       setMessage(null);
@@ -269,6 +306,7 @@ export default function ChannelPanel() {
       setError(null);
       setMessage(`已删除渠道「${channel.name}」`);
       await refresh();
+      notifyDataChanged();
     } catch (e) {
       setError(String(e));
       setMessage(null);
@@ -284,7 +322,7 @@ export default function ChannelPanel() {
         保存后模型别名立即出现在 <code>GET /v1/models</code>。
       </p>
 
-      <h3>新增渠道</h3>
+      <h3>新增 / 编辑渠道</h3>
       <div className="row-inline">
         <button
           type="button"
@@ -341,7 +379,7 @@ export default function ChannelPanel() {
               </span>
             )}
           </div>
-          {mode === "preset" && selectedPreset && (
+          {selectedPreset && (
             <p className="muted">
               base_url、路径模板、鉴权样式、include_usage 注入均按预设预填；
               {selectedPreset.supports_groupid_query
@@ -451,29 +489,75 @@ export default function ChannelPanel() {
           />
         </label>
         <label className="field">
-          <span>模型别名（客户端看到的名字）</span>
+          <span>优先级（越小越优先）</span>
           <input
-            type="text"
-            value={alias}
-            onChange={(e) => setAlias(e.target.value)}
-            placeholder="deepseek-chat"
+            type="number"
+            value={priority}
+            onChange={(e) => setPriority(Number(e.target.value) || 0)}
           />
         </label>
-        <label className="field">
-          <span>上游模型名</span>
+        <label className="checkbox">
           <input
-            type="text"
-            value={upstreamId}
-            onChange={(e) => setUpstreamId(e.target.value)}
-            placeholder="deepseek-chat"
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
           />
+          启用该渠道
         </label>
       </div>
-      {mode === "preset" && (
-        <p className="muted">
-          默认模型是「未实测」的建议值（02 §6.1.1），可改成你实际可用的模型名。
-        </p>
-      )}
+
+      <div className="alias-block">
+        <div className="row-inline">
+          <strong>模型别名</strong>
+          <button type="button" onClick={addRow}>
+            + 添加别名
+          </button>
+          <span className="muted">
+            别名是客户端看到的名字（全局唯一）；上游模型名是真实模型。
+          </span>
+        </div>
+        {rows.length === 0 && (
+          <p className="muted">还没有别名。至少添加一条，否则渠道不会对外发布。</p>
+        )}
+        {rows.map((row, index) => (
+          <div className="row-inline alias-row" key={index}>
+            <label className="field">
+              <span>别名</span>
+              <input
+                type="text"
+                value={row.alias}
+                onChange={(e) => updateRow(index, { alias: e.target.value })}
+                placeholder="deepseek-chat"
+              />
+            </label>
+            <label className="field">
+              <span>上游模型名</span>
+              <input
+                type="text"
+                value={row.upstream_id}
+                onChange={(e) => updateRow(index, { upstream_id: e.target.value })}
+                placeholder="deepseek-chat"
+              />
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={row.enabled}
+                onChange={(e) => updateRow(index, { enabled: e.target.checked })}
+              />
+              启用
+            </label>
+            <button type="button" onClick={() => removeRow(index)}>
+              删除
+            </button>
+          </div>
+        ))}
+        {mode === "preset" && (
+          <p className="muted">
+            默认模型是「未实测」的建议值（02 §6.1.1），可改成你实际可用的模型名。
+          </p>
+        )}
+      </div>
 
       <div className="row-inline">
         <label className="field">
@@ -501,6 +585,7 @@ export default function ChannelPanel() {
             <div className="cred-row">
               <span className="cred-meta">
                 <code>{c.provider}</code> · {c.name} · <code>{c.base_url}</code>
+                {c.enabled ? "" : " · 已禁用"}
               </span>
               <span className="cred-actions">
                 <button type="button" onClick={() => loadForEdit(c)}>

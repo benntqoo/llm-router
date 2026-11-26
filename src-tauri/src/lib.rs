@@ -146,12 +146,15 @@ pub fn run() {
             commands::channel::channel_save,
             commands::channel::channel_delete,
             commands::channel::channel_put_key,
+            commands::channel::models_preview,
             commands::circuit::circuit_status,
             commands::circuit::circuit_settings_get,
             commands::circuit::circuit_settings_set,
             commands::circuit::circuit_reset,
             commands::vault::vault_status,
             commands::vault::vault_put_secret,
+            commands::vault::vault_put_secret_for_channel,
+            commands::vault::vault_list_secrets_for_channel,
             commands::vault::vault_reveal_secret,
             commands::vault::vault_list_secrets,
             commands::vault::vault_delete_secret,
@@ -164,6 +167,7 @@ pub fn run() {
             commands::client_key::client_key_create,
             commands::client_key::client_key_list,
             commands::client_key::client_key_update_limits,
+            commands::client_key::client_key_update_meta,
             commands::client_key::client_key_delete,
         ])
         .run(tauri::generate_context!())

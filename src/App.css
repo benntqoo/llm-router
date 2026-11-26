@@ -126,6 +126,7 @@ code {
 
 .row-inline input[type="text"],
 .row-inline input[type="password"],
+.row-inline input[type="number"],
 .row-inline input:not([type]) {
   background: #14161b;
   border: 1px solid #2c303a;
@@ -259,4 +260,29 @@ code {
   max-height: 240px;
   overflow: auto;
   word-break: break-all;
+}
+
+/* T9：模型别名编辑区 */
+.alias-block {
+  border: 1px solid #2c303a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  background: #191c23;
+}
+
+.alias-row {
+  align-items: flex-end;
+}
+
+/* T9：快速开始的步骤列表 */
+.steps {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: #9aa0a6;
+  font-size: 14px;
+}
+
+.steps li {
+  margin: 6px 0;
 }

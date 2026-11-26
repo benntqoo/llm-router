@@ -320,3 +320,107 @@ async fn acceptance_invalid_channel_is_rejected_without_writing() {
     assert!(channel::channel_list_of(&f.app).expect("列表失败").is_empty());
     assert!(model_aliases(&f).await.is_empty());
 }
+
+// ── T9：模型预览与网关同源 / 多别名 / 禁用即隐藏 ──────────────────────
+
+#[tokio::test]
+async fn acceptance_models_preview_matches_gateway_list() {
+    let f = fixture();
+
+    let payload = ChannelInput {
+        name: "DeepSeek 官方".to_string(),
+        provider: "deepseek".to_string(),
+        base_url: "https://api.deepseek.com".to_string(),
+        models: vec![ModelInput {
+            alias: "deepseek-chat".to_string(),
+            upstream_id: "deepseek-chat".to_string(),
+            enabled: true,
+        }],
+        ..ChannelInput::default()
+    };
+    channel::channel_save_of(&f.app, payload).expect("保存失败");
+
+    // UI 预览（models_preview IPC）与网关 /v1/models 必须是同一份名单
+    let preview = channel::models_preview_of(&f.app).expect("预览失败");
+    let preview_aliases: Vec<String> = preview.models.iter().map(|m| m.alias.clone()).collect();
+    let gateway_aliases = model_aliases(&f).await;
+    assert_eq!(
+        preview_aliases, gateway_aliases,
+        "UI 预览与网关返回的别名必须一致"
+    );
+    assert_eq!(preview.models[0].owned_by, "DeepSeek 官方");
+    assert_eq!(preview.base_url, "http://127.0.0.1:8787/v1");
+}
+
+#[tokio::test]
+async fn acceptance_one_channel_can_publish_multiple_aliases() {
+    let f = fixture();
+
+    let payload = ChannelInput {
+        name: "DeepSeek 官方".to_string(),
+        provider: "deepseek".to_string(),
+        base_url: "https://api.deepseek.com".to_string(),
+        models: vec![
+            ModelInput {
+                alias: "deepseek-chat".to_string(),
+                upstream_id: "deepseek-chat".to_string(),
+                enabled: true,
+            },
+            ModelInput {
+                alias: "deepseek-reasoner".to_string(),
+                upstream_id: "deepseek-reasoner".to_string(),
+                enabled: true,
+            },
+        ],
+        ..ChannelInput::default()
+    };
+    let saved = channel::channel_save_of(&f.app, payload).expect("保存失败");
+    assert_eq!(saved.models.len(), 2, "一个渠道应能挂多条别名");
+
+    let aliases = model_aliases(&f).await;
+    assert!(aliases.contains(&"deepseek-chat".to_string()), "实际 {aliases:?}");
+    assert!(aliases.contains(&"deepseek-reasoner".to_string()), "实际 {aliases:?}");
+}
+
+#[tokio::test]
+async fn acceptance_disabled_channel_is_hidden_from_models() {
+    let f = fixture();
+
+    let payload = ChannelInput {
+        name: "我的代理".to_string(),
+        provider: "custom".to_string(),
+        base_url: "https://proxy.example.com".to_string(),
+        models: vec![ModelInput {
+            alias: "my-alias".to_string(),
+            upstream_id: "my-model".to_string(),
+            enabled: true,
+        }],
+        ..ChannelInput::default()
+    };
+    let saved = channel::channel_save_of(&f.app, payload).expect("保存失败");
+    assert!(model_aliases(&f).await.contains(&"my-alias".to_string()));
+
+    // 关掉渠道 → 别名立刻从 /v1/models 与 UI 预览里消失
+    let mut off = ChannelInput {
+        id: Some(saved.id.clone()),
+        name: "我的代理".to_string(),
+        provider: "custom".to_string(),
+        base_url: "https://proxy.example.com".to_string(),
+        enabled: false,
+        models: vec![ModelInput {
+            alias: "my-alias".to_string(),
+            upstream_id: "my-model".to_string(),
+            enabled: true,
+        }],
+        ..ChannelInput::default()
+    };
+    off.priority = Some(100);
+    channel::channel_save_of(&f.app, off).expect("更新失败");
+
+    assert!(
+        !model_aliases(&f).await.contains(&"my-alias".to_string()),
+        "禁用的渠道不应再对外发布别名"
+    );
+    let preview = channel::models_preview_of(&f.app).expect("预览失败");
+    assert!(preview.models.is_empty(), "UI 预览也应同步隐藏");
+}

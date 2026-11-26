@@ -155,37 +155,21 @@ async fn list_models(
     let client = auth::authenticate(&state.store, &headers)?;
     check_rate_limit(&state, &client)?;
 
-    let entries: Vec<ModelEntry> = state
-        .store
-        .with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT alias, owned_by FROM (
-                     SELECT m.alias AS alias, c.name AS owned_by
-                     FROM model m JOIN channel c ON c.id = m.channel_id
-                     WHERE m.enabled = 1 AND c.enabled = 1
-                     UNION
-                     SELECT rg.alias AS alias, 'route_group' AS owned_by
-                     FROM route_group rg
-                 ) ORDER BY alias",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(ModelEntry {
-                    id: row.get(0)?,
-                    object: "model",
-                    created: 0,
-                    owned_by: row.get(1)?,
-                })
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
+    let entries: Vec<ModelEntry> = crate::store::channels::list_published_models(&state.store)
+        .map_err(|e| {
+            GatewayError::new(
+                crate::gateway::errors::ErrorKind::ApiError,
+                format!("别名查询失败: {e}"),
+            )
+        })?
+        .into_iter()
+        .map(|m| ModelEntry {
+            id: m.alias,
+            object: "model",
+            created: 0,
+            owned_by: m.owned_by,
         })
-        .map_err(|e| GatewayError::new(
-            crate::gateway::errors::ErrorKind::ApiError,
-            format!("别名查询失败: {e}"),
-        ))?;
+        .collect();
 
     Ok(Json(ModelList::from_entries(entries)))
 }
