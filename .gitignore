@@ -19,6 +19,8 @@ dist/
 target/
 src-tauri/target/
 src-tauri/gen/
+__pycache__/
+*.pyc
 
 # ── 编辑器 / 系统 ──
 .vscode/*
