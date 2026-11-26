@@ -22,7 +22,7 @@ use crate::providers::adapter::{AuthStyle, ChannelConfig, ChannelKind};
 /// 工具调用（`tool_calls`）兼容度。
 ///
 /// 02 §4.1 注：实测不过的渠道标 `partial` 并在 UI 提示；02 §10.1 判据
-/// "全绿才能标 `stable`"。实测矩阵由 T9 执行，**在实测之前一律 `Unknown`**。
+/// "全绿才能标 `stable`"。实测矩阵由 T10 执行，**在实测之前一律 `Unknown`**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSupport {

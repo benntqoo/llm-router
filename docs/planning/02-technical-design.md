@@ -341,10 +341,17 @@ harness (pi 等)
     "type": "invalid_request_error | authentication_error | rate_limit_error | api_error | upstream_error",
     "code": "<上游原始码，如 minimax_1004>",
     "channel": "<channel.name>",
+    "available_models": ["deepseek-chat", "kimi-chat"],
     "retried": ["deepseek 官方", "kimi 官方"]   // fallback 走过的候选
   }
 }
 ```
+
+**键的可选性**：`code` / `channel` / `available_models` 三个键在对应信息缺失时**整个键不出现**（不出 `null`）。
+
+`available_models` 是 §2.1 ③「未命中 → 400，响应体附可用别名列表」的实现载体，**只在别名未命中**时填充，
+此时 `code = "model_not_found"`。别名**命中**但没有可用候选（渠道全禁用 / 熔断中 / 无凭证）走的是另一条路径，
+**不带**该字段——那条路径的问题不是"名字不认识"，附别名列表会误导客户端。
 
 **429 与 `Retry-After`**（2026-11-26 头头裁决；`Retry-After` 只走**响应头**，错误体字段表不变）：
 
@@ -416,7 +423,7 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 | 阿里百炼 | `qwen-plus` |
 | 硅基流动 | `deepseek-ai/DeepSeek-V3` |
 
-这些是**公开常识的默认建议值，不是实测结论**——02 §10.1 的实测矩阵（T9/T10）跑完之前一律按「未验证」对待，用户可随时改。UI 上标注「默认建议（未实测，可改）」。
+这些是**公开常识的默认建议值，不是实测结论**——02 §10.1 的实测矩阵（T10）跑完之前一律按「未验证」对待，用户可随时改。UI 上标注「默认建议（未实测，可改）」。
 
 #### 6.1.2 自定义 OpenAI 兼容渠道的表单字段
 
@@ -442,7 +449,7 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 3. 轮询 `POST https://github.com/login/oauth/access_token`（`grant_type=urn:ietf:params:oauth:grant-type:device_code`）→ GitHub token（`ghu_`，长期有效，vault 存储）。
 4. **Token 换取**：`GET https://api.github.com/copilot_internal/v2/token`（Bearer ghu_）→ Copilot token（JWT，**~30 分钟有效**）→ 内存缓存，过期前 5min 自动重取（R-6 伪装头也用于此请求）。
 
-**出站**：`POST https://api.githubcopilot.com/chat/completions`，Bearer = Copilot token，附 editor 伪装头（具体 UA/版本串以参考仓库源码为准，实现任务 T17 中核实并固化到常量）。
+**出站**：`POST https://api.githubcopilot.com/chat/completions`，Bearer = Copilot token，附 editor 伪装头（具体 UA/版本串以参考仓库源码为准，实现任务 T21 中核实并固化到常量）。
 
 **合规声明（必须写进 UI 首次启用弹窗）**：将 Copilot 额度用于第三方客户端违反 GitHub Copilot ToS，账号可能受限。用户显式确认后才启用。
 
@@ -453,15 +460,15 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 | 实测项 | 结果 |
 |---|---|
 | 设备标识 | `~/.workbuddy/device-id`（36B UUID `357bb4e7-…`；`device-id.machine` 同值）**可读可写** |
-| 用户登录态目录 | `~/.workbuddy/app/users/<64位hex>/`（目录存在；内部结构**未验证**，任务 T18a 确认） |
+| 用户登录态目录 | `~/.workbuddy/app/users/<64位hex>/`（目录存在；内部结构**未验证**，任务 T22 确认） |
 | 连接器密钥 | `~/.workbuddy/app/connector-keys/<uuid>.key`（32B 二进制；`~/.workbuddy-key-fallback/connector-keys/` 存同名备份） |
 | 全局配置 | `~/.workbuddy/app/app-config.json` 仅含 locale 等，无凭证 |
 
 **adapter 设计：**
 
-1. 扫描 `app/users/` 取当前登录态（T18a 抓包确认文件与字段后固化读取逻辑）。
+1. 扫描 `app/users/` 取当前登录态（T22 抓包确认文件与字段后固化读取逻辑）。
 2. 转发时携带登录态凭证 + **复写后的 device-id**（隔离用途，默认不复写用户本机文件，仅在"多账号隔离"模式下经确认写入）。
-3. 上游 endpoint = WorkBuddy 自家 API host（**未验证，T18a 抓包产出**）。
+3. 上游 endpoint = WorkBuddy 自家 API host（**未验证，T22 抓包产出**）。
 4. 失效判定：401/403 → 标记账号 `expired`，UI 提示"请在 WorkBuddy 桌面端重新登录"。
 5. 读取登录态文件**只读**，绝不改写 WorkBuddy 自身数据（区别于 TraeWorkAssistant 的登录态切换/指纹伪造——v1 不做切换器，只做"读当前登录态 + 转发"）。
 
@@ -485,7 +492,7 @@ pub trait ProviderAdapter: Send + Sync {
 **本节是 pi 接入方式的唯一权威载体。** 依据：pi 1.6.1 自带文档
 （`~/.pi/agent/install/releases/<版本>/node_modules/@earendil-works/pi-coding-agent/docs/`
 与 `schemas/models.schema.json`），以及 2026-11-26 的实连验证（见
-`docs/reviews/T10-pi-integration.md`）。
+`docs/reviews/T10-channel-matrix-and-pi.md`）。
 
 #### 6.5.1 安装 pi（Windows）
 
@@ -835,7 +842,7 @@ python scripts/security_check.py `
 | # | 风险 | 应对 |
 |---|---|---|
 | 1 | Copilot/WorkBuddy 额度反代违反平台 ToS，账号可能受限 | UI 首次启用强制确认；默认关闭；不提供规避检测能力 |
-| 2 | WorkBuddy 上游协议未验证，T18a 抓包可能发现签名/加密 | 预留 buffer；失败则降级为"仅保活 + 额度查看，不转发" |
+| 2 | WorkBuddy 上游协议未验证，T22 抓包可能发现签名/加密 | 预留 buffer；失败则降级为"仅保活 + 额度查看，不转发" |
 | 3 | MiniMax 国内站 GroupId 口径分裂 | 双 profile + 可配置拼接；实测矩阵定稿 |
 | 4 | 国产渠道 tools 兼容性参差 | §10.1 矩阵标注 partial，不假装全兼容 |
 | 5 | HAR 模板随站点改版失效 | 失败即通知；模板可由用户自行编辑重录 |
@@ -871,3 +878,4 @@ python scripts/security_check.py `
 | v0.9 | 2026-11-26 | T10 实测矩阵与 pi 实连回填：§6.5 **重写**为 pi 接入指引（安装 / 配置文件位置 / JSON 片段 / 环境变量插值 / 验证命令 / 实连结论，依据 pi 1.6.1 自带 schema 与官方文档）；§10.1 补**矩阵执行方式**（经网关打、预设名单单一权威、只读取库、client key 不落盘）与当前状态（**真实 7 列待 API Key**）；§1.2 补 `scripts/` 与 `src-tauri/examples/` 目录说明 |
 | v0.10 | 2026-11-26 | T11 安全验收回填：§10.2 补**执行口径**（命中项分"明文凭证命中"与"结构性命中"两类，前者必须为 0、后者逐条列出；判据 1 要扫 dump + 主库 + WAL/SHM 三层；判据 3 要有日志脱敏中间件机制；判据 4 做正反两例）+ 可复跑执行器 `scripts/security_check.py`；§1.2 补该脚本。**§5.2 的「日志中间件全局脱敏」此前未接入**（T2 §7 记着"随 T3 接入"，T3 已过但一直没接），本轮由 `gateway::logging::request_log` 补齐 |
 | v0.11 | 2026-11-26 | T12 本地估算器回填：§8.1 把「估算入口」细化为**四种情形**（上游给全 / 上游没回 / 上游缺一项→**只补缺的那一项** / 出站失败→不估），明确"缺失 = usage 对象里没有这个键，**值为 0 不算缺失**"；补**编码选择**（`cl100k_base` 默认含全部国产模型 / `o200k_base` 给 gpt-4o·gpt-4.1·gpt-5·o 系列）与**国产模型只能近似**的硬约束（估算值必须带 `estimated=1`、不参与预算告警）。实现 `gateway::estimator::TiktokenEstimator`（tiktoken-rs），产线默认由 `CharRatioEstimator` 换为 tiktoken |
+| v0.12 | 2026-11-26 | 账本清理三项回填（头头 2026-11-26 裁决）：① **任务编号交叉引用对齐**——以 03 任务卡为唯一真值源，改 §6.1.1「T9/T10→T10」、§6.2「T17→T21」、§6.3 三处与 §11 风险表「T18a→T22」，并修 §6.5 指向不存在文件的坏引用（`T10-pi-integration.md` → `T10-channel-matrix-and-pi.md`）；② **§4.4 统一错误结构补 `available_models`**——写明该键只在**别名未命中**（`code = "model_not_found"`）时出现、缺失时**整个键不出现**（不出现 `null`），别名命中但无可用候选的路径**不带**该字段；③ **T18 签到站点清单已指定**（ModelScope + MiniMax Code，见 03 T18 卡片） |
