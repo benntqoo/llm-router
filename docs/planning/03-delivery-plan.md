@@ -86,6 +86,7 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 **T10 实测矩阵（A 类 7 列 + pi 接入）** `1.5d` · 依赖 T9
 - 目标：跑 02 §10.1 矩阵前七列；用 pi 实连并产出接入文档片段（02 §6.5 补全）。
 - 验收：矩阵填写完整并落库到 `docs/reviews/channel-matrix-*.md`；pi 一轮带工具调用对话成功。
+- 落地（2026-11-26）：**pi 实连通过**——官方 `pi.dev/install.ps1` 装 managed Pi **1.6.1**（系统 Node v22.16.0 不满足 ≥22.19.0，用**脚本自带的** `Install-NodeStandalone` 装独立 Node v22.23.5，**不动用户 Node 环境**）；`scripts/pi_models.py` 从应用库直读别名生成 `~/.pi/agent/models.json`（`apiKey` 写 `$LLMR_CLIENT_KEY`，**不留明文**），`pi --list-models llm-router` 正常列出别名；**一轮带工具调用的对话经真网关成功**（模型出 `read` tool_call → pi 执行真实工具 → 结果回传 → 模型收尾；网关 **2 次请求**、**2 条 `usage_log`** `status=success estimated=0`；上游侧看到的是**渠道密钥**而非 client key）。02 §6.5 按 pi 自带 schema 与官方文档**重写**（不再是"未验证"占位）。矩阵侧：`scripts/channel_matrix.py` 执行器建成（经网关跑 6 项，预设名单由 `cargo run --example presets` 导出，**不在 Python 侧抄**），在本地 mock 上**经真网关 6 项全绿**，产物 `docs/reviews/channel-matrix-2026-11-26-mock.md`。**A 类 7 列真实矩阵仍待真实 API Key**（本机无任何 A 类渠道密钥，`channel` 表为空），未测单元格一律标「· 未测」，**不猜测渠道能力**。验收留档 `docs/reviews/T10-channel-matrix-and-pi.md`。
 
 **T11 安全验收** `0.5d` · 依赖 T2 T3
 - 目标：02 §10.2 四条判据全过。

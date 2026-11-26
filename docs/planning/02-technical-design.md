@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.8（变更记录见 §13） |
+| 版本 | v0.9（变更记录见 §13） |
 | 日期 | 2026-11-26 |
 | 上游文档 | `01-architecture-and-feasibility.md`（可行性基线与竞品调研） |
 | 状态 | 待评审后进入开发。**本文档未改动任何代码或配置**。 |
@@ -114,6 +114,16 @@ src-tauri/src/
     quota.rs           # 额度探测（渠道支持时）
   store/
     schema.rs migrations/
+```
+
+仓库根目录另有运维脚本（**不进应用二进制**，只用于验证与文档生成）：
+
+```
+scripts/
+  channel_matrix.py     # 渠道实测矩阵执行器（02 §10.1）：经网关跑 6 项，产出 docs/reviews/channel-matrix-*.md
+  pi_models.py          # 生成 pi 的 models.json / settings.json 片段（02 §6.5），别名从应用库直读
+src-tauri/examples/
+  presets.rs            # 导出 A 类预设清单，供脚本侧引用（避免抄名单）
 ```
 
 ### 1.3 技术选型
@@ -471,13 +481,100 @@ pub trait ProviderAdapter: Send + Sync {
 
 ### 6.5 pi 接入指引（写入 UI 帮助页）
 
-已验证（pi 官方 README）：pi-ai 支持"任意 OpenAI 兼容 API"，`createProvider({ baseUrl, auth, models, api: openAICompletionsApi() })` 明确面向 "local inference servers, proxies"。接入方式二选一：
-1. 若 pi CLI 提供 custom provider 配置文件（`.pi/settings.json` 机制，**具体 JSON schema 未验证**），填 base_url + client key。
-2. 否则按 pi-ai 编程式写一个 provider 定义（README 示例完整可抄，含 `envApiKeyAuth`）。
+**本节是 pi 接入方式的唯一权威载体。** 依据：pi 1.6.1 自带文档
+（`~/.pi/agent/install/releases/<版本>/node_modules/@earendil-works/pi-coding-agent/docs/`
+与 `schemas/models.schema.json`），以及 2026-11-26 的实连验证（见
+`docs/reviews/T10-pi-integration.md`）。
 
-> 该项归入任务 T9（实测矩阵）：用 pi 实际连一次本地网关，产出一份可复制的配置片段写进文档。
-> **实测（pi 实连 + 配置片段）归 T10**——T9 只在 UI 上给出通用接入片段（base_url / api_key / model），
-> pi 专属的 CLI 配置格式**仍未验证**，不得先写死。
+#### 6.5.1 安装 pi（Windows）
+
+官方 PowerShell 安装脚本（脚本自带 Node 预检与 managed install）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File <(curl -fsSL https://pi.dev/install.ps1)
+```
+
+约束：pi 要求 **Node.js ≥ 22.19.0**。脚本在**无交互终端**（`[Console]::IsInputRedirected`）
+下会跳过自带的 `Install-NodeStandalone`，直接落到系统 Node——若系统 Node 版本过低会报
+`error: Pi requires Node.js 22.19.0 or newer.`。此时用**脚本自带的同一个函数**先装独立 Node：
+
+```powershell
+# 从官方脚本里摘出 Install-NodeStandalone（去掉末尾 Invoke-PiInstaller 调用）后 dot-source 调用
+. .\pi-install-lib.ps1 ; Install-NodeStandalone
+```
+
+它从 nodejs.org 下载 + SHA256 校验 + 解压到 `%LOCALAPPDATA%\pi-node\current`，**不动用户既有 Node 环境**；
+装完把该目录放到 `PATH` 前端再跑官方脚本即可完成 managed install（本机验证：Pi 1.6.1，
+装到 `%USERPROFILE%\.pi\agent\bin\pi.cmd`）。
+
+#### 6.5.2 配置文件位置
+
+| 文件 | 作用 |
+|---|---|
+| `~/.pi/agent/models.json` | provider 定义（baseUrl / api / apiKey / models） |
+| `~/.pi/agent/settings.json` | 默认 provider 与 model（可选） |
+| `~/.pi/agent/auth.json` | pi 自己的登录态凭据（`/login` 写入；本方案不用它） |
+
+JSON schema 以 pi 安装目录内的 `schemas/models.schema.json` 为准（provider 可选字段：
+`name` / `baseUrl` / `apiKey` / `api` / `headers` / `compat` / `authHeader` / `models` /
+`modelOverrides`；model 条目**只强制 `id`**，其余有默认值）。
+
+#### 6.5.3 配置片段
+
+```json
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "llm-router": {
+      "name": "LLM Router (本地网关)",
+      "baseUrl": "http://127.0.0.1:8787/v1",
+      "api": "openai-completions",
+      "apiKey": "$LLMR_CLIENT_KEY",
+      "models": [
+        { "id": "<别名>", "name": "<别名>", "contextWindow": 128000, "maxTokens": 8192 }
+      ]
+    }
+  }
+}
+```
+
+关键点：
+
+1. **`api` 只能是 `openai-completions`**：v1 入站仅 OpenAI 协议（§0.2），网关不转换协议。
+2. **`apiKey` 写环境变量插值 `$LLMR_CLIENT_KEY`，文件里不留明文**。pi 的插值语法：
+   `$NAME` / `${NAME}` 取环境变量，`$$` → 字面 `$`，`$!` → 字面 `!`，`!command` → 取命令输出。
+   环境变量必须在**启动 pi 的那个进程**里存在。
+3. **`models[].id` 必须是网关发布的别名**，且与 `GET /v1/models` 同源。
+4. `contextWindow` / `maxTokens` 按实际渠道能力填；填错只影响 pi 侧的预算与截断，不影响网关转发。
+
+**别名清单不要手抄**：用 `scripts/pi_models.py` 从应用库直读生成（与 `GET /v1/models` 同一份数据）：
+
+```powershell
+python scripts/pi_models.py --store "$env:APPDATA/llm-router/store.db" `
+    --out "$env:USERPROFILE/.pi/agent/models.json" `
+    --settings-out "$env:USERPROFILE/.pi/agent/settings.json" --write
+```
+
+#### 6.5.4 验证命令
+
+```powershell
+$env:LLMR_CLIENT_KEY = "<client key 明文>"      # §3.1：创建时只显示一次
+pi --list-models llm-router                      # 应列出别名
+pi --model llm-router/<别名> -p "用一句话回答：1+1 等于几？"
+```
+
+#### 6.5.5 实连结论（2026-11-26，mock 上游经真网关）
+
+| 项 | 实测结果 |
+|---|---|
+| `pi --list-models llm-router` | 列出 `deepseek-chat`（context 128K / max-out 8.2K） |
+| 一轮带工具调用的对话 | 成功：模型出 `read` tool_call → pi 执行真实工具 → 结果回传 → 模型收尾 |
+| 网关请求数 | **2 次**（第 1 次出 tool_call，第 2 次带 tool 结果收尾） |
+| 密钥改写 | 网关把入站 client key 换成上游密钥（上游侧看到的 `Authorization` 是渠道密钥） |
+| 用量落库 | 2 条 `usage_log`，`status=success estimated=0 prompt=11 completion=5`（上游真 usage，非估算） |
+
+pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.tool_calls` 帧经网关透传正常，
+这是「改写器不是转换器」在真实客户端上的直接证据。
 
 ### 6.6 应用内 UI 面板口径（T9 落地）
 
@@ -633,7 +730,7 @@ pub trait ProviderAdapter: Send + Sync {
 
 ## 10. 实测矩阵与验收判据
 
-### 10.1 渠道实测矩阵（T9 任务执行）
+### 10.1 渠道实测矩阵（T10 任务执行）
 
 每渠道 × 每项：
 
@@ -647,6 +744,26 @@ pub trait ProviderAdapter: Send + Sync {
 | 多轮上下文 | | | | | | | | | |
 
 判据：全绿才能在预设中标 `stable`；部分绿标 `partial`（UI 明示哪些特性不可用）。
+
+**执行方式（T10 落地）**：`scripts/channel_matrix.py` 对**已在应用里配好的渠道**经网关跑
+上表前 7 列的 6 项，产物落到 `docs/reviews/channel-matrix-<日期>.md`（主矩阵 + 逐项证据 +
+网关 `usage_log` 落库证据）。
+
+- **必须经网关打，不直连上游**：判据是"这个预设能不能标 stable / partial"，
+  那是**预设 + 网关改写（R-1~R-8）之后的联合属性**，不是渠道裸接口的属性。
+- 预设清单的权威载体是 `src-tauri/src/providers/presets/`；脚本通过
+  `cargo run --example presets` 现场导出，**不在 Python 侧抄一份**（抄了必然漂移）。
+- 脚本**只读**应用库；client key 只从命令行/环境变量取，**不打印、不落盘**。
+
+```powershell
+$env:LLMR_CLIENT_KEY = "<client key 明文>"
+python scripts/channel_matrix.py --store "$env:APPDATA/llm-router/store.db"
+```
+
+**当前状态（2026-11-26）**：矩阵框架已在**本地 mock 上游**经真网关自测，6 项全绿，
+产物见 `docs/reviews/channel-matrix-2026-11-26-mock.md`（该文件是**框架自测**，
+不是真实渠道数据）。**真实 7 列矩阵仍待真实 API Key**——本机无任何 A 类渠道密钥，
+故上表 7 列尚未回填。真实 key 到位后重跑同一条命令即可覆盖该文件。
 
 ### 10.2 安全验收（M1 必过）
 
@@ -701,3 +818,4 @@ pub trait ProviderAdapter: Send + Sync {
 | v0.6 | 2026-11-26 | T7 用量采集口径回填：§8.1 采集口径（一条记录 = 一次出站尝试；流式 tee / 非流式直读；估算入口；**失败尝试不估 token**）、§8.2 账号口径（API Key 型渠道用默认账号 `acct_default_<channel_id>`）与限额自学习细则（四个窗口从 `usage_log` 派生、**在途请求不计**；只收紧不放宽）、§9 `usage_log` 增 `account_id` |
 | v0.7 | 2026-11-26 | T8 预设接入与自定义渠道回填：§6.1.1 预设的**默认模型建议值**（未实测，可改）、§6.1.2 **自定义 OpenAI 兼容渠道的表单字段**（base_url / 路径模板 / 鉴权样式 / GroupId / include_usage 开关 / 额外头 / 模型别名）、§9 `channel.meta_json` 增 `auth_style` 与 `extra_headers` |
 | v0.8 | 2026-11-26 | T9 UI 第一轮回填：§6.5 注明 pi 实连归 T10；新增 §6.6 **应用内 UI 面板口径**（各面板职责与权威数据源 + **模型预览必须与 `GET /v1/models` 同源** + **跨面板数据变更要广播**，防止 UI 与网关漂移） |
+| v0.9 | 2026-11-26 | T10 实测矩阵与 pi 实连回填：§6.5 **重写**为 pi 接入指引（安装 / 配置文件位置 / JSON 片段 / 环境变量插值 / 验证命令 / 实连结论，依据 pi 1.6.1 自带 schema 与官方文档）；§10.1 补**矩阵执行方式**（经网关打、预设名单单一权威、只读取库、client key 不落盘）与当前状态（**真实 7 列待 API Key**）；§1.2 补 `scripts/` 与 `src-tauri/examples/` 目录说明 |

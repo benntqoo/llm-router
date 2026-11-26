@@ -58,9 +58,10 @@
 第 8 步：~~T6 追加：熔断落库 + UI 展示 + 429/Retry-After 口径~~ ✅（头头裁决后落地，留档 `docs/reviews/T6-circuit-persistence-verification.md`）；同批追加二（熔断时长可配 + 手动解除）、追加三（429 冷却上限可配，提交 `96be851`）也已落地
 第 9 步：~~T7 usage 采集~~ ✅（提交 `59053b2`，留档 `docs/reviews/T7-usage-capture.md`）
 第 10 步：~~T8 A 类预设 + 自定义渠道~~ ✅（提交 `a340a29`，留档 `docs/reviews/T8-preset-and-custom-channel.md`）
-第 11 步：~~T9 UI 第一轮~~ ✅（提交 `e70df27`，留档 `docs/reviews/T9-ui-first-round.md`）；下一步 T10 实测矩阵 → T11 安全验收
-第 12 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
-第 13 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
+第 11 步：~~T9 UI 第一轮~~ ✅（提交 `e70df27`，留档 `docs/reviews/T9-ui-first-round.md`）
+第 12 步：~~T10 实测矩阵（A 类 7 列 + pi 接入）~~ 🟡 **pi 实连已通过**（留档 `docs/reviews/T10-channel-matrix-and-pi.md`）；**A 类 7 列真实矩阵待真实 API Key**（见 §8 账本）
+第 13 步：每任务完成 → 验收留档 docs/reviews/<任务号>-*.md
+第 14 步：M1 全绿（03 §1 判据）→ 向头头汇报，再进 M2
 ```
 
 排期基准 6 周（03 §4）。滞后处理按 03 §5 降级预案，不擅自砍范围。
@@ -71,7 +72,7 @@
 |---|---|---|---|
 | 1 | **WorkBuddy 上游 API host 与登录态字段**。本机已实测：登录态在 `~/.workbuddy/app/users/<64hex>/`，设备标识 `~/.workbuddy/device-id`（UUID 可读写）；内部字段与 API host 未知 | T22（抓包）→ T23 | 代理抓 WorkBuddy 桌面端一次对话；产出 `docs/reviews/workbuddy-protocol.md`（**只记字段名，严禁记录 token 值**）。发现签名/加密 → 触发降级（仅保活+额度查看） |
 | 2 | **MiniMax 国内站 GroupId**：第三方口径分裂（有带/不带）。官方国际站确认不带 | T8/T10 | 三种口径逐一实测（不带/带 GroupId query/旧版路径），结论回填 02 §4.2 预设 |
-| 3 | **pi CLI 的自定义 provider 配置格式**。pi-ai 库已验证支持 OpenAI 兼容（`createProvider`），但 CLI 层 JSON schema 未见文档 | T10 | 装 pi 实测；产出可复制的接入配置片段，回填 02 §6.5 |
+| 3 | ~~**pi CLI 的自定义 provider 配置格式**~~ | T10 | ✅ **已实测**（2026-11-26）：配置在 `~/.pi/agent/models.json`（provider 定义）+ `~/.pi/agent/settings.json`（默认 provider/model）；`api` 取 `openai-completions`；`apiKey` 用 `$ENV_NAME` 插值（`$$`/`$!` 转义、`!command` 取命令输出）。权威口径见 02 §6.5，依据是 pi 1.6.1 **自带**的 `docs/models.md` 与 `schemas/models.schema.json`；片段生成器 `scripts/pi_models.py` |
 | 4 | DeepSeek/Kimi/GLM/百炼/硅基流动 base_url（常识级，未逐一到控制台复核） | T8/T10 | 各渠道控制台文档核对一遍 |
 | 5 | 国产渠道 `tools`（tool_calls）兼容性参差 | T10 | 实测矩阵 02 §10.1，结果决定预设标 `stable`/`partial` |
 
@@ -124,6 +125,8 @@
 | ✅ | T7 账号口径（**头头 2026-11-26 认可**）：API Key 型渠道按需补建默认账号 `acct_default_<channel_id>`（"账号"在 v1 是统一概念，后续接账号池不改采集层）。02 §8.2 口径不变 | T7 留档 `docs/reviews/T7-usage-capture.md` §4 |
 | ✅ | T8 A 类预设 + 自定义渠道（02 §6.1 的 7 个 profile 全部接入 UI：每个预设带一条**默认模型建议值**（公开常识值，**未实测、可改**）→ 选中预设后**仅剩填 key 一步**；自定义 OpenAI 兼容渠道表单：base_url / 路径模板 / 鉴权样式（`bearer`｜`custom_header`）/ GroupId / include_usage 开关 / 额外固定头 / 模型别名 → 保存后别名**立即**出现在 `GET /v1/models`） | 提交 `a340a29`；留档 `docs/reviews/T8-preset-and-custom-channel.md`；截图 `docs/reviews/app-ui-channel.png`；02 §6.1.1/§6.1.2/§9（v0.7） |
 | ✅ | T9 UI 第一轮（渠道列表/编辑 + **模型别名多行管理** + 渠道启用/禁用 + 优先级；密钥录入与回看（**30s 自动遮蔽**）且与渠道面板**联动一致**；**client key 管理**（创建 + 标签/限额编辑）；**`/v1/models` 预览**（与网关同源）+ 客户端接入片段） | 提交 `e70df27`；留档 `docs/reviews/T9-ui-first-round.md`；截图 `docs/reviews/app-ui-t9-channels.png` / `app-ui-t9-preview.png`；02 §6.6（v0.8）；**判据实测：从零配置 DeepSeek 渠道 + client key = 7.1 秒（上限 3 分钟）** |
+| 🟡 | **T10 实测矩阵（A 类 7 列 + pi 接入）**：**pi 实连已通过**（官方脚本装 Pi 1.6.1；`~/.pi/agent/models.json` 片段由 `scripts/pi_models.py` 从应用库直读生成；一轮带工具调用的对话经真网关成功——模型出 `read` tool_call → pi 执行真实工具 → 结果回传；网关 2 次请求 + 2 条 `usage_log status=success estimated=0`；上游侧看到的是渠道密钥）。**矩阵侧执行器已建成**（`scripts/channel_matrix.py` 经网关跑 6 项，预设名单由 `cargo run --example presets` 导出），在 mock 上**经真网关 6 项全绿**。**A 类 7 列真实数据仍缺真实 API Key**（本机无任何 A 类渠道密钥，`channel` 表为空），未测单元格一律标「· 未测」 | 留档 `docs/reviews/T10-channel-matrix-and-pi.md`；矩阵产物（框架自测）`docs/reviews/channel-matrix-2026-11-26-mock.md`；02 §6.5/§10.1/§1.2（v0.9） |
+| 🔴 | **T10 剩余阻塞：A 类 7 列真实矩阵 + 预设 `stable`/`partial` 标注**。前提是头头提供**任一 A 类渠道真实 API Key**（贴 7 个 / 只给部分均可）。到位后：`python scripts/channel_matrix.py --store "$env:APPDATA/llm-router/store.db"` 覆盖 `docs/reviews/channel-matrix-<日期>.md`，再按全绿/部分绿回填预设标注 | 头头提供真实 key；无 key 前**不猜测渠道能力**（03 T10 任务卡、02 §10.1） |
 | 🔴 | **AGENT.md §9 安全验收正则口径**：`grep -iE "sk-|Bearer |api_key"` 会恒定命中 DDL 注释与 `credential.kind` 取值，需收窄口径 | 提案与三个备选方案见 `docs/reviews/T2-vault-verification.md` §6，待头头裁决 |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 02 §6.1 标题写"8 profile"但表体只有 7 行（03 T8 写"7 个 profile"） | T4 与 T8 均按 7 个落地（T8 的 §6.1.1 列出 7 条默认模型，UI 下拉也是 7 个）；是否回填标题待裁决，见 `docs/reviews/T4-outbound-adapter-verification.md` §6 |
