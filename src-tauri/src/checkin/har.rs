@@ -258,11 +258,29 @@ pub struct TemplateVariable {
     pub default: Option<String>,
 }
 
-/// 模板的断言（状态码；JSON 路径断言属 T16）。
+/// 模板的断言（状态码 + JSON 路径；JSON 路径属 T16）。
+///
+/// **向后兼容**：T15 落库的模板只有 `status`；新增字段一律可选（缺失 = 没配）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TemplateAssert {
-    pub status: i64,
+    /// 期望状态码（`None` = 没配状态码断言）。
+    #[serde(default)]
+    pub status: Option<i64>,
+    /// JSON 路径断言（`None`/空 = 没配）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub json_paths: Vec<JsonPathAssert>,
+}
+
+/// 一条 JSON 路径断言（点号路径，支持数组下标；02 §7.1.3 §3）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JsonPathAssert {
+    /// 点号路径（如 `data.ok` / `data.items.0.id`）。
+    pub path: String,
+    /// 期望值（`None` = 「存在即通过」）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals: Option<serde_json::Value>,
 }
 
 /// 站点模板（落 `checkin_site.config_json`；02 §7.1.1）。
@@ -487,6 +505,16 @@ fn collect_leaves(value: &serde_json::Value, path: &mut String, out: &mut Vec<(S
 
 /// 按点路径取 JSON 里的字符串叶子。
 fn body_value(value: &serde_json::Value, path: &str) -> Option<String> {
+    json_lookup(value, path).and_then(|found| match found {
+        serde_json::Value::String(text) => Some(text.clone()),
+        _ => None,
+    })
+}
+
+/// 按点路径查 JSON 里的值（**任意类型**；数组下标用数字段名，如 `items.0.id`）。
+///
+/// T16 的 JSON 路径断言复用这一份实现，避免两处路径语义漂移。
+pub fn json_lookup<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = value;
     for segment in path.split('.') {
         current = match current {
@@ -495,10 +523,7 @@ fn body_value(value: &serde_json::Value, path: &str) -> Option<String> {
             _ => return None,
         };
     }
-    match current {
-        serde_json::Value::String(text) => Some(text.clone()),
-        _ => None,
-    }
+    Some(current)
 }
 
 /// 按点路径替换 JSON 里的字符串叶子。
@@ -857,7 +882,9 @@ pub fn build_template(
         },
         variables: originals.iter().map(|(v, _)| v.clone()).collect(),
         assert: TemplateAssert {
-            status: entry.response.status,
+            // 导入时先填**录制时的**状态码占位；用户应改成签到成功时的值（T16 §7.1.3 §3）
+            status: Some(entry.response.status),
+            json_paths: Vec::new(),
         },
     };
 
@@ -1044,7 +1071,7 @@ mod tests {
             cookie.value,
             "acw_tc={{auto_acw_tc}}; csrf_session={{cookie}}; csrf_token={{csrf}}"
         );
-        assert_eq!(template.assert.status, 401);
+        assert_eq!(template.assert.status, Some(401));
     }
 
     #[test]

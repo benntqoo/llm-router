@@ -119,6 +119,84 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<SiteRow> {
     })
 }
 
+// ────────────────────────────── 签到结果（T16） ──────────────────────────────
+
+/// 一行签到结果（`checkin_result`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultRow {
+    pub id: i64,
+    pub site_id: String,
+    /// Unix 秒。
+    pub ts: i64,
+    pub ok: bool,
+    /// 奖励 JSON（T16 留空；积分回写属 T18 / T17）。
+    pub reward_json: Option<String>,
+    /// 人类可读的中文原因（T19 通知直接用）。
+    pub message: Option<String>,
+}
+
+/// 写一行签到结果。
+///
+/// `ok = 1` **仅当**分类为 `success`（由调用方保证；02 §7.1.3 §5）。
+/// **响应体不进这里**——可能带 csrf / token 一类密文。
+pub fn insert_result(
+    conn: &Connection,
+    site_id: &str,
+    ts: i64,
+    ok: bool,
+    reward_json: Option<&str>,
+    message: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO checkin_result (site_id, ts, ok, reward_json, message)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            site_id,
+            ts,
+            if ok { 1_i64 } else { 0_i64 },
+            reward_json,
+            message,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 列签到结果（按时间倒序；`site_id` 为 `None` 时列全部）。
+pub fn list_results(conn: &Connection, site_id: Option<&str>, limit: usize) -> Result<Vec<ResultRow>> {
+    let limit = limit.clamp(1, 1000) as i64;
+    let mut stmt = match site_id {
+        Some(_) => conn.prepare(
+            "SELECT id, site_id, ts, ok, reward_json, message
+             FROM checkin_result WHERE site_id = ?1 ORDER BY ts DESC, id DESC LIMIT ?2",
+        )?,
+        None => conn.prepare(
+            "SELECT id, site_id, ts, ok, reward_json, message
+             FROM checkin_result ORDER BY ts DESC, id DESC LIMIT ?1",
+        )?,
+    };
+    let rows = match site_id {
+        Some(site_id) => stmt.query_map(rusqlite::params![site_id, limit], row_to_result)?,
+        None => stmt.query_map(rusqlite::params![limit], row_to_result)?,
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn row_to_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResultRow> {
+    Ok(ResultRow {
+        id: row.get(0)?,
+        site_id: row.get(1)?,
+        ts: row.get(2)?,
+        ok: row.get::<_, i64>(3)? != 0,
+        reward_json: row.get(4)?,
+        message: row.get(5)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +261,35 @@ mod tests {
         assert!(delete_site(&conn, &row.id).expect("删除失败"));
         assert!(!delete_site(&conn, &row.id).expect("删除失败"));
         assert!(get_site(&conn, &row.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn results_round_trip_and_sort_by_time() {
+        let store = Store::open_in_memory().expect("打开内存库失败");
+        let conn = store.lock();
+        let site_row = site("ModelScope");
+        upsert_site(&conn, &site_row).expect("写入失败");
+
+        let first = insert_result(&conn, &site_row.id, 100, false, None, Some("断言未通过"))
+            .expect("写结果失败");
+        let second = insert_result(&conn, &site_row.id, 200, true, Some("{\"credits\":400}"), Some("签到成功"))
+            .expect("写结果失败");
+        assert!(first < second);
+
+        let rows = list_results(&conn, Some(&site_row.id), 10).expect("列结果失败");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts, 200, "按时间倒序");
+        assert!(rows[0].ok);
+        assert_eq!(rows[0].reward_json.as_deref(), Some("{\"credits\":400}"));
+        assert_eq!(rows[1].message.as_deref(), Some("断言未通过"));
+        assert!(!rows[1].ok);
+
+        assert_eq!(list_results(&conn, None, 10).expect("列结果失败").len(), 2);
+        assert_eq!(
+            list_results(&conn, Some("site-not-exist"), 10)
+                .expect("列结果失败")
+                .len(),
+            0
+        );
     }
 }

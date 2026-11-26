@@ -273,7 +273,7 @@ fn summarize(row: &SiteRow) -> Result<SiteSummary, String> {
             source: template.source,
             method: template.request.method,
             url: template.request.url,
-            status: template.assert.status,
+            status: template.assert.status.unwrap_or(0),
             variable_count: template.variables.len(),
             variable_names: template
                 .variables
