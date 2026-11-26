@@ -134,6 +134,7 @@
 | 🟡 | **M1 里程碑状态：判据 ②③④ 已验通过；① 的真实 DeepSeek 部分挂起**（头头决定先不测真实上游，与 T10 真实矩阵同一前提）。**汇报件见 `docs/reviews/M1-milestone-report.md`** | 03 §1 判据；解除条件 = 拿到任一 A 类渠道真实 API Key（一把钥匙同时解锁 T10 真实矩阵与 M1 判据 ①） |
 | ✅ | **AGENT.md §9 安全验收正则口径**（头头 2026-11-26 裁决：改为指向执行器）。§9 保留四条判据语义，**执行统一走只读执行器** `scripts/security_check.py`，并写明"明文凭证命中必须为 0 / 结构性命中逐条列出"的分类口径；原命令三处与现实不符之处（正则恒命中 `api_key`、`strings` 是 Unix 工具、`grep logs/` 而应用不落日志文件）一并清掉 | 留档 `docs/reviews/security-check-m1.md` §4 + §4.1（含在**用户真实库**与**已录密钥的验证库**上的实跑留档，退出码 0）；02 §10.2 执行口径 |
 | ✅ | **02 §6.1 标题"8 profile"** → 已按事实改为 **"7 profile"**（表体 7 行；T4/T8/UI/T8 任务卡均按 7 个落地，03 T8 卡片写的也是"7 个 profile"） | 头头 2026-11-26 裁决；02 §6.1 |
+| ✅ | **分支命名**（头头 2026-11-26 裁决："main 指向 dev 最新并推远端，dev 也推"）：本地 `master` → **`main`**（指向 dev 最新 = 当前可发布状态），`dev` 一并推上远端并各自设上游；旧远端 `master` **已删除**；GitHub 仓库**默认分支改为 `main`**。现与 AGENT.md §8 的 `main`（可发布）+ `dev`（日常）**完全一致** | 实操记录：`git branch -m master main` → `git branch -f main dev` → `git push -u origin main` → `git push -u origin dev` → `gh api -X PATCH repos/benntqoo/llm-router -f default_branch=main`（GitHub **不允许删当前默认分支**，必须先切默认分支）→ `git push origin --delete master` |
 | 🔴 | 任务编号交叉引用对齐（02 的 `T18a`/`T17`/`T9` 与 03 任务卡不一致） | 提案 `docs/reviews/proposal-task-numbering.md`，待头头裁决 |
 | 🔴 | 统一错误体新增 `available_models` 字段是否回填 02 §4.4 | 02 §2.1 ③ 要求"响应体附可用别名"，§4.4 字段表未列；已按可选字段实现，见 `docs/reviews/T5-routing-alias-verification.md` §6 |
 | 🔴 | T18 签到站点清单待指定 | `docs/planning/03-delivery-plan.md` §2 T18 |
