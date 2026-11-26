@@ -187,7 +187,14 @@ mod tests {
     fn generated_key_has_prefix_and_long_body() {
         let key = generate_client_key();
         assert!(key.starts_with(CLIENT_KEY_PREFIX));
-        assert_eq!(key.len(), CLIENT_KEY_PREFIX.len() + 43);
+        // base62 去前导零：32 字节随机数编码后是 **42 或 43** 个字符
+        // （62^42 < 2^256 < 62^43；首字节 < 4 时落在 42 位）。
+        // 这里**不能**断言固定长度——首字节为 0~3 的概率约 1.2%，会变成随机失败。
+        let body_len = key.len() - CLIENT_KEY_PREFIX.len();
+        assert!(
+            (42..=43).contains(&body_len),
+            "随机部分应为 42~43 个 base62 字符，实际 {body_len}"
+        );
         assert_ne!(key, generate_client_key(), "每次生成必须不同");
     }
 
@@ -202,10 +209,11 @@ mod tests {
 
     #[test]
     fn base62_roundtrip_encoding_is_reversible_by_length() {
-        // 32 字节 → 43~44 个 base62 字符（2^256 < 62^43 < 2^256 的关系）
+        // 32 字节 → 43 个 base62 字符（62^42 < 2^256 < 62^43；首字节 ≥ 4 时必为 43 位）。
+        // 首字节 < 4 时值更小 → 42 位；全零 → "0"（长度为 1）。
         let raw: [u8; 32] = [7u8; 32];
         let encoded = base62_encode(&raw);
-        assert!(encoded.len() >= 43 && encoded.len() <= 44);
+        assert_eq!(encoded.len(), 43);
         assert!(encoded.chars().all(|c| c.is_ascii_alphanumeric()));
         assert_eq!(base62_encode(&[0u8; 32]).len(), 1);
         assert_eq!(base62_encode(&[]), "0");
