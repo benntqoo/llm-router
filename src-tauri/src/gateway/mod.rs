@@ -13,6 +13,7 @@ pub mod circuit_store;
 pub mod errors;
 pub mod fallback;
 pub mod inbound;
+pub mod logging;
 pub mod outbound;
 pub mod ratelimit;
 pub mod router;

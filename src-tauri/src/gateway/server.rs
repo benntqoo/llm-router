@@ -21,6 +21,7 @@ use crate::gateway::auth::{self, AuthenticatedClient};
 use crate::gateway::errors::GatewayError;
 use crate::gateway::fallback::Forwarder;
 use crate::gateway::inbound::openai::{parse_chat_request, ModelEntry, ModelList};
+use crate::gateway::logging;
 use crate::gateway::ratelimit::RateLimiter;
 use crate::gateway::router::{AliasRouter, RouteError};
 use crate::store::Store;
@@ -83,6 +84,8 @@ pub fn router(state: GatewayState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
+        // 请求日志中间件（02 §5.2）：敏感头一律脱敏成 `***`。
+        .layer(axum::middleware::from_fn(logging::request_log))
         .with_state(state)
 }
 
