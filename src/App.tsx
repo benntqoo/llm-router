@@ -4,6 +4,7 @@ import ChannelPanel from "./ChannelPanel";
 import CircuitPanel from "./CircuitPanel";
 import ClientKeyPanel from "./ClientKeyPanel";
 import ModelsPanel from "./ModelsPanel";
+import UsagePanel from "./usage/UsagePanel";
 import VaultPanel from "./VaultPanel";
 import "./App.css";
 
@@ -79,7 +80,8 @@ function App() {
         <p className="muted">
           已完成 T0 骨架 / T1 数据层 / T2 加密保险库 / T3 入站鉴权 / T4 出站适配器 /
           T5 路由别名 / T6 流式管道与熔断 / T7 用量采集 / T8 预设与自定义渠道 /
-          T9 UI 第一轮；后续：T10 实测矩阵 → T11 安全验收
+          T9 UI 第一轮 / T11 安全验收 / T12 本地估算器 / T13 价目表与成本换算；
+          T10 实测矩阵的执行器已建（A 类 7 列真实数据待真实渠道 key）。
         </p>
       </section>
 
@@ -92,6 +94,8 @@ function App() {
       <ModelsPanel />
 
       <CircuitPanel />
+
+      <UsagePanel />
     </main>
   );
 }

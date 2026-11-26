@@ -286,3 +286,110 @@ code {
 .steps li {
   margin: 6px 0;
 }
+
+/* ── T14：用量统计面板 ─────────────────────────────────────────────── */
+
+/* 维度 / 范围 / 度量的切换按钮组 */
+.row-inline .sep {
+  width: 1px;
+  height: 20px;
+  background: #2c303a;
+  margin: 0 4px;
+}
+
+.card button.active {
+  background: #1d3a5f;
+  border-color: #3d6ea8;
+  color: #dce8f7;
+}
+
+/* KPI 行 */
+.usage-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.usage-kpi {
+  border: 1px solid #2c303a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #191c23;
+}
+
+.usage-kpi-label {
+  font-size: 12px;
+  color: #9aa0a6;
+}
+
+.usage-kpi-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: #e8eaed;
+  margin: 4px 0 2px;
+  word-break: break-all;
+}
+
+.usage-kpi-hint {
+  font-size: 12px;
+  color: #6f7683;
+}
+
+/* 聚合条形图（手写 SVG） */
+.usage-chart {
+  width: 100%;
+  height: auto;
+  display: block;
+  margin: 8px 0 4px;
+}
+
+.chart-label {
+  fill: #9aa0a6;
+  font-size: 12px;
+}
+
+.chart-value {
+  fill: #e8eaed;
+  font-size: 12px;
+}
+
+.chart-track {
+  fill: #1d2027;
+  rx: 3;
+}
+
+.chart-bar {
+  fill: #4f8bd6;
+  rx: 3;
+}
+
+/* 聚合表 / 最近请求表 */
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+
+.usage-table th,
+.usage-table td {
+  border-bottom: 1px solid #2c303a;
+  padding: 6px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.usage-table th {
+  color: #9aa0a6;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.usage-table td {
+  color: #e8eaed;
+}
+
+.usage-table tbody tr:hover td {
+  background: #191c23;
+}
