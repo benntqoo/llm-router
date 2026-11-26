@@ -25,6 +25,7 @@ use llm_router_lib::gateway::ratelimit::RateLimiter;
 use llm_router_lib::gateway::router::AliasRouter;
 use llm_router_lib::gateway::server::{self, GatewayState};
 use llm_router_lib::gateway::usage::{CharRatioEstimator, TokenEstimator};
+use llm_router_lib::store::analytics::{aggregate, recent_requests, AggregateQuery, Dim};
 use llm_router_lib::store::quota::read_quota;
 use llm_router_lib::store::usage::StoreUsageSink;
 use llm_router_lib::store::Store;
@@ -89,12 +90,26 @@ async fn mock_handler(
             NON_STREAM_PARTIAL_USAGE_BODY,
         )
             .into_response(),
-        "sseusage" => (
-            StatusCode::OK,
-            [(CONTENT_TYPE, "text/event-stream")],
-            STREAM_BODY,
-        )
-            .into_response(),
+        "sseusage" => {
+            // 刻意延迟 60ms：让「首个 token 到达时刻（TTFT）」与「输出耗时」可观测
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "text/event-stream")],
+                STREAM_BODY,
+            )
+                .into_response()
+        }
+        "slowusage" => {
+            // 刻意延迟 120ms：让「输出速度（tokens·s⁻¹）」能按公式复算
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/json")],
+                NON_STREAM_BODY,
+            )
+                .into_response()
+        }
         "fail429" => (
             StatusCode::TOO_MANY_REQUESTS,
             [
@@ -448,6 +463,123 @@ async fn acceptance_cost_micros_uses_three_prices() {
         Some(108),
         "成本应按输入/输出/缓存读三价换算"
     );
+}
+
+// ── 验收：四维聚合 + 最近请求明细（T14；02 §8.4）────────────────────────
+
+/// 不限时间范围的聚合查询。
+fn all_time(dim: Dim) -> AggregateQuery {
+    AggregateQuery {
+        dim,
+        since_ts: None,
+        until_ts: None,
+        limit: Some(50),
+    }
+}
+
+/// T14 验收（03 §2 T14 / 03 §1 M2 判据）：**四维聚合 + 最近请求明细**。
+///
+/// 走**真网关**：流式 + 非流式各一次 → 用量落库 → 聚合结果必须反映真实流量。
+#[tokio::test]
+async fn acceptance_aggregate_reflects_real_gateway_traffic() {
+    let base = start_mock().await;
+    let f = fixture();
+    seed_channel(&f, "c1", "非流式渠道", "slowusage", &base, "chat-a");
+    seed_channel(&f, "c2", "流式渠道", "sseusage", &base, "chat-b");
+
+    // 一次非流式（上游 usage：prompt 31 / completion 7 / cached 5）
+    let r1 = chat(&f, "chat-a", false).await;
+    assert_eq!(r1.status(), StatusCode::OK);
+    // 一次流式（上游 usage 帧：prompt 42 / completion 9，带 TTFT）
+    let r2 = chat(&f, "chat-b", true).await;
+    assert_eq!(r2.status(), StatusCode::OK);
+    // 必须**读完响应体**：tee 在流被消费完时才冲刷末帧的 usage（02 §8.1）
+    let _ = read_body_text(r2).await;
+
+    let rows = wait_usage_rows(&f.store, 2).await;
+    assert_eq!(rows.len(), 2, "一次出站尝试 = 一行");
+
+    // ── 按渠道聚合 ──
+    let by_channel = aggregate(&f.store, &all_time(Dim::Channel)).expect("按渠道聚合");
+    assert_eq!(by_channel.buckets.len(), 2, "两个渠道 → 两个桶");
+
+    let c1 = by_channel
+        .buckets
+        .iter()
+        .find(|b| b.key == "c1")
+        .expect("应有 c1 桶");
+    assert_eq!(c1.label, "非流式渠道", "桶应带上可读的渠道名");
+    assert_eq!(c1.requests, 1);
+    assert_eq!(c1.prompt_tokens, 31);
+    assert_eq!(c1.completion_tokens, 7);
+    assert_eq!(c1.cache_read_tokens, 5);
+    assert_eq!(c1.total_tokens, 38);
+    assert_eq!(c1.success_count, 1);
+    assert_eq!(c1.error_count, 0);
+    assert_eq!(c1.estimated_rows, 0, "上游给了 usage → 不是估算行");
+    assert_eq!(c1.ttft_p50_ms, None, "非流式没有 TTFT");
+
+    let c2 = by_channel
+        .buckets
+        .iter()
+        .find(|b| b.key == "c2")
+        .expect("应有 c2 桶");
+    assert_eq!(c2.prompt_tokens, 42);
+    assert_eq!(c2.completion_tokens, 9);
+    assert!(
+        c2.ttft_p50_ms.is_some(),
+        "流式有 TTFT → 桶里应有分位数"
+    );
+
+    // ── 合计（不受 limit 影响）──
+    let total = &by_channel.total;
+    assert_eq!(total.requests, 2);
+    assert_eq!(total.prompt_tokens, 73);
+    assert_eq!(total.completion_tokens, 16);
+    assert_eq!(total.total_tokens, 89);
+    assert_eq!(total.success_count, 2);
+    // 该上游模型没配牌价 → 两行成本都是 NULL（未知）→ 已知成本合计 0，
+    // 但"成本未知"的行数要单独计数（02 §8.3 的 0 vs NULL 语义）
+    assert_eq!(total.cost_micros, 0);
+    assert_eq!(total.cost_unknown_rows, 2);
+
+    // ── 按 UTC 日聚合 ──
+    let by_day = aggregate(&f.store, &all_time(Dim::Day)).expect("按日聚合");
+    assert_eq!(by_day.buckets.len(), 1, "同一天的两次请求 → 一个桶");
+    assert_eq!(by_day.buckets[0].requests, 2);
+    assert_eq!(by_day.buckets[0].total_tokens, 89);
+
+    // ── 按模型 / 按客户端聚合 ──
+    let by_model = aggregate(&f.store, &all_time(Dim::Model)).expect("按模型聚合");
+    assert_eq!(by_model.buckets.len(), 1, "两个渠道用的是同一个上游模型");
+    assert_eq!(by_model.buckets[0].key, "deepseek-chat");
+    assert_eq!(by_model.buckets[0].requests, 2);
+
+    let by_client = aggregate(&f.store, &all_time(Dim::Client)).expect("按客户端聚合");
+    assert_eq!(by_client.buckets.len(), 1);
+    assert_eq!(by_client.buckets[0].key, "ck1");
+    assert_eq!(by_client.buckets[0].label, "t7", "桶应带上 client key 标签");
+    assert_eq!(by_client.buckets[0].requests, 2);
+
+    // ── 最近请求明细（M2 判据要显示的四项）──
+    let recent = recent_requests(&f.store, 10).expect("读明细");
+    assert_eq!(recent.len(), 2);
+    assert!(recent[0].ts >= recent[1].ts, "新的在前");
+    for item in &recent {
+        assert_eq!(item.status.as_deref(), Some("success"));
+        assert!(item.total_tokens > 0);
+        assert_eq!(item.estimated, false, "上游给了 usage → 不是估算行");
+        assert_eq!(item.cost_micros, None, "没配牌价 → 成本未知（NULL）");
+        // 输出速度必须**按该行自己的耗时复算**（tokens ÷ 秒）
+        let duration = item.duration_ms.expect("成功行应记录耗时");
+        assert!(duration > 0, "mock 有意延迟，耗时应为正");
+        let tps = item.output_tps.expect("成功且有耗时的行应能算出 tokens·s⁻¹");
+        let expected = item.completion_tokens as f64 * 1000.0 / duration as f64;
+        assert!(
+            (tps - expected).abs() < 1e-6,
+            "tokens·s⁻¹ 应等于 输出 token ÷ 耗时秒：期望 {expected}，实际 {tps}"
+        );
+    }
 }
 
 // ── 验收：429 后 quota_json 更新 ───────────────────────────────────────

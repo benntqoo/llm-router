@@ -772,6 +772,53 @@ cost_micros = round( ( 可计费输入   × input_per_1m
 - `minimax_intl`（国际站）按 **USD** 计价，本表以元计价、**不做汇率折算** → 预填**不覆盖**该 provider
   （`cost_micros` 保持 NULL），用户可自行填行。
 
+### 8.4 聚合与图表口径（T14）
+
+**数据来源**：全部从 `usage_log` 派生——**流水是唯一真值**，不另设计数表（与 §8.2 的窗口计数同一口径）。
+
+**四个维度**：
+
+| `dim` | 分桶键 | 可读名 | 排序 |
+|---|---|---|---|
+| `day` | `ts` 按 **UTC 日**截断（`%Y-%m-%d`，与 §8.2 的 UTC 日界一致） | 同键 | **日期升序** |
+| `channel` | `channel_id` | `channel.name`（查不到回退为 id） | token 总量降序 |
+| `model` | `upstream_model`（上游真实模型名，R-1 替换后的） | 同键 | token 总量降序 |
+| `client` | `client_key_id` | `client_key.label`（查不到回退为 id） | token 总量降序 |
+
+- 可空列一律 `COALESCE` 成 `(未记录)`，**不因 NULL 丢数据**。
+- 桶数上限默认 **50**；**合计桶不受上限影响**（截断只影响展示，不影响合计）。
+
+**时间范围**：`ts >= since_ts`（**含**）且 `ts < until_ts`（**不含**）；默认近 **30 天**、上界不限。
+
+**每个桶的指标**：
+
+| 指标 | 口径 |
+|---|---|
+| `requests` | 桶内行数 = **出站尝试数**（一条 `usage_log` 一行，§8.1） |
+| `success_count` / `error_count` / `aborted_count` | 按 `status` 分 |
+| `prompt_tokens` / `completion_tokens` / `cache_read_tokens` / `cache_write_tokens` / `reasoning_tokens` | SUM |
+| `total_tokens` | **输入 + 输出**（缓存读写**已含在输入里**，不重复计） |
+| `cost_micros` | `SUM(COALESCE(cost_micros, 0))` = **已知成本合计** |
+| `cost_unknown_rows` | `cost_micros IS NULL` 的行数（**未配牌价**）——延续 §8.3 的 `0` / `NULL` 语义：**已知成本合计为 0 不等于"不花钱"** |
+| `estimated_rows` | `estimated=1` 的行数（估算行） |
+| `ttft_p50_ms` / `ttft_p95_ms` | **只在 `ttft_ms IS NOT NULL` 的行上算**（= 流式行）；**无样本 → NULL**（不是 0） |
+| `output_tps` | 成功行按「输出 token ÷ 耗时」加权；**无有效样本 → NULL** |
+
+**分位数**：**最近秩法**——排序后取第 `ceil(p × n)` 个（1 起）。`p50` 即中位数，`p95` 即 P95。
+（SQLite 无分位函数，故取原始值在内存里算；空样本返回 `None`。）
+
+**输出速度（tokens·s⁻¹）**：
+
+- **单行**：`completion_tokens ÷ (duration_ms ÷ 1000)`，**仅在 `status='success'` 且 `duration_ms > 0` 时有值**；
+  否则 `NULL`（**不是 0，也不是无穷大**——耗时为 0 时速度无从计算）。
+- **桶级**：`Σ(成功行的输出 token) × 1000 ÷ Σ(成功行的耗时)`（按耗时加权）。
+
+**估算值与成本**：估算行（`estimated=1`）**照常计入**聚合与成本，但 UI 必须标出"估算"；
+估算值**不参与预算告警**（§8.1 R7）。
+
+**最近请求明细**（M2 判据）：逐条给出 tokens / TTFT / tokens·s⁻¹ / 成本 / `estimated` 标记，
+按 `ts` 倒序，默认 50 条——这是"一次流式请求后 UI 显示 tokens / TTFT / tokens·s⁻¹ / 估算成本"的落地载体。
+
 ---
 
 ## 9. 数据模型（增量修订）
@@ -941,3 +988,4 @@ python scripts/security_check.py `
 | v0.11 | 2026-11-26 | T12 本地估算器回填：§8.1 把「估算入口」细化为**四种情形**（上游给全 / 上游没回 / 上游缺一项→**只补缺的那一项** / 出站失败→不估），明确"缺失 = usage 对象里没有这个键，**值为 0 不算缺失**"；补**编码选择**（`cl100k_base` 默认含全部国产模型 / `o200k_base` 给 gpt-4o·gpt-4.1·gpt-5·o 系列）与**国产模型只能近似**的硬约束（估算值必须带 `estimated=1`、不参与预算告警）。实现 `gateway::estimator::TiktokenEstimator`（tiktoken-rs），产线默认由 `CharRatioEstimator` 换为 tiktoken |
 | v0.12 | 2026-11-26 | 账本清理三项回填（头头 2026-11-26 裁决）：① **任务编号交叉引用对齐**——以 03 任务卡为唯一真值源，改 §6.1.1「T9/T10→T10」、§6.2「T17→T21」、§6.3 三处与 §11 风险表「T18a→T22」，并修 §6.5 指向不存在文件的坏引用（`T10-pi-integration.md` → `T10-channel-matrix-and-pi.md`）；② **§4.4 统一错误结构补 `available_models`**——写明该键只在**别名未命中**（`code = "model_not_found"`）时出现、缺失时**整个键不出现**（不出现 `null`），别名命中但无可用候选的路径**不带**该字段；③ **T18 签到站点清单已指定**（ModelScope + MiniMax Code，见 03 T18 卡片） |
 | v0.13 | 2026-11-26 | T13 价目表与成本换算回填：**新增 §8.3 成本换算口径**——`price` 表的匹配规则（`*` 通配、命中多条取最具体）、**三价换算公式**（可计费输入 = `prompt_tokens - cache_read_tokens`；缓存命中**只按缓存价计一次**；缓存写按输入价；**总额**四舍五入一次）、**空值语义**（单价 `NULL` ≡ 0 = 该档不计费；**没命中价目 → `cost_micros` 为 NULL（未知），与"免费 0"必须可区分**）、估算行（`estimated=1`）照样算成本但**不参与预算告警**、**改价/删价后该 provider 的历史行一并重算**；并给出**预填牌价快照（2026-11-26）的六家官方来源与取价规则**（取主列表价）与已知限制（多档定价表达不了、`minimax_intl` 按 USD 计价不折算、假定 `prompt_tokens` 含缓存命中 token 的 OpenAI 语义）。§8 的成本条目与 §8.1 的 `cost_micros` 字段来源同步指向 §8.3 |
+| v0.14 | 2026-11-26 | T14 聚合与图表回填：**新增 §8.4 聚合与图表口径**——把 §8 的「按 日/渠道/模型/client_key 四维；TTFT P50/P95；输出 tokens/s」细化为可实现的定义：四维的**分桶键与可读名**（渠道名 / client key 标签查不到时回退为 id）、**时间范围**（`since` 含 / `until` 不含，默认近 30 天）、**每个桶的 13 项指标**（请求数 / 三态计数 / 五类 token / 总 token / 已知成本合计 / **成本未知行数** / 估算行数 / TTFT P50·P95 / 输出速度）、**分位数用最近秩法**、**输出速度的单行与桶级公式**（耗时为 0 → `NULL`，不是 0 也不是无穷大）、估算行照常计入但 UI 须标注、**最近请求明细**（M2 判据的落地载体）。并明确**已知成本合计为 0 ≠ 不花钱**（未配牌价的行单独计数，延续 §8.3 的 `0`/`NULL` 语义） |

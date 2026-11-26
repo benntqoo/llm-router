@@ -7,4 +7,5 @@ pub mod circuit;
 pub mod client_key;
 pub mod gateway;
 pub mod price;
+pub mod usage;
 pub mod vault;

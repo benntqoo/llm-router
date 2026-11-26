@@ -174,6 +174,8 @@ pub fn run() {
             commands::price::price_delete,
             commands::price::price_recompute,
             commands::price::price_preview,
+            commands::usage::usage_aggregate,
+            commands::usage::usage_recent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
