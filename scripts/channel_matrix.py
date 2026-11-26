@@ -16,6 +16,7 @@
   $env:LLMR_CLIENT_KEY = "llmr_xxx"
   python scripts/channel_matrix.py --store "$env:APPDATA/llm-router/store.db"
   python scripts/channel_matrix.py --store ... --channels deepseek,glm --json
+  python scripts/channel_matrix.py --store ... --out <path> --note "本次是 mock 自测"
 
 安全：本脚本**只读**应用库；client key 只从命令行/环境变量取，**不打印、不落盘**。
 """
@@ -379,7 +380,7 @@ def run_channel(ch: Channel, gateway: str, client_key: str, timeout: float,
 
 
 def render_markdown(columns: list[dict[str, Any]], gateway: str, generated_at: str,
-                    preset_count: int) -> str:
+                    preset_count: int, note: str = "") -> str:
     names = [c["name"] for c in columns]
     header = [
         "| 项 | " + " | ".join(names) + " |",
@@ -437,6 +438,10 @@ def render_markdown(columns: list[dict[str, Any]], gateway: str, generated_at: s
     body = [
         f"# 渠道实测矩阵 — {generated_at}",
         "",
+    ]
+    if note:
+        body += [f"> ⚠️ {note}", ""]
+    body += [
         "| 项 | 值 |",
         "|---|---|",
         "| 矩阵 | 02 §10.1 前 7 列（A 类 API Key 型渠道） |",
@@ -475,6 +480,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--manifest", default=os.path.join("src-tauri", "Cargo.toml"),
                         help="Cargo.toml 路径（用于导出预设清单）")
+    parser.add_argument("--note", default="",
+                        help="产物顶部的备注（例如标注本次是 mock 自测而非真实渠道）")
     parser.add_argument("--json", action="store_true", help="额外输出 JSON")
     args = parser.parse_args()
 
@@ -522,7 +529,8 @@ def main() -> int:
     out_path = args.out or os.path.join("docs", "reviews", f"channel-matrix-{generated_at}.md")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with io.open(out_path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(render_markdown(columns, args.gateway, generated_at, len(presets) or len(channels)))
+        fh.write(render_markdown(columns, args.gateway, generated_at,
+                                 len(presets) or len(channels), args.note))
     out(f"矩阵已写入 {out_path}")
 
     if args.json:
