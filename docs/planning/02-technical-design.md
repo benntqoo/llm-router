@@ -731,6 +731,42 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 - 结果写 `checkin_result`；获得积分回写 `account.quota_json`（签到与额度池同源——本项目的差异化点）。
 - 通知：系统通知 + 可选 webhook（企微/飞书/Telegram）。
 
+### 7.2.1 调度与补签口径（T17 落地）
+
+**1. 调度模型**
+
+- **每分钟 tick 一次**（tokio 定时器），用 `cron` crate 解析 5 字段表达式（分 时 日 月 周）。
+- **本地时区**：cron 表达式按**用户所在时区**解释（`chrono::Local`），不是 UTC。
+- 站点级 cron 存在 `checkin_site.schedule`（**空 = 不参与调度**）；`enabled = 0` 的站点不跑（02 §7.3）。
+
+**2. 应跑判定（去重）——一个应触发周期最多跑一次**
+
+- `due_at` = **最近一次应触发时刻**（≤ 现在的那个）。算法：取 cron 的下一次触发 `T_next`，再取 `T_next` 之前紧邻的那次触发即 `due_at`。
+- `last_attempt` = 该站点最近一次**尝试**（不论成败）的 `checkin_result.ts`。
+- 判定：`last_attempt >= due_at` → **本周期已跑过，跳过**；否则 → 该跑。
+- 因为 `last_attempt` 落库，**跨重启也成立**（应用重启不会把同一个周期再打一遍）。
+
+**3. 错过补签**
+
+- **应用启动**与**系统计划任务唤起**时做**同一套判定** → 关应用期间漏掉的周期自动补上（判据：「关闭应用后计划任务仍触发并补签」）。
+- 新导入的站点 `enabled = 0` → 不跑；用户**启用**后第一个 tick 会跑一次（此时 `last_attempt` 为空）。
+- **不因失败而立刻重试**：同一应触发周期只跑一次；下次周期自然重试。要立刻再试用「立即执行一次」。
+
+**4. 系统兜底任务**
+
+- **Windows**：每个「启用且有 cron」的站点注册**一个**计划任务，任务名 `LLM Router Checkin - <site_id>`（**连字符**，与代码 `system::TASK_PREFIX` 一致），动作 = `"<exe>" --checkin-once --site <site_id>`。
+  - cron → 计划任务频率映射：分钟字段固定 + 小时 `*` → `/sc hourly`；分钟字段 `*/N` → `/sc minute /mo N`；**分钟字段 `*` → `/sc minute /mo 1`（每分钟）**；固定时分 → `/sc daily`；带星期 → `/sc weekly /d MON,TUE,…`；其余表达式 → **退回每天一次**（宁可多跑，不可漏跑）。
+- **macOS**：`~/Library/LaunchAgents/com.llmrouter.checkin.<site>.plist`（`StartCalendarInterval`；`*/N` 分钟用 `StartInterval = N×60`）。
+- **注册时机**：站点**启用**或 **cron 变更**时同步注册；**停用或删除**时注销。注册/注销/查询走系统命令（Windows `schtasks`、macOS `launchctl`）。
+- **「任务不存在」= 已注销**：注销走**先查后删**（`/query` 判存在 → 不在就直接返回"已注销"），**不靠错误文案匹配**——`schtasks` 的报错文案随系统语言变（英文系统 "ERROR: The system cannot find the file specified." / 中文系统 "错误: 系统找不到指定的文件。"），按字符串匹配必然漏判。
+- **错误文案按系统 OEM 代码页解码**：`schtasks` 在**无控制台的 GUI 进程**里按 OEM 代码页输出（中文 Windows = GBK/936），直接按 UTF-8 解会出乱码；解码顺序 UTF-8 → UTF-16LE → OEM 代码页 → 有损兜底。
+- **CLI 入口**：`llm-router.exe --checkin-once [--site <id>]` → **不起 UI、不起网关**，跑完补签判定后退出——这正是计划任务/launchd 唤起后的执行方式。
+
+**5. 边界**
+
+- 本卡**不含**：通知（T19）、积分回写（`account.quota_json`，T18）、浏览器自动化辅轨（02 §7.1 辅轨）、多用户/云同步。
+- **调度层不重试**：T16 引擎一次一打；失败只落 `checkin_result`，由下个应触发周期再试。
+
 ### 7.3 合规边界
 
 - 站点插件默认全关，启用即视为用户知晓自动化签到可能违反站点条款。
@@ -1101,3 +1137,5 @@ python scripts/security_check.py `
 | v0.14 | 2026-11-26 | T14 聚合与图表回填：**新增 §8.4 聚合与图表口径**——把 §8 的「按 日/渠道/模型/client_key 四维；TTFT P50/P95；输出 tokens/s」细化为可实现的定义：四维的**分桶键与可读名**（渠道名 / client key 标签查不到时回退为 id）、**时间范围**（`since` 含 / `until` 不含，默认近 30 天）、**每个桶的 13 项指标**（请求数 / 三态计数 / 五类 token / 总 token / 已知成本合计 / **成本未知行数** / 估算行数 / TTFT P50·P95 / 输出速度）、**分位数用最近秩法**、**输出速度的单行与桶级公式**（耗时为 0 → `NULL`，不是 0 也不是无穷大）、估算行照常计入但 UI 须标注、**最近请求明细**（M2 判据的落地载体）。并明确**已知成本合计为 0 ≠ 不花钱**（未配牌价的行单独计数，延续 §8.3 的 `0`/`NULL` 语义） |
 | v0.15 | 2026-11-27 | T15 HAR 导入与模板化回填：**新增 §7.1.1 HAR 1.2 子集与模板结构**（只取 `request` 的 method/url/headers/queryString/postData 与 `response.status`；**响应体与响应头一律丢弃**——实测签到响应的 `Set-Cookie` 带 csrf 密文；模板落 `checkin_site.config_json`，占位符语法 `{{name}}`，替换发生在"值内部"（`header` / `header_part` / `query` / `body` 四种 target），导入模板 `enabled = 0`）与 **§7.1.2 变量标记与密文边界**（候选自动识别清单；**模板零密文**，变量真实取值进保险库 `credential`（`kind = 'cookie' | 'access_token'`）；**归属渠道**——因 `credential.channel_id` 为 NOT NULL 外键而站点无渠道，按头头 2026-11-27 裁决取方案 A：站点归属一个渠道（选已有或按站点名新建），与 §7.2 积分回写 `account.quota_json` 同源；落库前自检模板不得残留被标记字段原值；IPC 只传掩码值，保存时回传路径重新解析）；§9 补 `credential.kind` 的签到取值 |
 | v0.16 | 2026-11-27 | T16 重放引擎回填：**新增 §7.1.3 重放引擎口径**——① **变量注入**（敏感变量按 `credential_id` 从保险库解密、非敏感变量用 `default`；**缺凭据不发请求**直接分类 `credential_missing`；替换发生在值内部；**未知占位符拒绝重放**→`template_invalid`）；② **请求构造**（**query 以模板 `request.query` 数组为准重建**——HAR 的 url 自带 query 与 `queryString` 重复，先剥 URL 再重建，否则参数发两遍；**剔除 `Host` 与 `Content-Length`**——由客户端按实际 URL/请求体生成，留着录制旧值会把请求打歪；连接 10s / 整请求 30s，**引擎自己不重试**，重试与冷却属 T17）；③ **响应断言**（`assert.status` 是**期望状态码**而非录制值，导入时先填录制值占位；新增可选 `assert.jsonPaths`（点号路径 + 数组下标 + `equals`），状态码与 JSON 路径是"与"关系；**旧模板兼容**——新字段一律可选）；④ **错误分类**（`success` / `assert_failed` / `network_error` / `credential_missing` / `template_invalid` / `credential_invalid`(401·403) / `rate_limited`(429) / `http_error`，「可重试」沿用 §3.3 判据；**不猜验证码**——不内置验证码识别，验证码表现为断言不符，归 `assert_failed`/`http_error`）；⑤ **结果落库**（每次重放写一行 `checkin_result`，`ok=1` 仅当 `success`；**响应体不进库**——只在内存里留 512 字节截断片段，防 csrf/token 密文落库；`reward_json` 留空，积分回写属 T18/T17）；⑥ **边界**（T16 只做引擎：无调度 / 无计划任务 / 无通知 / 无浏览器辅轨 / 无 UI 触发入口，「立即执行一次」按钮留 T17·T18） |
+| v0.17 | 2026-11-27 | T17 调度器与系统兜底回填：**新增 §7.2.1 调度与补签口径**——① **调度模型**（每分钟 tick 一次；`cron` crate 解析 5 字段；**本地时区** `chrono::Local` 解释 cron 表达式，不是 UTC；`schedule` 空 = 不参与调度，`enabled = 0` 不跑）；② **应跑判定（去重）**——`due_at` = 最近一次应触发时刻（≤ now，由 cron 的下一次触发倒推紧邻的前一次）；`last_attempt` = 该站点最近一次尝试的 `checkin_result.ts`；**`last_attempt >= due_at` → 本周期已跑过、跳过**（落库去重 ⇒ **跨重启也成立**）；③ **错过补签**——应用启动与系统计划任务唤起时做**同一套判定**，关应用期间漏掉的周期自动补上；**不因失败立刻重试**（同周期只跑一次），要立刻再试用「立即执行一次」；④ **系统兜底**——Windows 每个启用站点注册**一个**计划任务（`LLM Router Checkin - <site_id>`，动作 `"<exe>" --checkin-once --site <site_id>`；cron → `/sc hourly`/`minute /mo N`/`daily`/`weekly` 映射，**其余表达式退回每天一次**，宁可多跑不可漏跑）、macOS launchd plist（`StartCalendarInterval` / `StartInterval`）；**注册时机** = 启用或改 cron 时注册、停用或删除时注销；**CLI 入口** `--checkin-once [--site <id>]`（**不起 UI、不起网关**，跑完退出）；⑤ **边界**（不含通知 T19 / 积分回写 T18 / 浏览器辅轨 / 云同步；**调度层不重试**） |
+| v0.18 | 2026-11-27 | T17 真机验收后的口径修订（**§7.2.1 §4 同步改写**）：① **任务名以连字符为准**（`LLM Router Checkin - <site_id>`，与代码 `system::TASK_PREFIX` 一致；v0.17 行里的 `·` 是笔误，已一并订正）；② **频率映射补「分钟字段 `*` → `/sc minute /mo 1`」**——真机实测发现 `* * * * *` 曾落进"未识别 → 每天一次"，会把"每分钟"降级成"每天"→ **系统兜底漏跑**，已修并加回归单测；③ **「任务不存在」= 已注销**（注销走**先查后删**，不靠错误文案匹配）——`schtasks` 的报错文案随系统语言变（英文 "ERROR: The system cannot find the file specified." / 中文 "错误: 系统找不到指定的文件。"），按字符串匹配必然漏判；④ **系统命令输出按系统 OEM 代码页解码**（无控制台的 GUI 进程里 `schtasks` 按 OEM 输出，中文 Windows = GBK/936；直接按 UTF-8 解出乱码），解码顺序 UTF-8 → UTF-16LE → OEM → 有损兜底；⑤ **补齐 T17 的 UI 入口**（T16 留档里"立即执行一次"明确记在 T17/T18）：签到面板新增**调度区**——cron 输入 / 启用开关 / 「立即执行」/「同步系统兜底任务」/ 最近执行记录表（`src/checkin/schedule.ts` 为纯函数模块，`node --test` 可跑） |
