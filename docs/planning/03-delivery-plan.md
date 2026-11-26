@@ -76,6 +76,7 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 **T8 A 类预设 + 自定义渠道** `1.5d` · 依赖 T4
 - 目标：02 §6.1 的 7 个 profile 数据 + "自定义 OpenAI 兼容渠道"表单（base_url/路径模板/鉴权样式/group_id）。
 - 验收：预设渠道选中后仅剩"填 key"一步；自定义渠道可保存并出现在 `/v1/models`。
+- 落地（2026-11-26）：7 个 profile 全部接入 UI（DeepSeek/Kimi/GLM/MiniMax 国际/MiniMax 国内/百炼/硅基流动），每个预设带一条**默认模型建议值**（公开常识值，**未实测、可改**）→ 选预设即预填 base_url / 路径模板 / 鉴权样式 / include_usage 注入，**只剩填 key**；自定义渠道表单字段落到 `channel` 行 + `channel.meta_json`（base_url / 路径模板 / 鉴权样式 `bearer`｜`custom_header` / GroupId / include_usage 开关 / 额外固定头 / 模型别名），保存后别名**立即**出现在 `GET /v1/models`；密钥不进渠道行，一律走保险库；表单里删掉的模型**置 disabled 不物理删除**（保 `route_member` 编排）；`meta_json` 走**整份替换**语义，字段 `null` 统一解释为"不覆盖"。口径见 02 §6.1.1/§6.1.2/§9（v0.7），验收留档 `docs/reviews/T8-preset-and-custom-channel.md`。
 
 **T9 UI 第一轮** `3d` · 依赖 T1–T8（可部分并行）
 - 目标：渠道列表/编辑、密钥录入与回看（30s 遮蔽）、模型别名管理、client key 管理、`/v1/models` 预览。

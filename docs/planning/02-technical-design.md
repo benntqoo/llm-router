@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.6（变更记录见 §13） |
+| 版本 | v0.7（变更记录见 §13） |
 | 日期 | 2026-11-26 |
 | 上游文档 | `01-architecture-and-feasibility.md`（可行性基线与竞品调研） |
 | 状态 | 待评审后进入开发。**本文档未改动任何代码或配置**。 |
@@ -391,6 +391,37 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 
 预设是**纯数据**（`presets/*.rs` 返回 `PresetDef`）：新增一个 OpenAI 兼容渠道 = 填一张表单（base_url / 路径模板 / 鉴权样式 / group_id 等 meta），**零代码**。
 
+#### 6.1.1 预设的默认模型（未实测建议值）
+
+为了让「选中预设后**仅剩填 key 一步**」成立，每个预设额外带一条**默认模型**（上游模型名 = 默认别名）：
+
+| 预设 | 默认上游模型名（= 默认别名） |
+|---|---|
+| DeepSeek | `deepseek-chat` |
+| Kimi | `moonshot-v1-8k` |
+| GLM | `glm-4-flash` |
+| MiniMax 国际 | `abab6.5s-chat` |
+| MiniMax 国内 | `abab6.5s-chat` |
+| 阿里百炼 | `qwen-plus` |
+| 硅基流动 | `deepseek-ai/DeepSeek-V3` |
+
+这些是**公开常识的默认建议值，不是实测结论**——02 §10.1 的实测矩阵（T9/T10）跑完之前一律按「未验证」对待，用户可随时改。UI 上标注「默认建议（未实测，可改）」。
+
+#### 6.1.2 自定义 OpenAI 兼容渠道的表单字段
+
+| 表单项 | 落到哪 | 约束 |
+|---|---|---|
+| 渠道名 | `channel.name` | 非空、唯一 |
+| base_url | `channel.base_url` | 非空、必须是 `http`/`https` |
+| 路径模板 | `meta_json.path_chat` | 必须以 `/` 开头；默认 `/v1/chat/completions` |
+| 鉴权样式 | `meta_json.auth_style` | `bearer`（默认）/ `custom_header`（须配 `auth_header_name`） |
+| GroupId | `meta_json.group_id` + `supports_groupid_query` | MiniMax 国内站用（§4.2）；国际站留空 |
+| 注入 `stream_options.include_usage` | `meta_json.inject_stream_usage` | 默认开；上游报 400 时可关（P-4 会自动降级） |
+| 额外固定头 | `meta_json.extra_headers` | 如 `{"x-foo": "bar"}` |
+| 模型别名 / 上游模型名 | `model.alias` / `model.upstream_id` | **至少一条**；别名全局唯一 |
+
+保存成功后，别名**立即**出现在 `GET /v1/models`（别名 = `model.alias` ∪ `route_group.alias`）。
+
 ### 6.2 GitHub Copilot（OAuth 型）
 
 **流程（四步，均为社区已验证路径，参考实现：bjornmelin/github-copilot-proxy、npm 包 coxy）：**
@@ -549,7 +580,9 @@ pub trait ProviderAdapter: Send + Sync {
 ```sql
 -- channel.meta_json 约定字段（MiniMax 等）
 -- { "group_id": "..." | null, "supports_groupid_query": true|false,
---   "path_chat": "/v1/text/chatcompletion_v2", "inject_stream_usage": false }
+--   "path_chat": "/v1/text/chatcompletion_v2", "inject_stream_usage": false,
+--   "auth_style": "bearer" | "custom_header", "auth_header_name": "x-api-key",
+--   "extra_headers": { "x-foo": "bar" } }
 
 -- credential 增加_oauth 型两类凭据（同 channel 下并存）
 --   kind: 'api_key' | 'oauth_gh_token' | 'oauth_copilot_token' | 'session_workbuddy'
@@ -645,3 +678,4 @@ pub trait ProviderAdapter: Send + Sync {
 | v0.4 | 2026-11-26 | 头头裁决：③ 熔断**时长可配置**（默认 60s、最小单位 1s、存 `app_setting` 表，§2.3/§9）；④ UI 增加**手动解除熔断**（`circuit_reset`，§2.3） |
 | v0.5 | 2026-11-26 | 头头裁决：⑤ **429 冷却上限可配置**（默认 60s、最小 1s；冷却 = `min(max(退避, Retry-After), 上限)`，上限可缩短上游要求的等待，§2.3/§4.4/§9） |
 | v0.6 | 2026-11-26 | T7 用量采集口径回填：§8.1 采集口径（一条记录 = 一次出站尝试；流式 tee / 非流式直读；估算入口；**失败尝试不估 token**）、§8.2 账号口径（API Key 型渠道用默认账号 `acct_default_<channel_id>`）与限额自学习细则（四个窗口从 `usage_log` 派生、**在途请求不计**；只收紧不放宽）、§9 `usage_log` 增 `account_id` |
+| v0.7 | 2026-11-26 | T8 预设接入与自定义渠道回填：§6.1.1 预设的**默认模型建议值**（未实测，可改）、§6.1.2 **自定义 OpenAI 兼容渠道的表单字段**（base_url / 路径模板 / 鉴权样式 / GroupId / include_usage 开关 / 额外头 / 模型别名）、§9 `channel.meta_json` 增 `auth_style` 与 `extra_headers` |
