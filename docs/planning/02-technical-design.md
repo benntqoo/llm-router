@@ -669,6 +669,61 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 - **变量取值更新**：重录 HAR 后同名变量覆盖旧凭据（删旧 `credential` 行、写新行），模板里的 `credential_id` 同步更新。
 - **IPC 只传掩码值**：导入返回给 UI 的是**敏感值掩码**（`***`），真实值不出 Rust 进程；保存时前端回传**文件路径 + 标记清单**，Rust 重新读取并解析（无导入态驻留内存）。
 
+### 7.1.3 重放引擎口径（T16 落地）
+
+**一句话**：模板 + 保险库里的真实取值 → 拼成一次 HTTP 请求 → 断言响应 → 出一个**错误分类** → 写一行 `checkin_result`。
+
+**1. 变量注入**
+
+- 敏感变量：按 `credential_id` 从保险库解密；非敏感变量：用模板里的 `default`。
+- **缺凭据不发请求**：直接分类 `credential_missing`（凭据不存在 / 被删 / 保险库锁着）。
+- 替换发生在**值内部**（与 §7.1.1 的四种 target 一致）：整个头值、`Cookie` 头里的子项、查询参数值、JSON 请求体叶子。
+- **未知占位符拒绝重放**：模板里出现 `{{x}}` 但变量表没有 `x` → 分类 `template_invalid`（否则会把 `{{x}}` 原样发到上游）。
+
+**2. 请求构造**
+
+- 方法 / URL / 头 / 查询 / 请求体全部取自模板。
+- **query 以模板 `request.query` 数组为准重建**：HAR 的 `url` 自带 query 且与 `queryString` 内容重复 → 先从 URL 剥掉 query string，再按数组重建（否则同一个参数会发两遍）。
+- **剔除 `Host` 与 `Content-Length` 头**：这两个由 HTTP 客户端按实际 URL 与请求体生成；留着录制时的旧值会把请求打歪（`Host` 与 URL 不一致时尤其危险）。
+- 超时：连接 **10s**、整次请求 **30s**（可配）；每次重放是一次独立请求，**引擎自己不重试**（重试与冷却属 T17 调度层）。
+
+**3. 响应断言**
+
+- `assert.status` 是**期望状态码**（不是"录制时的状态码"）：导入时先填录制值占位，用户应改成签到成功时的值（T18 的站点插件会带正确断言）。
+- `assert.jsonPaths`（可选）：`{"path": "data.ok", "equals": true}`；点号路径，支持数组下标（`data.items.0.id`）。
+  - 路径不存在 → 断言失败；存在但值不等 → 断言失败；响应体不是 JSON → 断言失败。
+  - `equals` 缺省 = 「存在即通过」。
+- 状态码与 JSON 路径断言是**与**关系，都过才算成功；两者都没配 → 只判「请求没出错且状态码是 2xx/3xx」。
+- **旧模板兼容**：T15 落库的模板只有 `assert.status`，新增字段一律**可选**（缺失按"没配"处理），旧模板继续可用。
+
+**4. 错误分类**（引擎的唯一输出口径）
+
+| 分类 | 判据 | 可重试 |
+|---|---|---|
+| `success` | 断言全过 | — |
+| `assert_failed` | 状态码不符 / JSON 路径不符 | 否 |
+| `network_error` | 连接失败 / 超时 / 读响应体失败 | 是 |
+| `credential_missing` | 模板变量的凭据缺失 | 否 |
+| `template_invalid` | 模板不可用（JSON 解析失败 / 未知占位符 / 断言配置非法） | 否 |
+| `credential_invalid` | 上游 401 / 403 | 否 |
+| `rate_limited` | 上游 429 | 是（冷却与重试属 T17） |
+| `http_error` | 其它 4xx / 5xx | 5xx 是 / 4xx 否 |
+
+- 「可重试」沿用 §3.3 的判据（429 / 5xx / 连接超时 / 网络错可重试；401/403/400 不可重试）。
+- **不猜验证码**：不内置验证码识别（AGENT.md §5.7 不做风控规避）。验证码表现为状态码或正文与断言不符 → 归 `assert_failed` / `http_error`；要单独表达由用户用 JSON 路径断言或站点插件表达。
+
+**5. 结果落库**
+
+- 每次重放写一行 `checkin_result`（`site_id` / `ts` / `ok` / `message` / `reward_json`）。
+- `ok = 1` **仅当**分类为 `success`；`message` 是人类可读的中文原因（T19 通知直接用）。
+- **响应体不进库**：失败排障用的响应体片段只在内存里（`ReplayOutcome.body_preview`，截断 512 字节），**不落 `checkin_result`**——响应体可能带 csrf / token 一类密文。
+- `reward_json` 在 T16 **留空**：积分提取与 `account.quota_json` 回写属站点插件（T18）/ 调度层（T17）。
+
+**6. 边界**
+
+- T16 只做引擎：**不含**调度（cron）、系统计划任务、通知、浏览器自动化辅轨、UI 触发入口。
+- 「立即执行一次」按钮留给 T17 / T18 一并做（已记 backlog）。
+
 ### 7.2 调度与通知
 
 - 应用内：tokio 定时器（cron 语义，`cron` crate）。
@@ -1045,3 +1100,4 @@ python scripts/security_check.py `
 | v0.13 | 2026-11-26 | T13 价目表与成本换算回填：**新增 §8.3 成本换算口径**——`price` 表的匹配规则（`*` 通配、命中多条取最具体）、**三价换算公式**（可计费输入 = `prompt_tokens - cache_read_tokens`；缓存命中**只按缓存价计一次**；缓存写按输入价；**总额**四舍五入一次）、**空值语义**（单价 `NULL` ≡ 0 = 该档不计费；**没命中价目 → `cost_micros` 为 NULL（未知），与"免费 0"必须可区分**）、估算行（`estimated=1`）照样算成本但**不参与预算告警**、**改价/删价后该 provider 的历史行一并重算**；并给出**预填牌价快照（2026-11-26）的六家官方来源与取价规则**（取主列表价）与已知限制（多档定价表达不了、`minimax_intl` 按 USD 计价不折算、假定 `prompt_tokens` 含缓存命中 token 的 OpenAI 语义）。§8 的成本条目与 §8.1 的 `cost_micros` 字段来源同步指向 §8.3 |
 | v0.14 | 2026-11-26 | T14 聚合与图表回填：**新增 §8.4 聚合与图表口径**——把 §8 的「按 日/渠道/模型/client_key 四维；TTFT P50/P95；输出 tokens/s」细化为可实现的定义：四维的**分桶键与可读名**（渠道名 / client key 标签查不到时回退为 id）、**时间范围**（`since` 含 / `until` 不含，默认近 30 天）、**每个桶的 13 项指标**（请求数 / 三态计数 / 五类 token / 总 token / 已知成本合计 / **成本未知行数** / 估算行数 / TTFT P50·P95 / 输出速度）、**分位数用最近秩法**、**输出速度的单行与桶级公式**（耗时为 0 → `NULL`，不是 0 也不是无穷大）、估算行照常计入但 UI 须标注、**最近请求明细**（M2 判据的落地载体）。并明确**已知成本合计为 0 ≠ 不花钱**（未配牌价的行单独计数，延续 §8.3 的 `0`/`NULL` 语义） |
 | v0.15 | 2026-11-27 | T15 HAR 导入与模板化回填：**新增 §7.1.1 HAR 1.2 子集与模板结构**（只取 `request` 的 method/url/headers/queryString/postData 与 `response.status`；**响应体与响应头一律丢弃**——实测签到响应的 `Set-Cookie` 带 csrf 密文；模板落 `checkin_site.config_json`，占位符语法 `{{name}}`，替换发生在"值内部"（`header` / `header_part` / `query` / `body` 四种 target），导入模板 `enabled = 0`）与 **§7.1.2 变量标记与密文边界**（候选自动识别清单；**模板零密文**，变量真实取值进保险库 `credential`（`kind = 'cookie' | 'access_token'`）；**归属渠道**——因 `credential.channel_id` 为 NOT NULL 外键而站点无渠道，按头头 2026-11-27 裁决取方案 A：站点归属一个渠道（选已有或按站点名新建），与 §7.2 积分回写 `account.quota_json` 同源；落库前自检模板不得残留被标记字段原值；IPC 只传掩码值，保存时回传路径重新解析）；§9 补 `credential.kind` 的签到取值 |
+| v0.16 | 2026-11-27 | T16 重放引擎回填：**新增 §7.1.3 重放引擎口径**——① **变量注入**（敏感变量按 `credential_id` 从保险库解密、非敏感变量用 `default`；**缺凭据不发请求**直接分类 `credential_missing`；替换发生在值内部；**未知占位符拒绝重放**→`template_invalid`）；② **请求构造**（**query 以模板 `request.query` 数组为准重建**——HAR 的 url 自带 query 与 `queryString` 重复，先剥 URL 再重建，否则参数发两遍；**剔除 `Host` 与 `Content-Length`**——由客户端按实际 URL/请求体生成，留着录制旧值会把请求打歪；连接 10s / 整请求 30s，**引擎自己不重试**，重试与冷却属 T17）；③ **响应断言**（`assert.status` 是**期望状态码**而非录制值，导入时先填录制值占位；新增可选 `assert.jsonPaths`（点号路径 + 数组下标 + `equals`），状态码与 JSON 路径是"与"关系；**旧模板兼容**——新字段一律可选）；④ **错误分类**（`success` / `assert_failed` / `network_error` / `credential_missing` / `template_invalid` / `credential_invalid`(401·403) / `rate_limited`(429) / `http_error`，「可重试」沿用 §3.3 判据；**不猜验证码**——不内置验证码识别，验证码表现为断言不符，归 `assert_failed`/`http_error`）；⑤ **结果落库**（每次重放写一行 `checkin_result`，`ok=1` 仅当 `success`；**响应体不进库**——只在内存里留 512 字节截断片段，防 csrf/token 密文落库；`reward_json` 留空，积分回写属 T18/T17）；⑥ **边界**（T16 只做引擎：无调度 / 无计划任务 / 无通知 / 无浏览器辅轨 / 无 UI 触发入口，「立即执行一次」按钮留 T17·T18） |
