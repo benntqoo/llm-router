@@ -7,8 +7,8 @@
 | 验收日期 | 2026-11-26 |
 | 执行 | MiniMax Code（开发 agent） |
 | 分支 | `dev` |
-| 代码提交 | `33dbe34`（价目表模块 + 落库换算 + v8 迁移 + IPC + 单测/e2e）；实测夹具 `7c8d168`（真实上游，默认 ignore）；文档提交另计 |
-| 结论 | **通过**（任务卡验收判据「单测覆盖『输入+输出+缓存读』三价换算」实测通过；单测 + e2e 全链 + 真机三证） |
+| 代码提交 | `33dbe34`（价目表模块 + 落库换算 + v8 迁移 + IPC + 单测/e2e）；实测夹具 `7c8d168`（真实上游，默认 ignore）；`902af5d`（实测夹具假绿修复）；文档提交另计 |
+| 结论 | **通过**（任务卡验收判据「单测覆盖『输入+输出+缓存读』三价换算」实测通过；单测 + e2e 全链 + 真机 + **真实上游**四证） |
 
 > 本文件改动范围：仅记录 T13 的验收判据、实测证据、交付物与取舍；**不含**后续任务的结论。
 
@@ -22,6 +22,7 @@
 | 2 | **预填国产牌价** | ✅ | §4：47 行，覆盖 6 家 provider，全部**取自厂商官方页面**（附来源与核验日期） |
 | 3 | **`cost_micros` 换算** | ✅ | §3：换算在**落库时**完成（`insert_usage`），改价后历史一并重算；口径写进 02 §8.3（v0.13） |
 | 4 | **单测覆盖「输入+输出+缓存读」三价换算** | ✅ | §3：三价各自独立成用例，另加"缓存命中不被重复计费""缓存写按输入价""总额一次舍入""NULL ≡ 0 / 未命中 = NULL"等；**e2e 真网关全链**也断言三价 |
+| 5 | **真实上游实测**（任务卡判据之外的追加证据） | ✅ | §3.6：打 OpenRouter **真上游**（非 mock），真实 token 数 → `cost_micros` 与**独立复算**逐笔一致（536 / 64 / 491 / 509 micros） |
 
 ## 2. 做了什么摘要
 
@@ -100,8 +101,64 @@
 
 ### 3.5 回归
 
-`cargo test --offline` → **321 项全绿**（269 单元 + 7 + 5 + 6 + 11 + 13 + **7** e2e + 3），2 ignored，0 失败，**0 编译告警**。
-（e2e 由 6 条增至 7 条 = 新增 T13 全链用例。）
+`cargo test --offline` → **321 项全绿**（269 单元 + 7 + 5 + 6 + 11 + 13 + **7** e2e + 3），**4** ignored，0 失败，**0 编译告警**。
+（e2e 由 6 条增至 7 条 = 新增 T13 全链用例；ignored 由 2 增至 4 = 新增 2 条默认不跑的真实上游用例。）
+
+### 3.6 真实上游实测（`tests/real_upstream_cost.rs`，默认 `#[ignore]`）
+
+e2e 打的是 **mock 上游**；本节打的是**真上游**（OpenRouter 免费模型），验的是「**真实上游报的 token 数** → 真实成本」这条链。
+
+**口径安排**
+
+| 项 | 做法 |
+|---|---|
+| 凭证 | 由使用者写入 `%TEMP%\openrouter.key`，脚本读进 `OPENROUTER_API_KEY` 环境变量 → 注入保险库加密入库（`vault.put_credential`）。**key 不落盘明文、不进日志、不进截图、不进 transcript** |
+| 渠道 | `provider='custom'`、`base_url=https://openrouter.ai/api/v1`，`meta_json` 覆盖 `path_chat=/chat/completions` + `HTTP-Referer` / `X-Title` |
+| 价目 | 该模型配一条**测试价**（输入 1 元/1M、输出 2 元/1M、缓存读 0.1 元/1M）。`cost_micros` 由**我们自己的价目表**算，与上游收多少钱无关；**上游免费 ⇒ 实际花费 0 元** |
+| 期望值 | 由测试内**独立复算函数** `expected_cost_micros()` 给出，**不调用生产换算函数**（避免自证） |
+
+**用例 1** `real_upstream_cost_micros_matches_independent_recompute`（模型 `liquid/lfm-3-1.7b:free`）
+
+| 项 | 实测 |
+|---|---|
+| HTTP | **200 OK** |
+| `prompt_tokens` | 18 |
+| `completion_tokens` | 259 |
+| `cache_read` / `cache_write` | 0 / 0 |
+| `estimated` | **0**（真实 usage，非估算） |
+| `status` | `success` |
+| `cost_micros` | **536** |
+| 独立复算 | **536** ✅ |
+
+复算：可计费输入 = 18 − 0 = 18；18×1 元 + 259×2 元 = 0.018 + 0.518 = **0.536 元 = 536 micros**。
+
+**用例 2** `real_upstream_reports_cache_read_tokens_if_any`（同一提示词连发两次）
+
+候选逐个尝试时，前 3 个免费模型返回 **429**（免费档限流重），第 4 个 `baidu/ernie-5.5-flash-preview:free` 成功。
+
+| 轮次 | prompt | completion | cache_read | `cost_micros` | 独立复算 |
+|---|---|---|---|---|---|
+| 探测轮 | 26 | 19 | 0 | 64 | **64** ✅ |
+| 第 1 轮 | 137 | 177 | 0 | 491 | **491** ✅ |
+| 第 2 轮 | 137 | 186 | 0 | 509 | **509** ✅ |
+
+**缓存命中观察**：三轮 `cache_read` **均为 0** —— OpenRouter 免费档不报缓存命中 token。符合 02 §8.3「上游不报就不验，不强求」。
+
+### 3.7 实测前置排查（顺带验掉的两个疑点）
+
+第一次真实上游调用返回 **401**，排查过程本身产出了两条证据。
+
+**① 出站 `Authorization` 头确实带上了**（原本无法单独证明）。三个直连探针对比：
+
+| 探针 | `Authorization` 头 | OpenRouter 响应 |
+|---|---|---|
+| A | 不带 | `No cookie auth credentials found` |
+| B | `Bearer sk-or-v1-000…`（格式对、值错） | `User not found.` |
+| C | `Bearer llmr_ukh…`（**本项目自己的入站 client key**） | `Missing Authentication header` |
+
+C 与 A/B **都不同** ⇒ 网关出站头带的是**我们自己的凭证值**（`providers/openai_compat.rs` R-2 生效），不是代码把头吞了。
+
+**② 401 的真因在 key 类型，不在代码**：`GET /api/v1/key` 返回 `is_management_key: true` / `is_provisioning_key: true` —— 这类 **Provisioning/management key 格式同样是 `sk-or-v1-…`，但不能发 chat 请求**，OpenRouter 一律回 401 `User not found.`（与官方文档及两份第三方说明一致）。换成普通 API key 后 `is_provisioning=false`，实测立即通过。**本项目代码全程无需改动。**
 
 ## 4. 预填牌价快照（2026-11-26）
 
@@ -132,6 +189,8 @@
 | 多档定价（分段 / 峰谷 / priority 1.5 倍） | 一档三价**表达不了** | 已在 02 §8.3「已知限制」写明；真要表达需改 `price` 表结构（走提案） |
 | Anthropic 语义（`input_tokens` 不含缓存） | **未处理** | 口径假定 `prompt_tokens` **含**缓存命中 token（OpenAI 语义），v1 全部出站渠道均满足；v2 接 Anthropic 上游时须先把 `cache_read_tokens` 并入 `prompt_tokens` |
 | 价目表编辑 **UI** | **本轮不做** | T13 任务卡只要求「表 + 预填 + 换算」；IPC（列/改/删/重算/试算）已就绪，**M2 判据里的「UI 显示成本」属 T14（聚合与图表 UI）**，届时直接接上 |
+| OpenRouter 渠道的 provider | `custom` | 自定义渠道的 provider 只能是 `custom` 或已知预设 → 价目表键落在 `("custom", 模型名)` 命名空间；**所有自定义渠道共享 `custom`**，靠 `model_pattern` 区分 |
+| 真实上游用的 **OpenRouter 免费模型** | **429 限流很重** | 夹具内置"逐个候选尝试 + 失败换下一个"（每个候选独立夹具，失败候选的错误行不污染成功候选）；本次 4 个候选里前 3 个 429、第 4 个成功。免费档限流是常态，实测结论要按"择期可复现"看 |
 
 ## 6. 交付物
 
@@ -144,6 +203,7 @@
 | `src-tauri/src/store/mod.rs` | 改——挂 `pub mod price`；回滚用例的版本向量补 v8 |
 | `src-tauri/src/commands/mod.rs` / `src-tauri/src/lib.rs` | 改——注册价目表 IPC |
 | `src-tauri/tests/usage_e2e.rs` | 改——新增 T13 全链 e2e；更新旧断言的过期口径 |
+| `src-tauri/tests/real_upstream_cost.rs` | **新增**——真实上游实测夹具（OpenRouter 免费模型，默认 `#[ignore]`）：逐候选回退 + 独立复算 + 假绿防护；后由 `902af5d` 修掉失败轮假绿 |
 | `docs/planning/02-technical-design.md` | 改——新增 §8.3 成本换算口径、§13 v0.13 |
 
 ## 7. 经验
@@ -155,3 +215,7 @@
 - **官方定价页多是前端渲染的**：智谱与百炼的页面直接抓只能拿到空壳（第三方文章也明确提醒了这点）；**搜索索引里反而有渲染后的完整表格**。查牌价时"直接抓页面"和"搜页面"要一起用。
 - **牌价快照会立刻过期**：DeepSeek 就在 2026-08-17 刚做过一次峰谷调价（涨幅最高 1100%）。所以预填必须**带日期 + 带来源 + 可编辑**，并且要在 UI 上说清"以厂商为准"。
 - **预填不覆盖用户改过的价**：迁移用 `INSERT OR IGNORE`，用户改过的行保持不变——升级不能让用户的修正被默认值冲掉。
+- **"独立复算"型断言会跟着失败一起塌成 0**：真实上游实测的第一版第 2 条用例，上游 401 时 `prompt/completion` 全为 0、`cost_micros` 恒为 0，而断言 `cost_micros == 独立复算值(0)` **照样通过**——失败被当成了成功。凡是复算型断言，必须**同时**断言上游调用本身成功（`status == success` + token > 0），否则期望值会跟着失败一起归零，断言自动变绿。
+- **上游 401 的三种文案能定位问题在哪一层**：不带头 → `No cookie auth credentials found`；带了但格式不对 → `Missing Authentication header`；格式对但不是可聊天的 key → `User not found.`。各打一次探针比读代码快——本轮正是靠这三个响应确认**出站头没问题、问题在 key 类型**。
+- **`sk-or-v1-` 前缀不等于"能发 chat"**：OpenRouter 的 **Provisioning/management key** 格式一模一样，但只能调 key 管理接口，一律 401。判断要用 `GET /api/v1/key` 的 `is_provisioning_key` 字段，**不能只看前缀**。
+- **本项目第一次打通真实上游 HTTPS**：reqwest + rustls + webpki roots 出网正常，上游的错误体原样透传回客户端——这条链路此前从未被验过。
