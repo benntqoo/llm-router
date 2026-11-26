@@ -23,9 +23,9 @@
 | 1 | **四维聚合**（按天 / 渠道 / 模型 / 客户端） | ✅ | §3.2 e2e 逐维度断言；§3.4 真机**四个维度逐一截图** |
 | 2 | **React 图表** | ✅ | §3.4 真机：手写 SVG 条形图（三种度量可切） |
 | 3 | UI 显示 **tokens** | ✅ | KPI「总 token **229**（输入 188 · 输出 41）」+ 明细表逐行 |
-| 4 | UI 显示 **TTFT** | ✅ | KPI「TTFT P50 / P95 = **188 ms / 193 ms**」；明细表 187 / 188 / 193 ms，**非流式显示「—」** |
-| 5 | UI 显示 **tokens·s⁻¹** | ✅ | KPI「输出速度 **44.9 tok/s**」；明细表 36.1 / 35.9 / 35.2 tok/s |
-| 6 | UI 显示 **估算成本** | ✅ | KPI「已知成本 **¥0 元**（另有 5 行未配牌价（未知））」——**未知的行不会被当成 0 元** |
+| 4 | UI 显示 **TTFT** | ✅ | KPI「TTFT P50 / P95 = **186 ms / 201 ms**」；明细表 185 / 186 / 201 ms，**非流式显示「—」** |
+| 5 | UI 显示 **tokens·s⁻¹** | ✅ | KPI「输出速度 **44.9 tok/s**」；明细表 36.6 / 36.3 / 34.2 tok/s（流式三行） |
+| 6 | UI 显示 **估算成本** | ✅ | KPI「已知成本 **¥0.000221 元**（另有 1 行未配牌价（未知））」——**有真实金额**，且**未知的行不会被当成 0 元**（明细表里 ¥0.00006 / ¥0.000041 元与「未知」并存） |
 | 7 | `usage_log.estimated` 标记正确（上游有 usage 时为 0） | ✅ | 明细表「来源」列全部显示**精确**；KPI「估算行 **0**」；库内 `estimated=0` |
 
 ## 2. 做了什么摘要
@@ -89,25 +89,38 @@
 
 ### 3.4 真机（真实应用 + 真网关 + mock 上游）
 
-用 `src-tauri/examples/seed_usage_demo.rs`（新）一键准备：种临时库（渠道 + 模型 + 凭证 + client key）并起一个 mock 上游（`127.0.0.1:55893`）。**库与保险库都指向 `%TEMP%\llmr-t14-demo\`，不污染用户真实库。**
+用 `src-tauri/examples/seed_usage_demo.rs`（新）一键准备：种临时库（渠道 + **两个模型** + 凭证 + client key + 一条价目）并起一个 mock 上游（`127.0.0.1:63582`）。**库与保险库都指向 `%TEMP%\llmr-t14-demo2\`，不污染用户真实库。**
+
+演示环境刻意做成**「有价 + 无价」两个模型**，一次把两件事都验实：
+
+| 模型 | 价目 | 用途 |
+|---|---|---|
+| `demo-model-1`（别名 `demo-chat`） | **配了**：输入 1 元/1M、输出 2 元/1M、缓存命中 0.1 元/1M | 让 UI 显示**真实金额** |
+| `demo-model-2`（别名 `demo-chat-2`） | **没配** | 让 UI 显示**「未知」**（02 §8.3 的 `NULL` 语义） |
 
 应用实跑日志：
 
 ```
-[store] 数据库 %TEMP%\llmr-t14-demo\store.db（schema v8）
-[vault] 保险库 %TEMP%\llmr-t14-demo\vault.bin（主密钥 v1）
+[store] 数据库 %TEMP%\llmr-t14-demo2\store.db（schema v8）
+[vault] 保险库 %TEMP%\llmr-t14-demo2\vault.bin（主密钥 v1）
 [gateway] 监听 http://127.0.0.1:18787/v1（OpenAI 兼容入站）
 ```
 
-经**真网关**打 5 次（2 次非流式 + 3 次流式），库里 5 行流水：
+经**真网关**打 5 次（3 次流式 + 1 次非流式走配价模型 + 1 次非流式走**未配价**模型），库里 5 行流水：
 
-| id | alias | prompt | completion | cache_read | estimated | ttft_ms | duration_ms | status | cost_micros |
+| id | 上游模型 | prompt | completion | cache_read | estimated | ttft_ms | duration_ms | status | cost_micros |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | demo-chat | 31 | 7 | 5 | **0** | NULL | 1 | success | **NULL** |
-| 2 | demo-chat | 31 | 7 | 5 | **0** | NULL | 0 | success | **NULL** |
-| 3 | demo-chat | 42 | 9 | 0 | **0** | **193** | 256 | success | **NULL** |
-| 4 | demo-chat | 42 | 9 | 0 | **0** | **188** | 251 | success | **NULL** |
-| 5 | demo-chat | 42 | 9 | 0 | **0** | **187** | 249 | success | **NULL** |
+| 1 | demo-model-1 | 31 | 7 | 5 | **0** | NULL | 1 | success | **41** |
+| 2 | demo-model-1 | 42 | 9 | 0 | **0** | **185** | 246 | success | **60** |
+| 3 | demo-model-1 | 42 | 9 | 0 | **0** | **201** | 263 | success | **60** |
+| 4 | demo-model-1 | 42 | 9 | 0 | **0** | **186** | 248 | success | **60** |
+| 5 | **demo-model-2** | 31 | 7 | 5 | **0** | NULL | 0 | success | **NULL（未知）** |
+
+成本独立复算（测试价：输入 1 元/1M、输出 2 元/1M、缓存命中 0.1 元/1M）：
+
+- 第 1 行：可计费输入 = 31 − 5 = 26 → `26×1 + 7×2 + 5×0.1 = 40.5` → **41 micros** ✅
+- 第 2–4 行：`42×1 + 9×2 = 60` → **60 micros** ✅
+- 第 5 行：没配牌价 → **NULL（未知）**，不是 0 ✅
 
 UI 实测（截图见 `docs/reviews/app-ui-usage*.png`）：
 
@@ -115,12 +128,12 @@ UI 实测（截图见 `docs/reviews/app-ui-usage*.png`）：
 |---|---|
 | KPI 请求数 | **5**（失败 0 · 断连 0） |
 | KPI 总 token | **229**（输入 188 · 输出 41） |
-| KPI 已知成本 | **¥0 元**，提示「另有 5 行未配牌价（未知）」 |
-| KPI TTFT P50 / P95 | **188 ms / 193 ms**（提示「只统计流式请求」） |
+| KPI 已知成本 | **¥0.000221 元**（= 41 + 60×3 = 221 micros），提示「另有 **1** 行未配牌价（未知）」 |
+| KPI TTFT P50 / P95 | **186 ms / 201 ms**（提示「只统计流式请求」） |
 | KPI 输出速度 | **44.9 tok/s**（提示「成功行按耗时加权」） |
 | KPI 估算行 | **0**（提示「上游没回 usage，由 tiktoken 估算」） |
-| 聚合表 | `2026-11-26 · 请求 5 · 失败 0 · 总 token 229 · 输入/输出 188/41 · ¥0 元（5 行未知）· 188ms/193ms · 44.9 tok/s · 估算 0` |
-| 明细表 | 时间 / 渠道·模型 / 输入·输出 / 总 token / TTFT / 速度 / 成本 / 来源 / 状态 —— **5 行全 success，来源全「精确」** |
+| 聚合表 | `2026-11-26 · 请求 5 · 失败 0 · 总 token 229 · 输入/输出 188/41 · ¥0.000221 元（1 行未知）· 186ms/201ms · 44.9 tok/s · 估算 0` |
+| 明细表 | 时间 / 渠道·模型 / 输入·输出 / 总 token / TTFT / 速度 / 成本 / 来源 / 状态 —— **5 行全 success，来源全「精确」**，成本列**有金额（¥0.00006 / ¥0.000041 元）与「未知」并存** |
 
 **四个维度逐一验证**（同一份数据，只切维度）：
 
@@ -128,10 +141,10 @@ UI 实测（截图见 `docs/reviews/app-ui-usage*.png`）：
 |---|---|---|
 | 按天 | `2026-11-26` → 229 | `app-ui-usage.png` |
 | 按渠道 | `演示渠道` → 229 | `app-ui-usage-channel.png` |
-| 按模型 | `demo-model-1` → 229 | `app-ui-usage-model.png` |
+| 按模型 | **两个桶**：`demo-model-1` → 191（¥0.000221 元）、`demo-model-2` → 38（**¥0 元（1 行未知）**） | `app-ui-usage-model.png` |
 | 按客户端 | `demo-client` → 229（**client key 标签已解析**） | `app-ui-usage-client.png` |
 
-**两处边界在真机上自然出现**：明细表里 `duration_ms = 0` 的那行速度显示「**—**」（不是 0、不是无穷大），`duration_ms = 1` 的那行显示 `7000.0 tok/s`——正是 02 §8.4「耗时为 0 → NULL」的口径。
+**两处边界在真机上自然出现**：明细表里 `duration_ms = 0` 的那行速度显示「**—**」（不是 0、不是无穷大），`duration_ms = 1` 的那行显示 `7000.0 tok/s`——正是 02 §8.4「耗时为 0 → NULL」的口径；同一张表里，**未配牌价那行成本显示「未知」而不是「¥0」**——正是 02 §8.3 的 `0` / `NULL` 语义。
 
 ### 3.5 回归
 
@@ -163,7 +176,7 @@ UI 实测（截图见 `docs/reviews/app-ui-usage*.png`）：
 | `src-tauri/src/store/mod.rs` / `src-tauri/src/commands/mod.rs` / `src-tauri/src/lib.rs` | 改——挂模块、注册 IPC |
 | `src-tauri/tests/usage_e2e.rs` | 改——新增 T14 聚合全链用例；mock 加 `slowusage` 场景（延迟 120ms）与 `sseusage` 延迟 60ms，让 TTFT / 输出速度可按公式复算 |
 | `src-tauri/src/gateway/auth.rs` | 改——**修掉一条既有随机失败断言**（见 §6）；纯测试改动，零行为变更 |
-| `src-tauri/examples/seed_usage_demo.rs` | **新增**——真机验收工具（种临时库 + 起 mock 上游） |
+| `src-tauri/examples/seed_usage_demo.rs` | **新增**——真机验收工具（种临时库：渠道 + **两个模型** + 一条价目 + 凭证 + client key，并起 mock 上游） |
 | `src/usage/types.ts` / `format.ts` / `format.test.ts` | **新增**——IPC 数据形状 / 纯格式化函数 + 10 条前端单测 |
 | `src/usage/UsageChart.tsx` / `UsagePanel.tsx` | **新增**——手写 SVG 条形图 / 用量统计面板 |
 | `src/App.tsx` / `src/App.css` | 改——挂载面板；补 KPI / 表格 / 图表样式 |

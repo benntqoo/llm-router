@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(Store::open(&store_path)?);
     let vault = Vault::open(Arc::clone(&store), &vault_path, None)?;
 
-    // ── 4. 种渠道 + 模型 + 凭证 ──
+    // ── 4. 种渠道 + 模型 + 凭证 + 价目 ──
     let meta = format!(
         r#"{{"path_chat":"{MOCK_CHAT_PATH}","extra_headers":{{"HTTP-Referer":"https://github.com/benntqoo/llm-router","X-Title":"LLM Router"}}}}"#
     );
@@ -106,12 +106,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              VALUES ('c-demo', '演示渠道', 'api_key', 'custom', ?1, 1, 100, ?2, ?3)",
             rusqlite::params![mock_base, llm_router_lib::vault::now_secs(), meta],
         )?;
+        // demo-model-1：**配了价** → UI 上能看到真实金额
         conn.execute(
             "INSERT INTO model (id, channel_id, upstream_id, alias, enabled)
              VALUES ('m-demo', 'c-demo', 'demo-model-1', 'demo-chat', 1)",
             [],
         )?;
+        // demo-model-2：**没配价** → 成本为 NULL（未知），用来对照 02 §8.3 的 0/NULL 语义
+        conn.execute(
+            "INSERT INTO model (id, channel_id, upstream_id, alias, enabled)
+             VALUES ('m-demo-2', 'c-demo', 'demo-model-2', 'demo-chat-2', 1)",
+            [],
+        )?;
         Ok(())
+    })?;
+    // 测试价：输入 1 元/1M、输出 2 元/1M、缓存命中 0.1 元/1M
+    store.with_conn(|conn| {
+        llm_router_lib::store::price::upsert(
+            conn,
+            &llm_router_lib::store::price::PriceEntry {
+                provider: "custom".to_string(),
+                model_pattern: "demo-model-1".to_string(),
+                input_per_1m: 1_000_000,
+                output_per_1m: 2_000_000,
+                cache_read_per_1m: 100_000,
+            },
+        )
     })?;
     vault.put_credential(
         "c-demo",
@@ -145,6 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[demo] 打网关（流式，看 TTFT）：");
     println!(
         "  curl -s -N http://127.0.0.1:18787/v1/chat/completions -H \"Authorization: Bearer {client_key}\" -H \"Content-Type: application/json\" -d '{{\"model\":\"demo-chat\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":true}}'"
+    );
+    println!("[demo] 打网关（**没配牌价**的模型 → 成本显示「未知」）：");
+    println!(
+        "  curl -s http://127.0.0.1:18787/v1/chat/completions -H \"Authorization: Bearer {client_key}\" -H \"Content-Type: application/json\" -d '{{\"model\":\"demo-chat-2\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}'"
     );
     println!();
     println!("[demo] mock 上游运行中，Ctrl+C 结束。");
