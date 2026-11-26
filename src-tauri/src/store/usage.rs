@@ -111,14 +111,30 @@ impl UsageSink for StoreUsageSink {
 }
 
 /// 写一条用量记录。
+///
+/// **成本换算（T13；02 §8.3）**：按渠道的 `provider` 查价目表，把 token 数换算成
+/// `cost_micros`（1e-6 元）。**没命中价目 → NULL**（未知），不是 0。
 pub fn insert_usage(store: &Store, record: &UsageRecord) -> Result<()> {
     store.with_conn(|conn| {
+        let provider = crate::store::price::provider_of_channel(conn, &record.channel_id)?;
+        let cost = match crate::store::price::lookup(conn, &provider, &record.upstream_model)? {
+            Some(price) => Some(crate::store::price::compute_cost_micros(
+                crate::store::price::BillableTokens {
+                    prompt_tokens: record.prompt_tokens,
+                    completion_tokens: record.completion_tokens,
+                    cache_read_tokens: record.cache_read_tokens,
+                    cache_write_tokens: record.cache_write_tokens,
+                },
+                &price,
+            )),
+            None => None,
+        };
         conn.execute(
             "INSERT INTO usage_log
                  (ts, client_key_id, channel_id, account_id, model_alias, upstream_model, protocol,
                   prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
-                  reasoning_tokens, estimated, ttft_ms, duration_ms, status, error_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                  reasoning_tokens, estimated, ttft_ms, duration_ms, status, error_kind, cost_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 record.ts,
                 record.client_key_id,
@@ -137,6 +153,7 @@ pub fn insert_usage(store: &Store, record: &UsageRecord) -> Result<()> {
                 record.duration_ms,
                 record.status.as_str(),
                 record.error_kind,
+                cost,
             ],
         )?;
         Ok(())

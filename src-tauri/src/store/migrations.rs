@@ -106,6 +106,16 @@ pub const MIGRATIONS: &[Migration] = &[
         down: &[crate::store::schema::USAGE_LOG_DROP_ACCOUNT_ID],
         up_fn: Some(crate::store::schema::ensure_usage_log_account_id),
     },
+    Migration {
+        // 播种预填牌价（T13；02 §8.3）。
+        // `INSERT OR IGNORE`：**不覆盖用户已改过的价**（同一主键已存在就跳过）。
+        version: 8,
+        name: "seed_default_prices",
+        up: &[],
+        // 回滚 = 清空价目表（回滚到 v3 会直接删表，此处只是把预填行清掉）。
+        down: &["DELETE FROM price;"],
+        up_fn: Some(crate::store::price::seed_default_prices_migration),
+    },
 ];
 
 /// 确保版本表存在。

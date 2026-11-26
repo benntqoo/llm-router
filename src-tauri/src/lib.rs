@@ -169,6 +169,11 @@ pub fn run() {
             commands::client_key::client_key_update_limits,
             commands::client_key::client_key_update_meta,
             commands::client_key::client_key_delete,
+            commands::price::price_list,
+            commands::price::price_upsert,
+            commands::price::price_delete,
+            commands::price::price_recompute,
+            commands::price::price_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

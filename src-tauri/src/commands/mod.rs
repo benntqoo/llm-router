@@ -6,4 +6,5 @@ pub mod channel;
 pub mod circuit;
 pub mod client_key;
 pub mod gateway;
+pub mod price;
 pub mod vault;

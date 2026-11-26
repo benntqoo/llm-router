@@ -634,7 +634,7 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 
 - 采集：上游 `usage` 精确值优先；无则 tiktoken-rs 估算并标 `estimated=1`。
 - MiniMax 特例：`usage.completion_tokens_details.reasoning_tokens` → `usage_log.reasoning_tokens`（§4.2）。
-- 成本：`price` 表（用户可编辑，预填国产渠道公开牌价）→ `cost_micros`（1e-6 元）。
+- 成本：`price` 表（用户可编辑，预填国产渠道公开牌价）→ `cost_micros`（1e-6 元）。口径见 §8.3。
 - 聚合视图：按 日/渠道/模型/client_key 四维；TTFT P50/P95；输出 tokens/s。
 - 配额监控：对支持额度查询的渠道（GLM/Kimi/MiniMax 包月等）定时 probe，展示剩余与重置时间。
 - **限额自学习**：per `(channel, account)` 维护 RPM/RPD/TPM/TPD 计数；429 响应的 `Retry-After` 与 `x-ratelimit-*` 头、以及渠道文档上报值，写入 `account.quota_json`，作为熔断冷却时长与调度排序依据。（源自 FreeLLMAPI 参考实现，见 `docs/reviews/freellmapi-analysis.md` §4-2）
@@ -660,7 +660,7 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 | `duration_ms` | 出站尝试耗时 |
 | `status` | `success` / `error` / `aborted`（客户端中途断连） |
 | `error_kind` | 失败时的错误类别（02 §4.4 的 `ErrorKind`） |
-| `cost_micros` | **T13 负责**（价目表换算），T7 恒为 NULL |
+| `cost_micros` | 价目表换算（**T13** 起由落库时算出，见 §8.3）；没命中价目时为 NULL（未知，非 0） |
 
 **流式采集**：在 SSE 通路上**旁路 tee**——转发字节的同时在**副本**上扫 `data:` 帧：找 `usage` 帧（`stream_options.include_usage` 注入后由上游主动下发，R-4），并记录**首个 token**时刻（TTFT）与输出字符数。tee 不得缓冲全量（§2.2 的零缓冲直通不变）。
 
@@ -710,6 +710,67 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 - `Retry-After` 与 `x-ratelimit-reset-*` / `x-ratelimit-remaining-*` 记进 `quota_json` 的 `last_rate_limit` 段（这是**事实**，不是推断）。
 - "渠道文档上报值"（用户按渠道文档手填的上限）与学习值写进同一组字段，学习只会把它压低、不会抬高。
 - `quota_json` 是**人工可编辑**的 JSON；用户改小它同样被视为上限，自学习不会把它改大。
+
+### 8.3 成本换算口径（T13）
+
+**价目表**：`price` 表，主键 `(provider, model_pattern)`，**用户可编辑**，预填国产渠道公开牌价。
+三档单价单位统一为 **1e-6 元 / 1M tokens**（即 1 元/1M tokens 记 `1_000_000`）。
+
+**匹配规则**：
+
+- `model_pattern` 里的 `*` 通配任意字符串（可出现在任意位置，可有多个）；**不含 `*` 即精确匹配**。
+- 命中多条时取**最具体**的一条：① 通配符个数少者优先 ② 字面量长度长者优先 ③ 仍相同则按 pattern 字典序取小者。
+- `provider` 取渠道的 `channel.provider`（预设标识：`deepseek` / `kimi` / `glm` / `dashscope` / `minimax_cn` / `minimax_intl` / `siliconflow`）。
+
+**换算公式**（`cost_micros`，单位 1e-6 元）：
+
+```
+可计费输入 = prompt_tokens - cache_read_tokens
+cost_micros = round( ( 可计费输入   × input_per_1m
+                     + completion_tokens × output_per_1m
+                     + cache_read_tokens  × cache_read_per_1m
+                     + cache_write_tokens × input_per_1m ) / 1_000_000 )
+```
+
+- **缓存命中 token 有独立档价，只按该档计一次**——它已经含在 `prompt_tokens` 里，不能再按输入价重复计一遍。
+- 价目表**没有独立的缓存写入档**（`price` 表只有三列），故**缓存写入按输入价计**。
+- 四舍五入在**总额**上做一次（不逐项舍入），避免多次舍入累积误差。
+
+**空值语义**（`0` 与 `NULL` 必须可区分）：
+
+| 情况 | `cost_micros` | 含义 |
+|---|---|---|
+| 命中价目且算出金额 | 整数 | 已知成本 |
+| 命中价目但某档单价为 `NULL` | 该档按 0 计（**`NULL` ≡ 0 = 该档不计费**） | 免费档 |
+| **没命中任何价目** | **NULL** | **未知（未配置牌价）**，不是 0 |
+
+**估算行照样算成本**：上游没回 usage、由 tiktoken 估算的行（`estimated=1`）**照样算** `cost_micros`——
+该行已用 `estimated=1` 标明含非上游原样的数，不必再用 NULL 表达不确定。
+估算值**不参与预算告警**（§8.1 R7），但成本照算。
+
+**改价后重算历史**：`cost_micros` 是**落库时算好的快照**。用户改价 / 删价后，**该 provider 的历史行一并重算**
+（`price_upsert` / `price_delete` 自动触发），否则历史成本会永远停留在旧牌价上。
+
+**预填牌价（快照 2026-11-26）**：取自各厂商官方页面，取价规则 = **取主列表价**
+（不取促销档 / 限时折扣档 / 时段折扣档；分段计价取第一档）。
+
+| provider | 官方来源 | 备注 |
+|---|---|---|
+| `deepseek` | `api-docs.deepseek.com/zh-cn/quick_start/pricing` | **峰谷定价**：空闲价 = 高峰价的一半（高峰 = 周一至周五 9:00–12:00、14:00–18:00）。表里存**高峰价**（列表价），空闲时段实际约一半 |
+| `kimi` | `platform.kimi.com/docs/pricing/chat` | 单档价；缓存写入另有 TTL 档（5min/1h），本表只记缓存读取价 |
+| `glm` | `docs.bigmodel.cn/cn/guide/start/pricing` | **分段计价**（按单次请求的输入长度分档，GLM-4.7 还要看输出长度）；表里存**第一档**（输入 <32K） |
+| `dashscope` | `bailian.console.aliyun.com` 模型价格页 | qwen-plus 的「输入 ≤128k」档；思考模式另有一档 |
+| `minimax_cn` | `platform.minimax.cn/docs/guides/pricing-paygo` | MiniMax-M3 的「≤512K 输入」档（永久五折后的现价） |
+| `siliconflow` | `siliconflow.cn/pricing` | 部分模型分夜间 / 白天两档，表里存主档 |
+
+**已知限制**：
+
+- 价目表是**单一价目快照**，**厂商调价不会自动跟随**——每条都可编辑，改一下即可。
+- **分段 / 峰谷 / 优先级服务（priority 1.5 倍）等多档定价无法用"每模型一组三价"表达**，本表只取一档；真实账单以厂商为准。
+- 口径假定 **`prompt_tokens` 含缓存命中 token**（OpenAI 语义）。v1 全部出站渠道均为 OpenAI 协议，满足该假定；
+  将来接入 Anthropic 协议上游（v2）时，须先把 `cache_read_tokens` 并入 `prompt_tokens` 再入库，否则会**低估**输入成本。
+- `minimax_intl`（国际站）按 **USD** 计价，本表以元计价、**不做汇率折算** → 预填**不覆盖**该 provider
+  （`cost_micros` 保持 NULL），用户可自行填行。
 
 ---
 
@@ -879,3 +940,4 @@ python scripts/security_check.py `
 | v0.10 | 2026-11-26 | T11 安全验收回填：§10.2 补**执行口径**（命中项分"明文凭证命中"与"结构性命中"两类，前者必须为 0、后者逐条列出；判据 1 要扫 dump + 主库 + WAL/SHM 三层；判据 3 要有日志脱敏中间件机制；判据 4 做正反两例）+ 可复跑执行器 `scripts/security_check.py`；§1.2 补该脚本。**§5.2 的「日志中间件全局脱敏」此前未接入**（T2 §7 记着"随 T3 接入"，T3 已过但一直没接），本轮由 `gateway::logging::request_log` 补齐 |
 | v0.11 | 2026-11-26 | T12 本地估算器回填：§8.1 把「估算入口」细化为**四种情形**（上游给全 / 上游没回 / 上游缺一项→**只补缺的那一项** / 出站失败→不估），明确"缺失 = usage 对象里没有这个键，**值为 0 不算缺失**"；补**编码选择**（`cl100k_base` 默认含全部国产模型 / `o200k_base` 给 gpt-4o·gpt-4.1·gpt-5·o 系列）与**国产模型只能近似**的硬约束（估算值必须带 `estimated=1`、不参与预算告警）。实现 `gateway::estimator::TiktokenEstimator`（tiktoken-rs），产线默认由 `CharRatioEstimator` 换为 tiktoken |
 | v0.12 | 2026-11-26 | 账本清理三项回填（头头 2026-11-26 裁决）：① **任务编号交叉引用对齐**——以 03 任务卡为唯一真值源，改 §6.1.1「T9/T10→T10」、§6.2「T17→T21」、§6.3 三处与 §11 风险表「T18a→T22」，并修 §6.5 指向不存在文件的坏引用（`T10-pi-integration.md` → `T10-channel-matrix-and-pi.md`）；② **§4.4 统一错误结构补 `available_models`**——写明该键只在**别名未命中**（`code = "model_not_found"`）时出现、缺失时**整个键不出现**（不出现 `null`），别名命中但无可用候选的路径**不带**该字段；③ **T18 签到站点清单已指定**（ModelScope + MiniMax Code，见 03 T18 卡片） |
+| v0.13 | 2026-11-26 | T13 价目表与成本换算回填：**新增 §8.3 成本换算口径**——`price` 表的匹配规则（`*` 通配、命中多条取最具体）、**三价换算公式**（可计费输入 = `prompt_tokens - cache_read_tokens`；缓存命中**只按缓存价计一次**；缓存写按输入价；**总额**四舍五入一次）、**空值语义**（单价 `NULL` ≡ 0 = 该档不计费；**没命中价目 → `cost_micros` 为 NULL（未知），与"免费 0"必须可区分**）、估算行（`estimated=1`）照样算成本但**不参与预算告警**、**改价/删价后该 provider 的历史行一并重算**；并给出**预填牌价快照（2026-11-26）的六家官方来源与取价规则**（取主列表价）与已知限制（多档定价表达不了、`minimax_intl` 按 USD 计价不折算、假定 `prompt_tokens` 含缓存命中 token 的 OpenAI 语义）。§8 的成本条目与 §8.1 的 `cost_micros` 字段来源同步指向 §8.3 |

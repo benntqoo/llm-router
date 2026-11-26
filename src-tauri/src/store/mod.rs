@@ -11,6 +11,7 @@
 pub mod channels;
 pub mod error;
 pub mod migrations;
+pub mod price;
 pub mod quota;
 pub mod schema;
 pub mod settings;
@@ -270,7 +271,7 @@ mod tests {
     fn migrate_down_to_rolls_back_partially() {
         let store = Store::open_in_memory().expect("打开内存库失败");
         let reverted = store.migrate_down_to(2).expect("回滚失败");
-        assert_eq!(reverted, vec![7, 6, 5, 4, 3], "应回滚版本 7、6、5、4 与 3");
+        assert_eq!(reverted, vec![8, 7, 6, 5, 4, 3], "应回滚版本 8、7、6、5、4 与 3");
         assert_eq!(store.version().expect("读取版本失败"), 2);
 
         let conn = store.lock();

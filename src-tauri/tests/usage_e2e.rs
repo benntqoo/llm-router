@@ -364,7 +364,10 @@ async fn acceptance_non_stream_usage_log_matches_upstream() {
     assert_eq!(row.error_kind, None);
     assert_eq!(row.ttft_ms, None, "非流式没有 TTFT");
     assert!(row.duration_ms.is_some(), "应记录出站耗时");
-    assert_eq!(row.cost_micros, None, "T13 之前成本恒为 NULL");
+    assert_eq!(
+        row.cost_micros, None,
+        "该上游模型没配牌价 → 成本为 NULL（未知），不是 0（T13 起按价目表算）"
+    );
     assert!(row.ts > 0);
 }
 
@@ -397,6 +400,54 @@ async fn acceptance_stream_usage_log_matches_upstream() {
     assert_eq!(row.estimated, 0, "上游给了 usage → 不是估算值");
     assert_eq!(row.status.as_deref(), Some("success"));
     assert!(row.ttft_ms.is_some(), "流式应记录 TTFT");
+}
+
+// ── 验收：成本换算全链（网关 → usage_log → cost_micros）────────────────
+
+/// T13 验收（03 §2 T13）：**输入 + 输出 + 缓存读** 三价换算。
+///
+/// 走**真网关**：请求经 mock 上游 → 用量落库 → 按价目表算出 `cost_micros`。
+#[tokio::test]
+async fn acceptance_cost_micros_uses_three_prices() {
+    let base = start_mock().await;
+    let f = fixture();
+    seed_channel(&f, "c1", "计价渠道", "usage", &base, "chat-a");
+    // 给该渠道的模型配一组价：输入 2 元/1M、输出 8 元/1M、缓存命中 0.04 元/1M
+    f.store
+        .with_conn(|conn| {
+            llm_router_lib::store::price::upsert(
+                conn,
+                &llm_router_lib::store::price::PriceEntry {
+                    provider: "deepseek".to_string(),
+                    model_pattern: "deepseek-chat".to_string(),
+                    input_per_1m: 2_000_000,
+                    output_per_1m: 8_000_000,
+                    cache_read_per_1m: 40_000,
+                },
+            )?;
+            Ok(())
+        })
+        .expect("写入价目");
+
+    let response = chat(&f, "chat-a", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = wait_usage_rows(&f.store, 1).await;
+    let row = &rows[0];
+    // 上游 usage：prompt 31（**含** 5 个缓存命中）、completion 7
+    assert_eq!(row.prompt_tokens, 31);
+    assert_eq!(row.completion_tokens, 7);
+    assert_eq!(row.cache_read_tokens, 5);
+    // 可计费输入 = 31 - 5 = 26
+    //   26 × 2 元/1M  = 0.052 元
+    //    7 × 8 元/1M  = 0.056 元
+    //    5 × 0.04 元/1M = 0.0002 元
+    //   合计 0.1082 元 = 108.2 micros → 总额四舍五入 = 108
+    assert_eq!(
+        row.cost_micros,
+        Some(108),
+        "成本应按输入/输出/缓存读三价换算"
+    );
 }
 
 // ── 验收：429 后 quota_json 更新 ───────────────────────────────────────
