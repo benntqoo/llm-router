@@ -22,6 +22,8 @@ pub struct Migration {
     pub up: &'static [&'static str],
     /// 回滚 SQL（必须与 `up` 对称）。
     pub down: &'static [&'static str],
+    /// 可选的自定义 `up` 步骤：需要"存在即跳过"这类条件执行时用（如补列）。
+    pub up_fn: Option<fn(&Connection) -> rusqlite::Result<()>>,
 }
 
 /// 内置迁移列表（按 version 升序）。
@@ -44,6 +46,7 @@ pub const MIGRATIONS: &[Migration] = &[
             "DROP TABLE IF EXISTS model;",
             "DROP TABLE IF EXISTS channel;",
         ],
+        up_fn: None,
     },
     Migration {
         version: 2,
@@ -58,12 +61,14 @@ pub const MIGRATIONS: &[Migration] = &[
             "DROP TABLE IF EXISTS account;",
             "DROP TABLE IF EXISTS credential;",
         ],
+        up_fn: None,
     },
     Migration {
         version: 3,
         name: "usage_and_price",
         up: &[crate::store::schema::USAGE_LOG_DDL, crate::store::schema::PRICE_DDL],
         down: &["DROP TABLE IF EXISTS price;", "DROP TABLE IF EXISTS usage_log;"],
+        up_fn: None,
     },
     Migration {
         version: 4,
@@ -76,18 +81,30 @@ pub const MIGRATIONS: &[Migration] = &[
             "DROP TABLE IF EXISTS checkin_result;",
             "DROP TABLE IF EXISTS checkin_site;",
         ],
+        up_fn: None,
     },
     Migration {
         version: 5,
         name: "circuit_state",
         up: &[crate::store::schema::CIRCUIT_STATE_DDL],
         down: &["DROP TABLE IF EXISTS circuit_state;"],
+        up_fn: None,
     },
     Migration {
         version: 6,
         name: "app_setting",
         up: &[crate::store::schema::APP_SETTING_DDL],
         down: &["DROP TABLE IF EXISTS app_setting;"],
+        up_fn: None,
+    },
+    Migration {
+        // 补 `usage_log.account_id`（T7 限额自学习；02 §9）。
+        // 新库建表时已含该列 → 幂等跳过；老库才真正 ALTER。
+        version: 7,
+        name: "usage_log_account_id",
+        up: &[],
+        down: &[crate::store::schema::USAGE_LOG_DROP_ACCOUNT_ID],
+        up_fn: Some(crate::store::schema::ensure_usage_log_account_id),
     },
 ];
 
@@ -176,6 +193,11 @@ fn apply_one(conn: &Connection, migration: &Migration) -> Result<()> {
     for sql in migration.up {
         tx.execute_batch(sql)
             .map_err(|e| StoreError::Migration(format!("迁移 {} ({}) 失败: {e}", migration.version, migration.name)))?;
+    }
+    if let Some(up_fn) = migration.up_fn {
+        up_fn(&tx).map_err(|e| {
+            StoreError::Migration(format!("迁移 {} ({}) 失败: {e}", migration.version, migration.name))
+        })?;
     }
     tx.execute(
         &format!("INSERT INTO {MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?1, ?2, ?3)"),

@@ -24,6 +24,8 @@ use llm_router_lib::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use llm_router_lib::gateway::ratelimit::RateLimiter;
 use llm_router_lib::gateway::router::AliasRouter;
 use llm_router_lib::gateway::server::{self, GatewayState};
+use llm_router_lib::gateway::usage::CharRatioEstimator;
+use llm_router_lib::store::usage::StoreUsageSink;
 use llm_router_lib::store::Store;
 use llm_router_lib::vault::Vault;
 use tower::ServiceExt;
@@ -249,6 +251,10 @@ fn fixture() -> Fixture {
         ))),
         Arc::new(StreamUsageDowngrades::default()),
         Arc::clone(&vault),
+        Arc::clone(&store),
+        // 用量采集与生产同款（落库 + 估算入口）
+        Arc::new(StoreUsageSink::new(Arc::clone(&store))),
+        Arc::new(CharRatioEstimator),
     ));
     let state = GatewayState {
         router: Arc::new(AliasRouter::new(Arc::clone(&store))),

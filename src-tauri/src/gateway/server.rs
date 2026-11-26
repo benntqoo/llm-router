@@ -119,7 +119,11 @@ async fn chat_completions(
         .map_err(route_error_to_gateway)?;
 
     // ④⑤⑥⑧⑨ 候选链 + 出站转发 + 熔断 + SSE 直通（02 §2.1）
-    state.forwarder.forward(&plan, &request, &headers).await
+    // 用量采集要记到入站 client key 上（02 §8.1）
+    state
+        .forwarder
+        .forward(&plan, &request, &headers, Some(client.id.as_str()))
+        .await
 }
 
 /// 路由错误 → 统一错误结构。
@@ -264,6 +268,8 @@ mod tests {
 
     use crate::gateway::circuit::CircuitBreaker;
     use crate::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
+    use crate::gateway::usage::CharRatioEstimator;
+    use crate::store::usage::StoreUsageSink;
     use crate::vault::Vault;
 
     /// 启动一个恒返回 500 的本机 mock 上游，返回 base_url。
@@ -297,6 +303,9 @@ mod tests {
             Arc::new(CircuitBreaker::new()),
             Arc::new(StreamUsageDowngrades::default()),
             Arc::clone(&vault),
+            Arc::clone(&store),
+            Arc::new(StoreUsageSink::new(Arc::clone(&store))),
+            Arc::new(CharRatioEstimator),
         ));
         let state = GatewayState {
             router: Arc::new(AliasRouter::new(Arc::clone(&store))),

@@ -9,6 +9,8 @@
 //!
 //! 本文件只放 DDL；迁移的编排（up/down 顺序、版本记录）在 `migrations.rs`。
 
+use rusqlite::Connection;
+
 /// 渠道：一个上游来源。
 pub const CHANNEL_DDL: &str = r#"
 CREATE TABLE channel (
@@ -101,12 +103,15 @@ CREATE TABLE client_key (
 "#;
 
 /// 用量流水。
+///
+/// 一条记录 = 一次出站尝试（02 §8.1）。
 pub const USAGE_LOG_DDL: &str = r#"
 CREATE TABLE usage_log (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   ts            INTEGER NOT NULL,
   client_key_id TEXT,
   channel_id    TEXT,
+  account_id    TEXT,                    -- 02 §8.2：账号 id（API Key 型渠道用默认账号）
   model_alias   TEXT,
   upstream_model TEXT,
   protocol      TEXT,                    -- openai|anthropic|responses
@@ -120,10 +125,42 @@ CREATE TABLE usage_log (
   duration_ms   INTEGER,
   status        TEXT,                    -- success|error|aborted
   error_kind    TEXT,
-  cost_micros   INTEGER                  -- 按价目表换算，单位 1e-6 元
+  cost_micros   INTEGER                  -- 按价目表换算，单位 1e-6 元（T13 负责）
 );
 CREATE INDEX idx_usage_ts ON usage_log(ts);
 "#;
+
+/// `usage_log` 增补 `account_id`（T7 限额自学习；02 §9）。
+///
+/// 老库用 `ALTER TABLE` 补列；新库由 `USAGE_LOG_DDL` 直接建出。
+pub const USAGE_LOG_ADD_ACCOUNT_ID: &str =
+    "ALTER TABLE usage_log ADD COLUMN account_id TEXT;";
+
+/// 回滚 `account_id` 增补（SQLite 3.35+ 支持 DROP COLUMN）。
+pub const USAGE_LOG_DROP_ACCOUNT_ID: &str = "ALTER TABLE usage_log DROP COLUMN account_id;";
+
+/// 幂等地给 `usage_log` 补 `account_id` 列。
+///
+/// 新库由 `USAGE_LOG_DDL` 直接建出该列，老库要靠 `ALTER TABLE` 补列。
+/// SQLite 没有 `ADD COLUMN IF NOT EXISTS`，所以先查 `PRAGMA table_info` 再决定。
+pub fn ensure_usage_log_account_id(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(usage_log)")?;
+    let mut rows = stmt.query([])?;
+    let mut exists = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "account_id" {
+            exists = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    if exists {
+        return Ok(());
+    }
+    conn.execute_batch(USAGE_LOG_ADD_ACCOUNT_ID)
+}
 
 /// 签到站点配置。
 pub const CHECKIN_SITE_DDL: &str = r#"

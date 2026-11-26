@@ -14,6 +14,8 @@ use llm_router_lib::gateway::fallback::Forwarder;
 use llm_router_lib::gateway::outbound::{OutboundClient, StreamUsageDowngrades};
 use llm_router_lib::gateway::ratelimit::RateLimiter;
 use llm_router_lib::gateway::server::{self, GatewayState};
+use llm_router_lib::gateway::usage::CharRatioEstimator;
+use llm_router_lib::store::usage::StoreUsageSink;
 use llm_router_lib::store::Store;
 use llm_router_lib::vault::Vault;
 use std::sync::RwLock;
@@ -33,6 +35,9 @@ async fn temp_state() -> (tempfile::TempDir, GatewayState, Arc<RwLock<Vault>>, S
             Arc::new(CircuitBreaker::new()),
             Arc::new(StreamUsageDowngrades::default()),
             Arc::clone(&vault),
+            Arc::clone(&store),
+            Arc::new(StoreUsageSink::new(Arc::clone(&store))),
+            Arc::new(CharRatioEstimator),
         )),
         store,
         limiter: Arc::new(RateLimiter::new()),
@@ -249,6 +254,9 @@ fn seed_client_key() {
             Arc::new(CircuitBreaker::new()),
             Arc::new(StreamUsageDowngrades::default()),
             Arc::clone(&vault),
+            Arc::clone(&store),
+            Arc::new(StoreUsageSink::new(Arc::clone(&store))),
+            Arc::new(CharRatioEstimator),
         )),
         store,
         limiter: Arc::new(RateLimiter::new()),

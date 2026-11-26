@@ -9,6 +9,7 @@
 //! 6. 2xx → 组装响应（P-7 `X-Routed-Via`、P-6 响应头透传）。
 
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -24,9 +25,16 @@ use crate::gateway::outbound::{
 };
 use crate::gateway::router::{RouteCandidate, RoutePlan};
 use crate::gateway::stream;
+use crate::gateway::usage::{
+    extract_completion_text, extract_prompt_text, parse_usage, resolve_tokens, TokenEstimator,
+    UsageContext, UsageTap, PROTOCOL_OPENAI,
+};
 use crate::providers;
 use crate::providers::adapter::{CallContext, OpenAIRequest, OutgoingCall, ProviderAdapter};
 use crate::providers::presets::minimax;
+use crate::store::quota::{default_account_id, learn_rate_limit, RateLimitObservation};
+use crate::store::usage::{UsageRecord, UsageSink, UsageStatus};
+use crate::store::Store;
 use crate::vault::Vault;
 
 /// 熔断粒度键：`(channel_id, upstream_model)`（02 §2.3）。
@@ -43,6 +51,12 @@ pub struct Forwarder {
     pub downgrades: Arc<StreamUsageDowngrades>,
     /// 加密保险库（凭证解密）。
     pub vault: Arc<RwLock<Vault>>,
+    /// 数据层（限额自学习回写 `account.quota_json`，02 §8.2）。
+    pub store: Arc<Store>,
+    /// 用量落库出口（一条记录 = 一次出站尝试，02 §8.1）。
+    pub usage_sink: Arc<dyn UsageSink>,
+    /// token 估算器（上游没回 usage 时用；T12 换 tiktoken-rs）。
+    pub estimator: Arc<dyn TokenEstimator>,
 }
 
 impl std::fmt::Debug for Forwarder {
@@ -58,12 +72,18 @@ impl Forwarder {
         circuit: Arc<CircuitBreaker>,
         downgrades: Arc<StreamUsageDowngrades>,
         vault: Arc<RwLock<Vault>>,
+        store: Arc<Store>,
+        usage_sink: Arc<dyn UsageSink>,
+        estimator: Arc<dyn TokenEstimator>,
     ) -> Self {
         Forwarder {
             client,
             circuit,
             downgrades,
             vault,
+            store,
+            usage_sink,
+            estimator,
         }
     }
 
@@ -73,6 +93,7 @@ impl Forwarder {
         plan: &RoutePlan,
         request: &ChatRequest,
         inbound_headers: &HeaderMap,
+        client_key_id: Option<&str>,
     ) -> Result<Response, GatewayError> {
         if self.vault.read().unwrap_or_else(|e| e.into_inner()).is_locked() {
             return Err(GatewayError::new(
@@ -89,6 +110,8 @@ impl Forwarder {
 
         for candidate in &plan.candidates {
             let key = circuit_key(&candidate.channel_id, &candidate.upstream_model);
+            // 用量采集上下文（02 §8.1）：一条记录 = 一次出站尝试
+            let usage_ctx = self.usage_context(client_key_id, request, candidate);
 
             // 熔断中的候选直接跳过
             if !self.circuit.allow(&key) {
@@ -146,6 +169,7 @@ impl Forwarder {
                     .build_call(candidate, adapter.as_ref(), request, inbound_headers, credential.clone())
                     .await?;
 
+                let attempt_started = Instant::now();
                 let send = self.client.send(&call, request.stream).await;
                 let response = match send {
                     Ok(response) => response,
@@ -153,6 +177,12 @@ impl Forwarder {
                         // 连接层失败：可重试（首字节前）
                         self.circuit.on_failure(&key);
                         retried.push(candidate.channel_name.clone());
+                        self.record_attempt(
+                            &usage_ctx,
+                            UsageStatus::Error,
+                            Some(ErrorKind::UpstreamError),
+                            attempt_started,
+                        );
                         last_error = Some(
                             GatewayError::upstream(err.to_string())
                                 .with_channel(candidate.channel_name.clone()),
@@ -167,7 +197,15 @@ impl Forwarder {
                     let info = RateLimitInfo::parse(&response.headers);
                     // 实际生效的冷却秒数（受用户设置的上限约束）
                     let cooldown = self.circuit.on_rate_limited(&key, info.cooldown_hint());
+                    // 限额自学习（02 §8.2）：上游报的上限写进 account.quota_json
+                    self.learn_quota(&candidate.channel_id, &info);
                     retried.push(candidate.channel_name.clone());
+                    self.record_attempt(
+                        &usage_ctx,
+                        UsageStatus::Error,
+                        Some(ErrorKind::RateLimitError),
+                        attempt_started,
+                    );
                     let err = GatewayError::rate_limited(format!(
                         "上游 {} 限流（429），冷却 {}s",
                         candidate.channel_name, cooldown
@@ -182,6 +220,12 @@ impl Forwarder {
                     // 5xx：可重试，并计入熔断
                     self.circuit.on_failure(&key);
                     retried.push(candidate.channel_name.clone());
+                    self.record_attempt(
+                        &usage_ctx,
+                        UsageStatus::Error,
+                        Some(ErrorKind::UpstreamError),
+                        attempt_started,
+                    );
                     last_error = Some(
                         GatewayError::upstream(format!(
                             "上游 {} 返回 {}",
@@ -201,19 +245,31 @@ impl Forwarder {
                         && mentions_stream_options(&body)
                     {
                         self.downgrades.disable(&candidate.channel_id);
+                        // 这也是一次真实的出站尝试 → 记一条（02 §8.1）
+                        self.record_attempt(
+                            &usage_ctx,
+                            UsageStatus::Error,
+                            Some(ErrorKind::InvalidRequestError),
+                            attempt_started,
+                        );
                         continue;
                     }
                     // 不可重试：原样回传（状态码 + 统一错误结构）
-                    return Err(upstream_client_error(
-                        status,
-                        &body,
-                        &candidate.channel_name,
-                    ));
+                    let err = upstream_client_error(status, &body, &candidate.channel_name);
+                    self.record_attempt(
+                        &usage_ctx,
+                        UsageStatus::Error,
+                        Some(err.error.kind),
+                        attempt_started,
+                    );
+                    return Err(err);
                 }
 
                 // 2xx：成功
                 self.circuit.on_success(&key);
-                return self.build_success_response(candidate, response, &retried).await;
+                return self
+                    .build_success_response(candidate, response, &retried, &usage_ctx, attempt_started)
+                    .await;
             }
         }
 
@@ -287,12 +343,80 @@ impl Forwarder {
         Ok((call, injection_enabled))
     }
 
+    /// 用量采集上下文（02 §8.1）。
+    fn usage_context(
+        &self,
+        client_key_id: Option<&str>,
+        request: &ChatRequest,
+        candidate: &RouteCandidate,
+    ) -> UsageContext {
+        UsageContext {
+            client_key_id: client_key_id.map(|id| id.to_string()),
+            channel_id: candidate.channel_id.clone(),
+            // API Key 型渠道用默认账号（02 §8.2）
+            account_id: default_account_id(&candidate.channel_id),
+            model_alias: request.model.clone(),
+            upstream_model: candidate.upstream_model.clone(),
+            protocol: PROTOCOL_OPENAI.to_string(),
+            prompt_text: extract_prompt_text(&request.raw),
+        }
+    }
+
+    /// 记一次**失败**的出站尝试（不估 token：失败的调用没有产出）。
+    fn record_attempt(
+        &self,
+        ctx: &UsageContext,
+        status: UsageStatus,
+        error_kind: Option<ErrorKind>,
+        started: Instant,
+    ) {
+        self.usage_sink.record(UsageRecord {
+            ts: crate::vault::now_secs(),
+            client_key_id: ctx.client_key_id.clone(),
+            channel_id: ctx.channel_id.clone(),
+            account_id: ctx.account_id.clone(),
+            model_alias: ctx.model_alias.clone(),
+            upstream_model: ctx.upstream_model.clone(),
+            protocol: ctx.protocol.clone(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            estimated: false,
+            ttft_ms: None,
+            duration_ms: started.elapsed().as_millis() as i64,
+            status,
+            error_kind: error_kind.map(|kind| kind.as_str().to_string()),
+        });
+    }
+
+    /// 限额自学习（02 §8.2）：把上游报的上限写进 `account.quota_json`。
+    fn learn_quota(&self, channel_id: &str, info: &RateLimitInfo) {
+        let observation = RateLimitObservation {
+            limit_requests: info.limit_requests,
+            limit_tokens: info.limit_tokens,
+            retry_after_secs: info.retry_after.map(|d| d.as_secs() as i64),
+            reset_requests_secs: info.reset_requests.map(|d| d.as_secs() as i64),
+            reset_tokens_secs: info.reset_tokens.map(|d| d.as_secs() as i64),
+            remaining_requests: info.remaining_requests,
+            remaining_tokens: info.remaining_tokens,
+        };
+        let result = learn_rate_limit(&self.store, channel_id, &observation);
+        if let Err(err) = result {
+            // 学习失败不影响请求（限额自学习只是给调度提供依据）
+            eprintln!("[quota] 限额自学习失败: {err}");
+        }
+    }
+
     /// 组装成功响应（P-6 响应头透传 + P-7 `X-Routed-Via`）。
     async fn build_success_response(
         &self,
         candidate: &RouteCandidate,
         response: UpstreamResponse,
         retried: &[String],
+        usage_ctx: &UsageContext,
+        started: Instant,
     ) -> Result<Response, GatewayError> {
         let routed_via = ascii_safe(&format!(
             "{}/{}",
@@ -314,6 +438,7 @@ impl Forwarder {
                                     "retried": retried,
                                 }
                             });
+                            self.record_non_stream_success(usage_ctx, Some(&value), started);
                             return Ok(Response::builder()
                                 .status(business_error.http_status)
                                 .header("x-routed-via", routed_via)
@@ -322,6 +447,8 @@ impl Forwarder {
                         }
                     }
                 }
+                let parsed: Option<Value> = serde_json::from_slice(&bytes).ok();
+                self.record_non_stream_success(usage_ctx, parsed.as_ref(), started);
                 let builder = Response::builder()
                     .status(response.status)
                     .header("x-routed-via", routed_via);
@@ -338,15 +465,61 @@ impl Forwarder {
                     Some(&candidate.channel_name),
                     retried,
                 );
+                // 旁路 tee：转发字节的同时扫 SSE 帧找 usage、记 TTFT（02 §8.1）
+                let tap = UsageTap::new(
+                    upstream,
+                    usage_ctx.clone(),
+                    Arc::clone(&self.estimator),
+                    Arc::clone(&self.usage_sink),
+                    started,
+                );
                 let builder = Response::builder()
                     .status(response.status)
                     .header("x-routed-via", routed_via);
                 let builder = copy_response_headers(builder, &response.headers);
                 Ok(builder
-                    .body(stream::into_body(upstream, event))
+                    .body(stream::into_body(Box::pin(tap), event))
                     .expect("构造响应"))
             }
         }
+    }
+
+    /// 记一次**成功**的非流式出站尝试（上游 usage 优先，否则估算）。
+    fn record_non_stream_success(
+        &self,
+        ctx: &UsageContext,
+        body: Option<&Value>,
+        started: Instant,
+    ) {
+        let upstream = body.and_then(parse_usage);
+        let completion = body.map(extract_completion_text).unwrap_or_default();
+        let (tokens, estimated) = resolve_tokens(
+            upstream,
+            self.estimator.as_ref(),
+            &ctx.upstream_model,
+            &ctx.prompt_text,
+            &completion,
+        );
+        self.usage_sink.record(UsageRecord {
+            ts: crate::vault::now_secs(),
+            client_key_id: ctx.client_key_id.clone(),
+            channel_id: ctx.channel_id.clone(),
+            account_id: ctx.account_id.clone(),
+            model_alias: ctx.model_alias.clone(),
+            upstream_model: ctx.upstream_model.clone(),
+            protocol: ctx.protocol.clone(),
+            prompt_tokens: tokens.prompt_tokens,
+            completion_tokens: tokens.completion_tokens,
+            cache_read_tokens: tokens.cache_read_tokens,
+            cache_write_tokens: tokens.cache_write_tokens,
+            reasoning_tokens: tokens.reasoning_tokens,
+            estimated,
+            // 非流式没有"首个 token"的概念
+            ttft_ms: None,
+            duration_ms: started.elapsed().as_millis() as i64,
+            status: UsageStatus::Success,
+            error_kind: None,
+        });
     }
 }
 

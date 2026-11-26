@@ -22,6 +22,17 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// 字符串形式（落库用；与 `Serialize` 的 snake_case 一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::InvalidRequestError => "invalid_request_error",
+            ErrorKind::AuthenticationError => "authentication_error",
+            ErrorKind::RateLimitError => "rate_limit_error",
+            ErrorKind::ApiError => "api_error",
+            ErrorKind::UpstreamError => "upstream_error",
+        }
+    }
+
     /// 默认 HTTP 状态码。
     pub fn default_status(self) -> StatusCode {
         match self {

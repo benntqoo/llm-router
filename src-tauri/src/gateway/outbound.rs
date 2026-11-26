@@ -80,6 +80,10 @@ pub struct RateLimitInfo {
     pub reset_tokens: Option<Duration>,
     /// `x-ratelimit-remaining-tokens`。
     pub remaining_tokens: Option<i64>,
+    /// `x-ratelimit-limit-requests`：上游的 RPM 上限（限额自学习用，02 §8.2）。
+    pub limit_requests: Option<i64>,
+    /// `x-ratelimit-limit-tokens`：上游的 TPM 上限（限额自学习用，02 §8.2）。
+    pub limit_tokens: Option<i64>,
 }
 
 impl RateLimitInfo {
@@ -116,6 +120,14 @@ impl RateLimitInfo {
                 .and_then(parse_duration_secs),
             remaining_tokens: headers
                 .get("x-ratelimit-remaining-tokens")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<i64>().ok()),
+            limit_requests: headers
+                .get("x-ratelimit-limit-requests")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<i64>().ok()),
+            limit_tokens: headers
+                .get("x-ratelimit-limit-tokens")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse::<i64>().ok()),
         }
@@ -294,6 +306,8 @@ mod tests {
         headers.insert("x-ratelimit-remaining-requests", HeaderValue::from_static("0"));
         headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("12s"));
         headers.insert("x-ratelimit-remaining-tokens", HeaderValue::from_static("1234"));
+        headers.insert("x-ratelimit-limit-requests", HeaderValue::from_static("60"));
+        headers.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("120000"));
 
         let info = RateLimitInfo::parse(&headers);
         assert_eq!(info.retry_after, Some(Duration::from_secs(30)));
@@ -301,6 +315,9 @@ mod tests {
         assert_eq!(info.remaining_requests, Some(0));
         assert_eq!(info.reset_tokens, Some(Duration::from_secs(12)));
         assert_eq!(info.remaining_tokens, Some(1234));
+        // 上限（限额自学习用）
+        assert_eq!(info.limit_requests, Some(60));
+        assert_eq!(info.limit_tokens, Some(120_000));
         // 冷却取较大值
         assert_eq!(info.cooldown_hint(), Some(Duration::from_secs(360)));
     }
