@@ -3,6 +3,7 @@
 //! 架构与红线依据 `docs/planning/02-technical-design.md` 与仓库根 `AGENT.md`。
 //! v1 入站仅 OpenAI 协议（`POST /v1/chat/completions` + `GET /v1/models`）。
 
+pub mod checkin;
 pub mod commands;
 pub mod gateway;
 pub mod providers;
@@ -45,6 +46,8 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 原生文件选择对话框（T15：导入 HAR）
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 数据层：空库自动建表（迁移到最新版本）；失败即启动失败。
             let db_path = store::default_db_path();
@@ -176,6 +179,10 @@ pub fn run() {
             commands::price::price_preview,
             commands::usage::usage_aggregate,
             commands::usage::usage_recent,
+            commands::checkin::checkin_import_har,
+            commands::checkin::checkin_save_template,
+            commands::checkin::checkin_list_sites,
+            commands::checkin::checkin_delete_site,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

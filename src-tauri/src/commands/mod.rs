@@ -3,6 +3,7 @@
 //! T0 只有 `gateway` 一个域。
 
 pub mod channel;
+pub mod checkin;
 pub mod circuit;
 pub mod client_key;
 pub mod gateway;

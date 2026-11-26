@@ -393,3 +393,19 @@ code {
 .usage-table tbody tr:hover td {
   background: #191c23;
 }
+
+/* 签到导入向导：长值/长 URL 截断，避免把操作列挤出视口 */
+.checkin-value,
+.checkin-url {
+  display: inline-block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+.checkin-value {
+  max-width: 220px;
+}
+.checkin-url {
+  max-width: 380px;
+}

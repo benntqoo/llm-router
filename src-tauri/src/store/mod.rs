@@ -10,6 +10,7 @@
 
 pub mod analytics;
 pub mod channels;
+pub mod checkin;
 pub mod error;
 pub mod migrations;
 pub mod price;
