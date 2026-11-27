@@ -4,10 +4,12 @@
 //! - [`adapter`]：trait 契约与共用类型（`ChannelConfig` / `CallContext` / `OutgoingCall` …）
 //! - [`openai_compat`]：唯一通用实现，完成 R-1~R-8 改写
 //! - [`presets`]：纯数据预设（02 §6.1 的 7 个 API Key profile）
+//! - [`oauth`]：OAuth 型渠道的**凭证获取**（T20：GitHub Copilot；只取凭证，不出站）
 //!
 //! v1 入站仅 OpenAI 协议，出站亦为 OpenAI 兼容改写；**v1 是改写器不是转换器**。
 
 pub mod adapter;
+pub mod oauth;
 pub mod openai_compat;
 pub mod presets;
 

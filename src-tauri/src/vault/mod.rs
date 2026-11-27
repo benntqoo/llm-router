@@ -356,6 +356,20 @@ impl Vault {
         kind: &str,
         secret: &SecretBytes,
     ) -> Result<String> {
+        self.put_credential_expiring(channel_id, kind, secret, None)
+    }
+
+    /// 存入一条凭据（**可带过期时间**），返回凭据 id。
+    ///
+    /// `expires_at` 是 Unix 秒（OAuth 型 token 用；`None` = 长期有效）。
+    /// 密文与 AAD 绑定规则**同** `put_credential`（AAD = 凭据 id）。
+    pub fn put_credential_expiring(
+        &self,
+        channel_id: &str,
+        kind: &str,
+        secret: &SecretBytes,
+        expires_at: Option<i64>,
+    ) -> Result<String> {
         let id = new_id("cred");
         // AAD 绑定凭证 id：密文无法在记录之间搬运
         let key = self.master_key.as_ref().ok_or(VaultError::Locked)?;
@@ -365,8 +379,8 @@ impl Vault {
         self.store.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO credential
-                     (id, channel_id, kind, ciphertext, nonce, key_version, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (id, channel_id, kind, ciphertext, nonce, key_version, expires_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     id,
                     channel_id,
@@ -374,6 +388,7 @@ impl Vault {
                     ciphertext,
                     nonce,
                     self.key_version,
+                    expires_at,
                     now,
                     now
                 ],

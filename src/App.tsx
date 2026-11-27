@@ -4,6 +4,7 @@ import ChannelPanel from "./ChannelPanel";
 import CheckinPanel from "./checkin/CheckinPanel";
 import CircuitPanel from "./CircuitPanel";
 import ClientKeyPanel from "./ClientKeyPanel";
+import CopilotPanel from "./copilot/CopilotPanel";
 import ModelsPanel from "./ModelsPanel";
 import UsagePanel from "./usage/UsagePanel";
 import VaultPanel from "./VaultPanel";
@@ -88,6 +89,8 @@ function App() {
       </section>
 
       <ChannelPanel />
+
+      <CopilotPanel />
 
       <VaultPanel />
 

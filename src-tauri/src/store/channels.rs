@@ -20,6 +20,58 @@ use crate::store::{Result, Store, StoreError};
 /// 自定义渠道的 provider 标识（02 §6.1）。
 pub const CUSTOM_PROVIDER: &str = "custom";
 
+/// OAuth 型渠道的 provider 标识（Copilot；T20）。
+pub const OAUTH_PROVIDER: &str = "copilot";
+
+/// 确保存在一条 **OAuth 型**渠道行，返回渠道 id（T20）。
+///
+/// **与 `save_channel` 的区别**：OAuth 渠道在拿到模型目录之前**没有模型**
+/// （模型属 T21），而 `save_channel` 要求「至少一个模型」→ 走这条专用路径。
+///
+/// **默认关闭**（`enabled = 0`）：AGENT.md §5.5 规定 Copilot / WorkBuddy 反代
+/// **默认关闭**，首次启用要过 ToS 确认弹窗（属 T24）——本函数**不提供**启用入口。
+pub fn ensure_oauth_channel(
+    store: &Store,
+    name: &str,
+    provider: &str,
+    base_url: &str,
+) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(StoreError::Invalid("渠道名不能为空".to_string()));
+    }
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Err(StoreError::Invalid("provider 不能为空".to_string()));
+    }
+    let base_url = base_url.trim().trim_end_matches('/').to_string();
+    store.with_conn(|conn| {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM channel WHERE name = ?1 LIMIT 1",
+                [name],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            // 已存在：只补 base_url（域名可能随账号变化），**不改 enabled**
+            conn.execute(
+                "UPDATE channel SET base_url = ?2 WHERE id = ?1",
+                rusqlite::params![id, base_url],
+            )?;
+            return Ok(id);
+        }
+        let id = crate::vault::new_id("ch");
+        conn.execute(
+            "INSERT INTO channel
+                 (id, name, kind, provider, base_url, enabled, priority, created_at, meta_json)
+             VALUES (?1, ?2, 'oauth', ?3, ?4, 0, 100, ?5, '{}')",
+            rusqlite::params![id, name, provider, base_url, crate::vault::now_secs()],
+        )?;
+        Ok(id)
+    })
+}
+
 /// 渠道私有参数（写进 `channel.meta_json`；字段见 02 §9）。
 ///
 /// 序列化时**全部字段都写**（含 `null`）：`meta_json` 是整份替换，

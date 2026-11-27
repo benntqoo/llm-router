@@ -205,6 +205,10 @@ pub fn run() {
             commands::notify::notify_get_config,
             commands::notify::notify_set_config,
             commands::notify::notify_test,
+            commands::copilot::copilot_authorize_start,
+            commands::copilot::copilot_authorize_poll,
+            commands::copilot::copilot_status,
+            commands::copilot::copilot_disconnect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
