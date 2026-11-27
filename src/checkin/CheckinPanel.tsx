@@ -15,6 +15,12 @@ import {
   targetLabel,
 } from "./format";
 import {
+  credentialState,
+  describeCredentialState,
+  describeReward,
+  pluginLabel,
+} from "./plugin";
+import {
   describeCron,
   describeSystemTask,
   formatClock,
@@ -22,30 +28,36 @@ import {
   validateCron,
 } from "./schedule";
 import type {
+  BuiltinSite,
   ChannelOption,
   FieldView,
   HarImport,
+  LoginSummary,
   MarkedVariable,
   ResultView,
   RunSummary,
   SaveTemplateInput,
+  SidecarHealth,
   SiteSummary,
   SystemSyncSummary,
 } from "./types";
 
 /**
- * 签到站点面板（T15 HAR 导入与模板化 · T17 调度器与系统兜底）。
+ * 签到站点面板（T15 HAR 导入与模板化 · T17 调度器与系统兜底 · T18 站点插件）。
  *
- * 两块：
- * 1. **站点调度**（T17）：给站点设 cron / 启用开关 / 立即执行一次 /
+ * 三块：
+ * 1. **内置站点插件**（T18）：ModelScope / MiniMax Code——**自带正确的断言**，
+ *    用户只提供登录态；MiniMax Code 走**浏览器辅轨**（弹一次浏览器登录）；
+ * 2. **站点调度**（T17）：给站点设 cron / 启用开关 / 立即执行一次 /
  *    同步系统兜底任务 + 看最近执行记录；
- * 2. **导入向导**（T15）：**选 HAR 文件 → 选一条 entry → 标记变量 → 保存模板**。
+ * 3. **导入向导**（T15）：**选 HAR 文件 → 选一条 entry → 标记变量 → 保存模板**。
  *
  * 密文边界（AGENT.md §5.3）：
  * - 导入回来的**敏感值已经是掩码**（后端在 IPC 边界就掩掉了），前端拿不到原值；
  * - 保存时前端只回传**路径 + 标记清单**，后端重新解析并把真实值写进保险库；
  * - 未标记的敏感字段由后端**自动补齐为变量**（名字带 `auto_` 前缀），
- *   否则它们会以明文留在模板里。
+ *   否则它们会以明文留在模板里；
+ * - 内置站点的登录态同样**只进保险库**，不回显、不进日志。
  */
 export default function CheckinPanel() {
   const [sites, setSites] = useState<SiteSummary[]>([]);
@@ -67,6 +79,11 @@ export default function CheckinPanel() {
   const [systemSummary, setSystemSummary] = useState<SystemSyncSummary | null>(null);
   const [busySite, setBusySite] = useState<string | null>(null);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  // ── T18 站点插件 ──
+  const [builtins, setBuiltins] = useState<BuiltinSite[]>([]);
+  /** 登录态输入框的草稿（`siteId` → 明文；**只活在内存里**，提交后清空）。 */
+  const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({});
+  const [sidecarHealth, setSidecarHealth] = useState<SidecarHealth | null>(null);
 
   const refreshSites = useCallback(async () => {
     try {
@@ -103,6 +120,12 @@ export default function CheckinPanel() {
     invoke<ChannelOption[]>("channel_list")
       .then((rows) => setChannels(rows))
       .catch(() => setChannels([]));
+    invoke<BuiltinSite[]>("checkin_builtin_sites")
+      .then((rows) => setBuiltins(rows))
+      .catch(() => setBuiltins([]));
+    invoke<SidecarHealth>("checkin_sidecar_health")
+      .then((row) => setSidecarHealth(row))
+      .catch(() => setSidecarHealth(null));
   }, [refreshSites, refreshResults]);
 
   // 相对时间要自己走（不然「下次：3 分钟后」会一直停在旧值）
@@ -372,10 +395,92 @@ export default function CheckinPanel() {
     ).length;
   }, [selected, marks]);
 
+  // ── T18 站点插件 ──
+
+  /** 添加一个内置站点（默认不启用——02 §7.3）。 */
+  const addBuiltin = useCallback(
+    async (pluginId: string) => {
+      setError(null);
+      setNotice(null);
+      setBusy(true);
+      try {
+        const summary = await invoke<SiteSummary>("checkin_add_builtin_site", {
+          pluginId,
+        });
+        setNotice(
+          `已添加「${summary.name}」：${summary.credentialHint ?? ""}` +
+            "（默认不启用——填好登录态后再勾启用）",
+        );
+        await refreshSites();
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [refreshSites],
+  );
+
+  /** 保存登录态（**明文只往后台送一次**，提交后清空输入框）。 */
+  const saveCredential = useCallback(
+    async (site: SiteSummary, which: "cookie" | "token") => {
+      setError(null);
+      setNotice(null);
+      const draft = (secretDrafts[site.id] ?? "").trim();
+      if (!draft) {
+        setError(which === "cookie" ? "登录态不能为空" : "token 不能为空");
+        return;
+      }
+      setBusySite(site.id);
+      try {
+        const summary = await invoke<SiteSummary>("checkin_set_credential", {
+          id: site.id,
+          which,
+          secret: draft,
+        });
+        applySummary(summary);
+        setSecretDrafts((current) => ({ ...current, [site.id]: "" }));
+        setNotice(
+          `「${summary.name}」的${which === "cookie" ? "网页 Cookie" : "开放平台 token"}已存进加密保险库`,
+        );
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusySite(null);
+      }
+    },
+    [secretDrafts, applySummary],
+  );
+
+  /** 拉起浏览器做登录交接（MiniMax Code：用户在浏览器里登录一次）。 */
+  const pluginLogin = useCallback(
+    async (site: SiteSummary) => {
+      setError(null);
+      setNotice(null);
+      setBusySite(site.id);
+      try {
+        const summary = await invoke<LoginSummary>("checkin_plugin_login", { id: site.id });
+        setNotice(summary.message);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusySite(null);
+      }
+    },
+    [],
+  );
+
+  /** 已建的内置站点（`plugin !== "har"`）。 */
+  const builtinSites = useMemo(
+    () => sites.filter((site) => site.plugin !== "har"),
+    [sites],
+  );
+
   return (
     <section className="card">
-      <h2>签到站点（T15 模板化 · T17 调度）</h2>
+      <h2>签到站点（T15 模板化 · T17 调度 · T18 站点插件）</h2>
       <p className="muted">
+        内置站点插件自带<b>正确的断言</b>，用户只要提供登录态；
         上半部分是调度（cron / 启用 / 立即执行 / 系统兜底），下半部分是 HAR 导入向导。
         调度口径见 02 §7.2.1：cron 写<b>经典 5 字段</b>（分 时 日 月 周），
         按本地时区解释；应用关着期间漏掉的周期会自动补签。
@@ -384,14 +489,66 @@ export default function CheckinPanel() {
       {error && <p className="error">{error}</p>}
       {notice && <p className="ok">{notice}</p>}
 
+      <h3>内置站点插件（T18）</h3>
+      {sidecarHealth && (
+        <p className="muted">
+          浏览器辅轨：{sidecarHealth.browserAvailable ? "可用" : "不可用"}
+          {sidecarHealth.browserAvailable &&
+            `（${sidecarHealth.browserChannel}，Node ${sidecarHealth.nodeVersion}）`}
+          　profile：{sidecarHealth.profileDir}
+        </p>
+      )}
+      {builtins.length === 0 ? (
+        <p className="muted">后端没返回内置插件清单。</p>
+      ) : (
+        <table className="usage-table">
+          <thead>
+            <tr>
+              <th>插件</th>
+              <th>要准备什么</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {builtins.map((item) => {
+              const added = builtinSites.some((site) => site.plugin === item.id);
+              return (
+                <tr key={item.id}>
+                  <td>
+                    <strong>{item.name}</strong>
+                    <div className="muted">默认 cron：{item.defaultSchedule}</div>
+                  </td>
+                  <td>
+                    <div>{item.credentialHint}</div>
+                    {item.needsSidecar && (
+                      <div className="muted">
+                        需要 Node 运行时 + sidecar 目录（开发态：cd sidecar && npm install）
+                      </div>
+                    )}
+                  </td>
+                  <td>
+                    <button onClick={() => void addBuiltin(item.id)} disabled={busy}>
+                      {added ? "已添加（可再点一次）" : "添加"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+
       <h3>站点调度</h3>
       {sites.length === 0 ? (
-        <p className="muted">还没有签到站点——先用下面的导入向导建一个。</p>
+        <p className="muted">
+          还没有签到站点——先在上面添加一个内置站点，或用下面的导入向导建一个。
+        </p>
       ) : (
         <table className="usage-table">
           <thead>
             <tr>
               <th>站点</th>
+              <th>登录态</th>
               <th>调度（cron）</th>
               <th>状态</th>
               <th>操作</th>
@@ -401,6 +558,7 @@ export default function CheckinPanel() {
             {sites.map((site) => {
               const draft = drafts[site.id] ?? site.schedule ?? "";
               const pending = busySite === site.id;
+              const credState = credentialState(site);
               return (
                 <tr key={site.id}>
                   <td>
@@ -408,11 +566,55 @@ export default function CheckinPanel() {
                     <div className="muted">
                       {site.template
                         ? `${site.template.method} ${shortUrl(site.template.url, 56)}`
-                        : "—"}
+                        : `插件：${pluginLabel(site.plugin)}`}
                     </div>
                     <div className="muted">
-                      变量：{site.template?.variableNames.join("、") ?? "—"}
+                      {site.template
+                        ? `变量：${site.template.variableNames.join("、") || "—"}`
+                        : site.credentialHint ?? "—"}
                     </div>
+                    {site.reward && (
+                      <div className="muted">积分：{describeReward(site.reward)}</div>
+                    )}
+                  </td>
+                  <td>
+                    <div className="muted">{describeCredentialState(credState)}</div>
+                    {credState === "sidecar" && (
+                      <button
+                        onClick={() => void pluginLogin(site)}
+                        disabled={pending}
+                      >
+                        登录（弹浏览器）
+                      </button>
+                    )}
+                    {credState !== "har" && credState !== "sidecar" && (
+                      <>
+                        <div className="row-inline">
+                          <input
+                            type="password"
+                            value={secretDrafts[site.id] ?? ""}
+                            placeholder="网页会话 Cookie"
+                            onChange={(e) =>
+                              setSecretDrafts((current) => ({
+                                ...current,
+                                [site.id]: e.target.value,
+                              }))
+                            }
+                          />
+                          <button
+                            onClick={() => void saveCredential(site, "cookie")}
+                            disabled={pending}
+                          >
+                            保存
+                          </button>
+                        </div>
+                        <div className="muted">
+                          {site.credentialReady
+                            ? "登录态已填（存加密保险库）——可以再填一次覆盖"
+                            : "还没填：F12 → Network → 任一站点请求 → Request Headers → Cookie"}
+                        </div>
+                      </>
+                    )}
                   </td>
                   <td>
                     <div className="row-inline">

@@ -196,6 +196,12 @@ pub fn run() {
             commands::checkin::checkin_run_now,
             commands::checkin::checkin_results,
             commands::checkin::checkin_system_sync,
+            commands::checkin::checkin_builtin_sites,
+            commands::checkin::checkin_add_builtin_site,
+            commands::checkin::checkin_set_credential,
+            commands::checkin::checkin_plugin_login,
+            commands::checkin::checkin_sidecar_health,
+            commands::checkin::checkin_site_reward,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

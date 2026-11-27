@@ -59,7 +59,7 @@ export type TemplateSummary = {
   variableNames: string[];
 };
 
-/** 签到站点摘要（T17 扩展：调度信息）。 */
+/** 签到站点摘要（T17 扩展：调度信息；T18 扩展：插件信息）。 */
 export type SiteSummary = {
   id: string;
   name: string;
@@ -81,6 +81,49 @@ export type SiteSummary = {
   systemTaskFrequency: string | null;
   /** 系统兜底同步时的错误（注册失败等）。 */
   systemTaskError: string | null;
+  /** 内置插件的登录态是否已填（HAR 模板恒为 `false`）。 */
+  credentialReady: boolean;
+  /** 内置插件是否需要浏览器辅轨。 */
+  needsSidecar: boolean;
+  /** 内置插件的凭据提示（HAR 模板为 `null`）。 */
+  credentialHint: string | null;
+  /** 该站点归属账号的积分快照。 */
+  reward: RewardSnapshot | null;
+};
+
+/** 账号额度快照里的签到积分（**「本次拿到了多少」，不是账户余额真值**）。 */
+export type RewardSnapshot = {
+  points: number;
+  unit: string;
+  source: string;
+  updatedAt: number;
+};
+
+/** 一个内置站点插件（UI 的「添加站点」清单项）。 */
+export type BuiltinSite = {
+  id: string;
+  name: string;
+  /** 凭据提示（告诉用户要准备什么）。 */
+  credentialHint: string;
+  /** 是否需要浏览器辅轨。 */
+  needsSidecar: boolean;
+  /** 默认 cron。 */
+  defaultSchedule: string;
+};
+
+/** 辅轨探活结果。 */
+export type SidecarHealth = {
+  nodeVersion: string;
+  browserAvailable: boolean;
+  browserChannel: string;
+  profileDir: string;
+  loggedIn: boolean | null;
+};
+
+/** 登录交接的摘要。 */
+export type LoginSummary = {
+  ok: boolean;
+  message: string;
 };
 
 /** 一次执行的摘要（「立即执行一次」的返回）。 */

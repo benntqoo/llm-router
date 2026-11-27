@@ -8,6 +8,7 @@
 //! - `migrations.rs` —— 迁移框架（版本记录、up/down 编排）；
 //! - `mod.rs` —— `Store`（打开、PRAGMA、迁移入口、路径解析）。
 
+pub mod account;
 pub mod analytics;
 pub mod channels;
 pub mod checkin;

@@ -71,6 +71,14 @@ pub struct SiteSummary {
     pub system_task_frequency: Option<String>,
     /// 系统兜底同步时的错误（注册失败等）。
     pub system_task_error: Option<String>,
+    /// 内置插件的登录态是否已填（HAR 模板恒为 `false`）。
+    pub credential_ready: bool,
+    /// 内置插件是否需要浏览器辅轨。
+    pub needs_sidecar: bool,
+    /// 内置插件的凭据提示（HAR 模板为 `None`）。
+    pub credential_hint: Option<String>,
+    /// 该站点归属账号的积分快照（02 §7.4 §4）。
+    pub reward: Option<crate::store::account::RewardSnapshot>,
 }
 
 /// 一次执行的摘要（IPC 返回）。
@@ -461,6 +469,224 @@ pub fn checkin_system_sync_of(state: &AppState) -> Result<SystemSyncSummary, Str
     Ok(summary)
 }
 
+// ────────────────────────────── 站点插件（T18） ──────────────────────────────
+
+/// 内置插件清单（UI 的「添加站点」用）。
+#[tauri::command]
+pub fn checkin_builtin_sites() -> Result<Vec<crate::checkin::plugin::BuiltinSite>, String> {
+    Ok(crate::checkin::plugin::builtin_catalog())
+}
+
+/// 建一个内置站点（ModelScope / MiniMax Code）。
+///
+/// 口径（02 §7.4 §4）：站点归属一个**占位渠道**（`provider = 'custom'`），
+/// 渠道下取默认账号——**凭据挂渠道、积分挂账号**（两张表的外键都是 NOT NULL）。
+/// 站点**默认不启用**（02 §7.3）。
+#[tauri::command]
+pub fn checkin_add_builtin_site(
+    state: State<'_, AppState>,
+    plugin_id: String,
+) -> Result<SiteSummary, String> {
+    checkin_add_builtin_site_of(&state, &plugin_id)
+}
+
+/// 建内置站点（可测版本）。
+pub fn checkin_add_builtin_site_of(
+    state: &AppState,
+    plugin_id: &str,
+) -> Result<SiteSummary, String> {
+    let plugin = crate::checkin::plugin::builtin(plugin_id)
+        .ok_or_else(|| format!("没有这个内置插件：{plugin_id}"))?;
+    let name = plugin.display_name().to_string();
+
+    // 1) 占位渠道（凭据必须挂在渠道上）
+    let channel_id = {
+        let vault = state.vault.read().map_err(|e| e.to_string())?;
+        vault
+            .ensure_channel(&format!("签到 · {name}"))
+            .map_err(|e| e.to_string())?
+    };
+
+    // 2) 默认账号（积分回写落在它的 quota_json）
+    let account_id = crate::store::quota::ensure_account(&state.store, &channel_id)
+        .map_err(|e| e.to_string())?;
+
+    // 3) 站点行（同名站点复用同一行）
+    let existing = state
+        .store
+        .with_conn(|conn| checkin::find_site_by_name(conn, &name))
+        .map_err(|e| e.to_string())?;
+    let config = crate::checkin::plugin::PluginSiteConfig {
+        channel_id: Some(channel_id),
+        account_id: Some(account_id),
+        ..Default::default()
+    };
+    let row = SiteRow {
+        id: existing
+            .as_ref()
+            .map(|site| site.id.clone())
+            .unwrap_or_else(checkin::new_site_id),
+        name,
+        plugin: plugin_id.to_string(),
+        config_json: Some(config.to_json()),
+        // 已有站点保留原 cron；新站点用插件的默认 cron
+        schedule: existing
+            .as_ref()
+            .and_then(|site| site.schedule.clone())
+            .or_else(|| Some(plugin.default_schedule().to_string())),
+        // 02 §7.3：站点插件默认全关
+        enabled: existing.as_ref().map(|site| site.enabled).unwrap_or(false),
+    };
+    state
+        .store
+        .with_conn(|conn| checkin::upsert_site(conn, &row))
+        .map_err(|e| e.to_string())?;
+    summarize(state, &row)
+}
+
+/// 填内置站点的登录态（**明文只进保险库，不回显、不落日志**）。
+///
+/// `which`：`cookie`（网页会话 Cookie，必需）/ `token`（开放平台 token，可选）。
+#[tauri::command]
+pub fn checkin_set_credential(
+    state: State<'_, AppState>,
+    id: String,
+    which: String,
+    secret: String,
+) -> Result<SiteSummary, String> {
+    checkin_set_credential_of(&state, &id, &which, &secret)
+}
+
+/// 填登录态（可测版本）。
+pub fn checkin_set_credential_of(
+    state: &AppState,
+    id: &str,
+    which: &str,
+    secret: &str,
+) -> Result<SiteSummary, String> {
+    if secret.trim().is_empty() {
+        return Err("登录态不能为空".to_string());
+    }
+    let row = state
+        .store
+        .with_conn(|conn| checkin::get_site(conn, id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("站点不存在：{id}"))?;
+    let mut config = crate::checkin::plugin::parse_config(&row);
+    let channel_id = config
+        .channel_id
+        .clone()
+        .ok_or_else(|| "站点没有归属渠道——请重建该站点".to_string())?;
+    let kind = match which {
+        "cookie" => "cookie",
+        "token" => "access_token",
+        other => return Err(format!("未知的登录态类型：{other}")),
+    };
+
+    let credential_id = {
+        let vault = state.vault.read().map_err(|e| e.to_string())?;
+        let bytes = SecretBytes::from_slice(secret.as_bytes());
+        let id = vault
+            .put_credential(&channel_id, kind, &bytes)
+            .map_err(|e| e.to_string())?;
+        // 只打印 id，明文不落日志
+        println!("[checkin] 站点 {id} 的 {which} 登录态已存进保险库（明文不落日志）");
+        id
+    };
+
+    match which {
+        "cookie" => config.credential_id = Some(credential_id),
+        _ => config.token_credential_id = Some(credential_id),
+    }
+    let mut updated = row.clone();
+    updated.config_json = Some(config.to_json());
+    state
+        .store
+        .with_conn(|conn| checkin::upsert_site(conn, &updated))
+        .map_err(|e| e.to_string())?;
+    summarize(state, &updated)
+}
+
+/// 拉起浏览器做**登录交接**（MiniMax Code 用：用户在浏览器里登录一次）。
+#[tauri::command]
+pub async fn checkin_plugin_login(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<LoginSummary, String> {
+    checkin_plugin_login_of(&state, &id).await
+}
+
+/// 登录交接（可测版本）。
+pub async fn checkin_plugin_login_of(state: &AppState, id: &str) -> Result<LoginSummary, String> {
+    let row = state
+        .store
+        .with_conn(|conn| checkin::get_site(conn, id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("站点不存在：{id}"))?;
+    let plugin = crate::checkin::plugin::builtin(&row.plugin)
+        .ok_or_else(|| format!("这个站点不是内置插件：{}", row.plugin))?;
+    let sidecar = crate::checkin::sidecar::Sidecar::default_instance().ok_or_else(|| {
+        "辅轨不可用——没找到 sidecar 脚本或 Node 运行时（开发态：在 sidecar/ 目录跑一次 `npm install`）"
+            .to_string()
+    })?;
+    let config = crate::checkin::plugin::parse_config(&row);
+    // 引擎只是为了让上下文里有 HTTP 客户端（辅轨型插件不发 HTTP 请求）
+    let engine = crate::checkin::replay::ReplayEngine::new().map_err(|e| e.to_string())?;
+    let ctx = crate::checkin::plugin::PluginContext {
+        site: &row,
+        config,
+        client: engine.client(),
+        vault: &state.vault,
+        sidecar: Some(sidecar),
+    };
+    let outcome = plugin
+        .login(&ctx)
+        .await
+        .ok_or_else(|| "这个插件不支持登录交接".to_string())?;
+    Ok(LoginSummary {
+        ok: outcome.ok,
+        message: outcome.message,
+    })
+}
+
+/// 辅轨探活（Node 运行时 + 浏览器可用性 + profile 路径）。
+#[tauri::command]
+pub async fn checkin_sidecar_health() -> Result<crate::checkin::sidecar::SidecarHealth, String> {
+    let sidecar = crate::checkin::sidecar::Sidecar::default_instance().ok_or_else(|| {
+        "辅轨不可用——没找到 sidecar 脚本或 Node 运行时（开发态：在 sidecar/ 目录跑一次 `npm install`）"
+            .to_string()
+    })?;
+    sidecar.health().await
+}
+
+/// 某站点归属账号的积分快照。
+#[tauri::command]
+pub fn checkin_site_reward(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<crate::store::account::RewardSnapshot>, String> {
+    let row = state
+        .store
+        .with_conn(|conn| checkin::get_site(conn, &id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("站点不存在：{id}"))?;
+    let config = crate::checkin::plugin::parse_config(&row);
+    Ok(config
+        .account_id
+        .as_deref()
+        .and_then(|account_id| crate::store::account::read_reward(&state.store, account_id)))
+}
+
+/// 登录交接的摘要。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginSummary {
+    /// 是否登录成功。
+    pub ok: bool,
+    /// 人话原因。
+    pub message: String,
+}
+
 /// 解析归属渠道：给 id 用它；给名字就按名字找/建。
 fn resolve_channel(state: &AppState, input: &SaveTemplateInput) -> Result<String, String> {
     if let Some(channel_id) = input.channel_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
@@ -528,6 +754,15 @@ fn summarize(state: &AppState, row: &SiteRow) -> Result<SiteSummary, String> {
         .and_then(|rows| rows.first().map(|row| row.ok));
     let task = crate::checkin::system::query(&row.id).ok();
 
+    // 内置插件的信息（HAR 模板没有这些）
+    let plugin = crate::checkin::plugin::builtin(&row.plugin);
+    let config = crate::checkin::plugin::parse_config(row);
+    let credential_ready = config.credential_id.is_some();
+    let reward = config
+        .account_id
+        .as_deref()
+        .and_then(|account_id| crate::store::account::read_reward(&state.store, account_id));
+
     Ok(SiteSummary {
         id: row.id.clone(),
         name: row.name.clone(),
@@ -542,6 +777,10 @@ fn summarize(state: &AppState, row: &SiteRow) -> Result<SiteSummary, String> {
         system_task_registered: task.as_ref().map(|task| task.registered).unwrap_or(false),
         system_task_frequency: task.and_then(|task| task.frequency),
         system_task_error: None,
+        credential_ready,
+        needs_sidecar: plugin.as_ref().map(|p| p.needs_sidecar()).unwrap_or(false),
+        credential_hint: plugin.as_ref().map(|p| p.credential_hint().to_string()),
+        reward,
     })
 }
 

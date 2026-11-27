@@ -1,0 +1,17 @@
+{
+  "name": "llm-router-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LLM Router 浏览器辅轨（T18；02 §7.4 §3）——Playwright 驱动浏览器跑签到，持久化 profile 复用登录态",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "health": "node index.mjs health",
+    "login": "node index.mjs login",
+    "checkin": "node index.mjs checkin"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.58.0"
+  }
+}

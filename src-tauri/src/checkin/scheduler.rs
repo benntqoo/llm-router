@@ -14,7 +14,7 @@ use crate::checkin::har::SiteTemplate;
 use crate::checkin::replay::{
     ReplayClass, ReplayEngine, ReplayOutcome, ResolveError, SecretResolver,
 };
-use crate::store::checkin::{self, SiteRow};
+use crate::store::checkin::{self, SiteRow, PLUGIN_HAR};
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -139,53 +139,130 @@ pub fn due_sites(store: &Store, now: DateTime<Local>) -> Vec<SiteRow> {
         .collect()
 }
 
-/// 跑一个站点（注入 → 重放 → 断言 → 分类 → 落 `checkin_result`）。
+/// 跑一个站点（**按 `plugin` 分派** → 执行 → 落 `checkin_result` → 积分回写）。
+///
+/// 分派口径（02 §7.4 §1）：
+/// - `har` → **T16 重放引擎**（用户自建模板）；
+/// - `modelscope` / `minimax_code` → **内置插件**（`checkin::sites::*`）；
+/// - 其它 → `template_invalid`（**不静默跳过**：站点配置错了要让人看见）。
 pub async fn run_site(
     store: &Store,
     vault: &Arc<RwLock<Vault>>,
     engine: &ReplayEngine,
     site: &SiteRow,
 ) -> ReplayOutcome {
-    let resolver = VaultResolver::new(Arc::clone(vault));
-    let outcome = match site.config_json.as_deref() {
-        Some(json) => match crate::checkin::replay::parse_template(json) {
-            Ok(template) => engine.replay(&template, &resolver).await,
-            Err(failure) => ReplayOutcome {
+    let outcome = execute(vault, engine, site).await;
+    record(store, &site.id, &outcome);
+    write_back_reward(store, site, &outcome);
+    outcome
+}
+
+/// 按插件类型执行一次签到（**不分派到别处**）。
+async fn execute(
+    vault: &Arc<RwLock<Vault>>,
+    engine: &ReplayEngine,
+    site: &SiteRow,
+) -> ReplayOutcome {
+    // 1) 用户自建 HAR 模板 → T16 重放引擎
+    if site.plugin == PLUGIN_HAR {
+        let resolver = VaultResolver::new(Arc::clone(vault));
+        return match site.config_json.as_deref() {
+            Some(json) => match crate::checkin::replay::parse_template(json) {
+                Ok(template) => engine.replay(&template, &resolver).await,
+                Err(failure) => ReplayOutcome {
+                    ok: false,
+                    class: failure.class,
+                    message: failure.message,
+                    status: None,
+                    elapsed_ms: 0,
+                    retryable: false,
+                    body_preview: None,
+                    reward: None,
+                },
+            },
+            None => ReplayOutcome {
                 ok: false,
-                class: failure.class,
-                message: failure.message,
+                class: ReplayClass::TemplateInvalid,
+                message: "站点没有模板（config_json 为空）".to_string(),
                 status: None,
                 elapsed_ms: 0,
                 retryable: false,
                 body_preview: None,
+                reward: None,
             },
-        },
+        };
+    }
+
+    // 2) 内置站点插件 → `checkin::sites::*`
+    match crate::checkin::plugin::builtin(&site.plugin) {
+        Some(plugin) => {
+            let config = crate::checkin::plugin::parse_config(site);
+            // 辅轨**只在需要时才探测**（找不到就 `None`——插件自己给出"辅轨不可用"的失败）
+            let sidecar = if plugin.needs_sidecar() {
+                crate::checkin::sidecar::Sidecar::default_instance()
+            } else {
+                None
+            };
+            let ctx = crate::checkin::plugin::PluginContext {
+                site,
+                config,
+                client: engine.client(),
+                vault,
+                sidecar,
+            };
+            plugin.run(&ctx).await
+        }
         None => ReplayOutcome {
             ok: false,
             class: ReplayClass::TemplateInvalid,
-            message: "站点没有模板（config_json 为空）".to_string(),
+            message: format!("未知的站点插件：{}", site.plugin),
             status: None,
             elapsed_ms: 0,
             retryable: false,
             body_preview: None,
+            reward: None,
         },
-    };
-    record(store, &site.id, &outcome);
-    outcome
+    }
 }
 
-/// 把结果写进 `checkin_result`（`reward_json` 留空——积分提取属 T18）。
+/// 把结果写进 `checkin_result`（`reward_json` 带本次拿到的积分）。
 pub fn record(store: &Store, site_id: &str, outcome: &ReplayOutcome) {
+    let reward_json = outcome.reward.as_ref().map(|reward| reward.to_json());
     let _ = store.with_conn(|conn| {
         checkin::insert_result(
             conn,
             site_id,
             now_secs(),
             outcome.ok,
-            None,
+            reward_json.as_deref(),
             Some(&outcome.message),
         )
     });
+}
+
+/// 积分回写 `account.quota_json`（02 §7.4 §4）。
+///
+/// **写回失败不回滚签到**——结果已落 `checkin_result`，回写失败只记日志。
+fn write_back_reward(store: &Store, site: &SiteRow, outcome: &ReplayOutcome) {
+    if !outcome.ok {
+        return;
+    }
+    let Some(reward) = outcome.reward.as_ref() else {
+        return;
+    };
+    let config = crate::checkin::plugin::parse_config(site);
+    let Some(account_id) = config.account_id.as_deref() else {
+        return;
+    };
+    if let Err(err) = crate::store::account::write_reward(
+        store,
+        account_id,
+        reward.amount,
+        &reward.unit,
+        now_secs(),
+    ) {
+        println!("[checkin] {}：积分回写失败（不影响签到结果）：{err}", site.name);
+    }
 }
 
 /// 当前 Unix 秒。

@@ -138,6 +138,9 @@ pub struct ReplayOutcome {
     pub retryable: bool,
     /// 失败时的响应体片段（**只在内存里，不落库**）。
     pub body_preview: Option<String>,
+    /// 本次拿到的积分（**T18 才有**；HAR 重放恒为 `None`）→ 落 `checkin_result.reward_json`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reward: Option<crate::checkin::reward::Reward>,
 }
 
 impl ReplayOutcome {
@@ -150,6 +153,7 @@ impl ReplayOutcome {
             elapsed_ms,
             retryable: failure.retryable,
             body_preview: None,
+            reward: None,
         }
     }
 }
@@ -206,6 +210,12 @@ impl ReplayEngine {
             .user_agent(concat!("llm-router/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(ReplayEngine { client })
+    }
+
+    /// HTTP 客户端（**给内置站点插件用**：T18 的 ModelScope 插件自己发请求，
+    /// 但复用引擎同一套超时口径——连接 10s / 整请求 30s）。
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     /// 重放一次签到请求。
@@ -312,6 +322,7 @@ impl ReplayEngine {
                     elapsed_ms: started.elapsed().as_millis() as u64,
                     retryable: true,
                     body_preview: None,
+                    reward: None,
                 };
             }
         };
@@ -342,6 +353,7 @@ pub fn evaluate(template: &SiteTemplate, status: u16, body: &[u8]) -> ReplayOutc
                 elapsed_ms: 0,
                 retryable: false,
                 body_preview: None,
+                reward: None,
             };
             return outcome;
         }
