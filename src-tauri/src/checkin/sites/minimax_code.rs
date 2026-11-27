@@ -38,8 +38,11 @@ pub const DEFAULT_PAGE_URL: &str = "https://agent.minimax.cn/";
 /// 辅轨 `checkin` 动作的超时（浏览器启动 + 页面加载，比 HTTP 慢得多）。
 pub const CHECKIN_TIMEOUT_SECS: u64 = 90;
 
-/// 辅轨 `login` 动作的超时（**要等用户手动登录**，给足时间）。
-pub const LOGIN_TIMEOUT_SECS: u64 = 300;
+/// 辅轨 `login` 动作的超时（浏览器启动 + 页面加载，比 HTTP 慢得多）。
+///
+/// **15 分钟**：真人登录要输密码 / 收 2FA / 走扫码，5 分钟太紧
+/// （真机踩过：用户还在输验证码，交接窗口就到期了）。
+pub const LOGIN_TIMEOUT_SECS: u64 = 900;
 
 /// 辅轨 `checkin` 的返回（**sidecar 的输出契约**）。
 #[derive(Debug, Clone, Deserialize)]

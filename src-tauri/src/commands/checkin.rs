@@ -573,6 +573,7 @@ pub fn checkin_set_credential_of(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("站点不存在：{id}"))?;
     let mut config = crate::checkin::plugin::parse_config(&row);
+    let old_config = config.clone();
     let channel_id = config
         .channel_id
         .clone()
@@ -604,6 +605,22 @@ pub fn checkin_set_credential_of(
         .store
         .with_conn(|conn| checkin::upsert_site(conn, &updated))
         .map_err(|e| e.to_string())?;
+
+    // 旧的那条凭据**在站点行更新成功之后**再删（与 T15 重录模板同一路子）——
+    // 不删会在保险库里留一条没人引用的孤儿凭据。
+    let previous = match which {
+        "cookie" => old_config.credential_id,
+        _ => old_config.token_credential_id,
+    };
+    if let Some(previous) = previous {
+        let still_used = config.credential_id.as_deref() == Some(previous.as_str())
+            || config.token_credential_id.as_deref() == Some(previous.as_str());
+        if !still_used {
+            let vault = state.vault.read().map_err(|e| e.to_string())?;
+            let _ = vault.delete_credential(&previous);
+        }
+    }
+
     summarize(state, &updated)
 }
 
