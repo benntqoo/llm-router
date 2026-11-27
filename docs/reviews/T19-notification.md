@@ -164,4 +164,4 @@ python scripts/security_check.py --store "$env:APPDATA\llm-router\store.db" \
 | `cargo check --all-targets` | **0 warning** |
 | 前端单测 | **49/49** |
 | `npm run build` | 通过（33 modules，gzip **64.24 kB**） |
-| 提交 | **口径与任务卡** `464f42c`（02 §7.5 + §13 v0.25 + 03 T19 卡片）· **代码** `4b6f0ee`（通知模块 + 3 个 IPC + 前端区块 + 测试）· **留档与账本**（本文件 + HANDOFF，提交号见 `git log`） |
+| 提交 | **口径与任务卡** `464f42c`（02 §7.5 + §13 v0.25 + 03 T19 卡片）· **代码** `4b6f0ee`（通知模块 + 3 个 IPC + 前端区块 + 测试）· **留档与账本** `581de44`（本文件 + HANDOFF） |
