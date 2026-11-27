@@ -1,7 +1,7 @@
 # T18 站点插件 ×2 —— 验收留档
 
 > 任务卡：`docs/planning/03-delivery-plan.md` §2「**T18 站点插件 ×2**」
-> 口径：`docs/planning/02-technical-design.md` §7.4（+ §13 v0.19 / **v0.20 真机修订**）
+> 口径：`docs/planning/02-technical-design.md` §7.4（+ §13 v0.19~**v0.24**）
 > 日期：2026-11-27　·　分支：`dev` → `main`
 > 声明：本卡只动「站点插件」这一层（插件机制 / 两个内置站点 / 浏览器辅轨 / 积分回写 / UI 入口），
 > **不含**通知（T19）、批量编排 UI、辅轨分发形态。
@@ -22,11 +22,13 @@
 | 积分三处落点（返回值 / `reward_json` / `account.quota_json`） | ✅ 已验证（mock 上游） | §4.1 e2e |
 | 积分回写对**真实站点** | ❌ **未验证**（真机当天已领过 → 本次无新增积分） | §5 |
 | MiniMax Code **真签到成功** + 签到入口定位 + 每日积分口径 | ✅ **已验证** | §4.2 ⑦⑧⑨ |
-| ModelScope **真签到成功** + 魔粒字段路径 | ❌ **未验证**（缺网页会话 Cookie） | §5 |
+| ModelScope **真签到成功** + 魔粒字段形状 | ✅ **已验证**（访问令牌 → 200 / 277 ms / 落库 `ok=1`） | §4.2 ⑩ |
+| ModelScope **「本次到账 > 0」分支**（差值 > 0） | ❌ **未验证**（真机当天已领过 → 差值 = 0） | §5 |
 
 **一句话**：链路、断言、分类、密文边界、辅轨、积分回写**全部打通并实测**；
-**MiniMax Code 的成功路径已跑通**（登录 → 打开签到面板 → 判「今天已领」→ 落库 `ok=1`，4307 ms）；
-剩下的是 **ModelScope 的成功路径**——只差头头的**网页会话 Cookie**（§6 提问）。
+**两个站点的成功路径都跑通了**——MiniMax Code（登录 → 打开签到面板 → 判「今天已领」→ 落库 `ok=1`，4307 ms）、
+ModelScope（**访问令牌** → `Cookie: m_session_id=<令牌>` → 200 / `Success=true` / 277 ms → 落库 `ok=1`）；
+剩下的是**「本次到账 > 0」那条分支**（真机当天已领过 → 差值 = 0）与 MiniMax 的 `/signin/claim` 响应体。
 
 ---
 
@@ -215,6 +217,40 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 
 - 截图：`docs/reviews/app-ui-t18-signin-success.png`（成功提示 + 最近执行记录 + 调度表「最近：成功」）。
 
+**⑩ ModelScope 真签到成功（第三轮，2026-11-27）—— 登录态口径从「手抄 Cookie」改成「访问令牌」**
+
+- **头头的反馈**：「cookies 只能手动输入吗？这样很不友好，并不是所有人都会获取 cookies」→ 口径改成**访问令牌**（魔搭 → 个人中心 → 访问令牌 → 点一下复制，`ms-` 开头）。
+- **两条走不通的路（都不内置，已在同轮撤销实现）**：
+  - 「让应用开浏览器自动登录魔搭」→ 真机实测：Chrome 顶部挂着「**自动测试软件正在控制 Chrome**」，登录框报 **`验证失败，点击框重试（error:22phmt）`**、**滑块根本没渲染**——魔搭的人机验证**专门拦自动化浏览器**；而**反检测 / 绕验证码是 AGENT.md §5.7 红线**；
+  - 「浏览器接管会话」（辅轨开浏览器 → 用户登录 → 把 Cookie 取回来）→ **凡是我们能读 Cookie 的浏览器都是被自动化控制的浏览器**，登录同样过不了人机验证 → 整套实现（辅轨 `session` 动作、`run_secret`、IPC、前端按钮）**已全部删除**。
+- **正解（第三方魔搭签到脚本的实测口径）**：**开放平台访问令牌可以直接当网页会话用**——`Cookie: m_session_id=<ms-令牌>` → `GET /api/v1/users/login/info` 即触发当日签到；**同一个令牌也是 `/openapi/v1/*` 的 Bearer** → **一个令牌，签到 + 魔粒全包**。
+- **真机结果**（走应用内 `scheduler::run_now`，与 UI「立即执行」同一条路径）：
+
+  ```
+  ok=true class=success status=Some(200) elapsed_ms=277
+  message=ModelScope 签到成功
+  ```
+
+  落库 `checkin_result` id=10 `ok=1`（后续复核行 id=13：`ModelScope 签到成功（今天已领过：当日每日签到魔粒 200，本次没有新增）`）。
+- **魔粒流水的真实形状**（`GET /openapi/v1/magicubes/transactions` → **200**）：
+
+  ```json
+  {"data":{"page":1,"page_size":20,"total":3,"records":[
+    {"type":"EARN","rule_key":"daily_active","total_amount":200,"count":1,"expire_days":1,"days_remaining":1,"category_key":"daily","gmt_created":"2026-11-27"},
+    {"type":"EARN","rule_key":"infocomplement_profile_experience","total_amount":50,"count":1,"expire_days":90,"gmt_created":"2026-11-27"},
+    {"type":"EARN","rule_key":"infocomplement_email_verification","total_amount":50,"count":1,"expire_days":90,"gmt_created":"2026-11-27"}
+  ]},"request_id":"…","success":true}
+  ```
+
+  → **金额字段 = `total_amount`**（不是 `amount`/`points`）、**日期字段 = `gmt_created`**（**只有日期**）、**类型 = `type`**、**规则 = `rule_key`**；
+  → **只有 `daily_active` 是「每日签到」那一笔**（当日 200 魔粒）；另两条是**一次性资料奖励**（各 50），**不算进签到奖励**；
+  → **网页会话 Cookie 也能开 `/openapi/v1/*`**（与 Bearer 回**同一份**流水）。
+- **奖励口径改成「签到前后差值」**：站点**不返回**「今日魔粒 / 今天已领」信号（签到响应体只是用户资料：`Code`/`Data`/`Message`/`RequestId`/`Success`，`Data` 里含 `GitlabAccessToken` 等敏感字段 → **插件不存响应体**），而当日那条 `daily_active` 流水**整天都在** → 只有**差值**才是「本次拿到」：
+  - 差值 > 0 → `points = 本次差额`、**回写额度池**；
+  - 差值 = 0 → 判**「今天已领过」**、`points = null`、**不回写额度池**（与 MiniMax Code 的口径一致）。
+- **真机当天跑出来的是「已领过」分支**：当日 200 魔粒在探针首次触发签到时就已入账 → 差值 = 0 → `ModelScope 签到成功（今天已领过：当日每日签到魔粒 200，本次没有新增）`、**`reward_json = NULL`**（**不重复计数**）。
+- **环境备注**：本机 `SetCursorPos` 被环境屏蔽（光标坐标被钉死，UI 自动化点不动按钮）→ 真机验证改走 `scheduler::run_now`（**与 UI「立即执行」同一条路径**，含落库与额度回写），不用手点。
+
 ### 4.3 真机揪出并修掉的 8 个 bug
 
 **第一轮（失败路径阶段）**
@@ -242,12 +278,12 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 
 | # | 未验证项 | 需要什么 | 解锁后要回填什么 |
 |---|---|---|---|
-| ① | ModelScope **真签到成功** | 一次 `modelscope.cn` 登录态的 **Cookie 请求头** | 成功响应体形状 + **魔粒字段路径**（当前是候选路径 `data.points`/`data.balance`/`data.magicubes`/`data.total`/`points`/`balance`，站点配置 `reward.path` 可覆盖） |
+| ① | ModelScope **「本次到账 > 0」分支**（差值 > 0） | 一个**还没签到过**的当天 | 真机当天**已领过**（当日 200 魔粒已在流水里）→ 实测跑的是**差值 = 0 → 判「今天已领过」**；**差值 > 0** 要等**次日首次运行**才验（届时应得 `points = 200` + 回写额度池） |
 | ② | MiniMax Code **`/signin/claim` 真正领取的响应体** | 一个**还没领过**的当天 | claim 响应体形状（积分/天数字段名）+ **领取按钮的真实文案**（现在是候选：`立即签到`/`去签到`/`签到领取`/`领取奖励`/`立即领取`/`领取`） |
 | ③ | 积分回写对**真实站点** | ①或②任一**真正拿到积分**即可 | `account.quota_json` 的真实 `points` 值 + `updated_at`（当前真机那次回写为 0——已领过 → 本次无新增积分，`quota_json` 保持 `{}`） |
 | ④ | MiniMax Code **签到按钮禁用态之外的状态枚举** | 一个还没领过的当天 | `status` 字段其余取值（现在只实测到 `3` = 已领取） |
 
-> 02 §7.4 §5 的「未验证项」清单与本表一致。**已收敛**：签到入口 DOM（→ 用户头像下拉「每日签到」）、每日积分与连签天数（→ 每日 400、第 4/7 天各 1000，实测第 7 天）。
+> 02 §7.4 §5 的「未验证项」清单与本表一致。**已收敛**：签到入口 DOM（→ 用户头像下拉「每日签到」）、每日积分与连签天数（→ 每日 400、第 4/7 天各 1000，实测第 7 天）、**ModelScope 真签到成功 + 魔粒字段形状（→ `total_amount` / `gmt_created` / `rule_key`，当日 200 魔粒）**。
 
 ---
 
@@ -255,7 +291,7 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 
 1. **辅轨依赖 Node 运行时 + `sidecar/` 的 `npm install`**——「开箱即用」的打包分发形态**不在本卡**（02 §7.4 §5 已写明）。
 2. **MiniMax Code 走浏览器** → 关掉应用时靠**系统计划任务**兜底（T17）唤起 `--checkin-once`，此时会**再拉一次浏览器**（约 3~5 s）。
-3. **ModelScope 的开放平台 Bearer token 是可选的**——没有它**签到仍然成功**，只是拿不到魔粒（渐进增强，不因查不到积分判失败）。
+3. **ModelScope 的凭据是「访问令牌」**（`ms-…`，个人中心 → 访问令牌 → 点一下复制）——**同一个令牌既是网页会话（`m_session_id`）又是 `/openapi/v1/*` 的 Bearer**；**手抄 Cookie 头那条路保留**（备选/排障），但不再是推荐路径。**拿不到魔粒不影响签到成功**（渐进增强，不因查不到积分判失败）。
 4. **积分是「本次拿到了多少」的快照**，**不是账户余额真值**（余额由取数方负责）；`quota_json` 里与限额字段**并存**，互不覆盖。
 5. **`reward.raw` 只留数值与布尔**——站点响应里若有字符串型积分说明，会被丢掉（防密文落库）。
 6. **浏览器 profile 里的凭证由浏览器自己加密保管**（DPAPI/Keychain），**应用不读、不导、不入库、不进 IPC**（AGENT.md §5.3 约束的是我们的存储路径）。
@@ -270,8 +306,8 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 
 | 项 | 结果 |
 |---|---|
-| `cargo test --all-targets` | **444 项全绿**（369 单元 + 75 e2e），4 ignored，0 失败，0 编译告警 |
-| `npm run build` | 通过（32 modules，gzip 62.73 kB） |
+| `cargo test --all-targets` | **449 项全绿**（373 单元 + 76 e2e），4 ignored，0 失败，0 编译告警 |
+| `npm run build` | 通过（32 modules，gzip 62.78 kB） |
 | 前端单测 | checkin **29/29**；全部 **44/44** |
 | 编译告警 | `cargo check --all-targets` **0 warning** |
 | `node --check sidecar/index.mjs` | 通过 |
