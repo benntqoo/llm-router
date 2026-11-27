@@ -141,6 +141,15 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 
 **T19 通知** `1d` · 依赖 T16
 - 系统通知 + webhook（企微/飞书/Telegram 任选）。验收：失败通知含站点名与原因。
+- **卡片补全（2026-11-27，头头批准开卡前补）**：口径见 02 §7.5（§13 v0.25）。
+  - **触发**：落点 = `scheduler::run_site` 之后（**结果已落库之后**）→ 一处覆盖**四条路径**（应用 tick / UI 立即执行 / CLI `--checkin-once` / **Windows 计划任务，应用关闭时**）；**成功与失败都通知**（失败**永远**通知 = §5.7「撞到验证码 = 失败并通知」；成功可关）。
+  - **内容**：标题 `签到成功/失败 · {站点名}`，正文含**分类 + 中文原因**（+ 成功时的本次到账）；**零敏感信息**（不带凭据 / 响应体）。
+  - **通道**：系统通知（`notify-rust`——**CLI 与计划任务路径没有 Tauri app handle**，刻意不用 Tauri 通知插件）+ webhook（**企微 / 飞书 / Telegram** 三种群机器人格式）。
+  - **配置**：`app_setting` 只存非密文项（总开关 / 成功也通知 / 类型 / **凭据 id** / Telegram chat_id）；**webhook 地址与 bot token 进保险库**（`kind='webhook'`，挂占位渠道「通知」），**零明文**、不回显 IPC。
+  - **失败**：通知发不出去**不影响签到结果**（只记日志、不重试、不回显 URL）。
+  - **验收判据（本卡）**：① 成功通知含**站点名**与本次到账；② 失败通知含**站点名与原因**；③ **应用关闭时**（计划任务路径）也能通知；④ webhook 地址在库 / WAL / SHM / 保险库**四层扫描零明文**；⑤ 通知失败**不影响** `checkin_result` 落库。
+  - **边界（不做）**：邮件 / 短信 / 钉钉 / 企微**应用**消息、通知历史与已读状态、模板自定义、@人。
+- **落地（2026-11-27）**：**M3 第五张卡**（M3 判据的最后一环）。新增 `checkin::notify`（配置 / 文案 / 三种 webhook 请求体 / 系统通知 / 错误脱敏）+ `checkin::system_notify`（**Windows AUMID 注册**）+ `commands::notify`（**3 个 IPC**：`notify_get_config` / `notify_set_config` / `notify_test`）+ 前端「**结果通知（T19）**」区块。**落点 = `scheduler::run_site` 之后**（结果已落库才通知）→ 一处覆盖四条路径；**失败永远通知**、成功可关；**通知失败不影响签到结果**（只记日志、不重试）。**通道决策**：系统通知用 **`notify-rust`**（**刻意不用 Tauri 通知插件**——CLI 与计划任务路径**没有 app handle**，用插件就覆盖不了「应用关闭时也通知」）。**密文边界**：webhook 地址 / bot token 进**保险库**（`kind='webhook'`，挂占位渠道「通知」），`app_setting` 只存**凭据 id**；IPC 只回「配没配」；**reqwest 错误一律归一成不含地址的一句话**。**真机证据**：① 本地接收器（`POST /hook` + 上游 401）收到**企微形状**原文——含**站点名 + 分类 + 原因**、**零密文**；② **Windows 计划任务路径（应用完全关闭）真机送达**：`schtasks /run` → `Last Run Time 12:13:38` → 接收器**同时**收到通知体 + `checkin_result` 新增 id=19 → **判据 ③ 有真机证据**（计划任务 `Last Result = 1` = **签到失败**，不是任务挂了；T17 退出码契约 0/1/2）；③ **真机全库四层扫描**（`scripts/security_check.py` 带 webhook 明文做 `--secret`）→ **明文凭证命中 0 条、退出码 0**；④ AUMID 注册落地（开始菜单 `LLM Router.lnk`）。**真机揪出并修掉**：① **toast「已发送」但屏幕什么都没有** → 根因是**非 powershell 进程冒用 PowerShell 的 AUMID 会被 OS 静默丢弃**（API 仍返回成功）→ 自建 AUMID + COM 注册开始菜单快捷方式 + 写 `System.AppUserModel.ID`；② reqwest 错误**带出地址** → 统一脱敏。回归 `cargo test --all-targets` → **458 项全绿**（0 失败 / 4 ignored / 0 编译告警）；前端 **49/49**；`npm run build` 通过（33 modules，gzip 64.24 kB）。**仍未验证**：**系统通知横幅肉眼可见**（本机 GDI/DXGI 都取不到 shell 合成层，**连 PowerShell 原生 toast 也不显示** → 疑似系统层面拦截，待目视确认）与**真实企微/飞书/Telegram 群机器人**（待头头给地址，当密文进保险库）。留档 `docs/reviews/T19-notification.md`。
 
 > M3 合计 ≈ 9.5d（约 2 周）。
 
