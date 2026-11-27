@@ -251,6 +251,20 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 - **真机当天跑出来的是「已领过」分支**：当日 200 魔粒在探针首次触发签到时就已入账 → 差值 = 0 → `ModelScope 签到成功（今天已领过：当日每日签到魔粒 200，本次没有新增）`、**`reward_json = NULL`**（**不重复计数**）。
 - **环境备注**：本机 `SetCursorPos` 被环境屏蔽（光标坐标被钉死，UI 自动化点不动按钮）→ 真机验证改走 `scheduler::run_now`（**与 UI「立即执行」同一条路径**，含落库与额度回写），不用手点。
 
+**⑪ 两站已启用 + 系统兜底任务真机验证（2026-11-27）**
+
+- 头头决定「**两站都启用**」→ `checkin_site.enabled = 1`：ModelScope `0 9 * * *`（每天 09:00）、MiniMax Code `20 8 * * *`（每天 08:20）。
+- **Windows 计划任务各注册一个**（02 §7.2.1 §4 的口径）：
+
+  | 任务名 | 动作 | 频率 |
+  |---|---|---|
+  | `LLM Router Checkin - site_182212017abbf1808375126911d9c85d` | `"…\target\debug\llm-router.exe" --checkin-once --site site_1822…` | 每天 09:00 |
+  | `LLM Router Checkin - site_be349863212e1e94368062b134468038` | `"…\target\debug\llm-router.exe" --checkin-once --site site_be34…` | 每天 08:20 |
+
+- **整链真机验证（应用关着跑的）**：把应用**完全停掉**（只剩计划任务能触发）→ 临时把 ModelScope 的 cron 调到当前分钟 → `schtasks /run` → 任务 **11:44:56** 自动触发 → 真实打到 `www.modelscope.cn` → 落库 `checkin_result` **id=15 `ok=1`** → 任务 **Last Result: 0** → 随后 cron 还原为每天 09:00。
+- **去重口径复验**：当天这一周期已跑过时，任务照样跑成功（exit 0）但**不重复打上游**（`本周期已跑过`）——应用重启后的每分钟 tick 同理（两站都已启用，重启后未产生新的结果行）。
+- **已知限制**：任务动作指向**开发态二进制** `src-tauri/target/debug/llm-router.exe` → `cargo clean` / 删掉 `target/` 会让任务失效（**本项目还没有安装版可指**，分发形态不在本卡）；Windows 计划任务默认「**仅当用户登录时运行**」——注销状态下不会触发（补签靠应用启动时的同一套判定）。
+
 ### 4.3 真机揪出并修掉的 8 个 bug
 
 **第一轮（失败路径阶段）**
