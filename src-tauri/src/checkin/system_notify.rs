@@ -13,6 +13,35 @@
 /// 注册用的 AUMID（**与 toast 里报的名字一致**）。
 pub const AUMID: &str = "LLM Router";
 
+/// **纯函数**：全局通知开关关着时该报什么（`None` = 照常发送）。
+///
+/// 真机踩过（2026-11-27）：Windows 的**全局通知总开关**关着时，**所有** toast 都会被
+/// **静默丢弃**——`notify-rust` 照样返回成功，日志写着「已发送」，屏幕上什么都没有。
+/// 事件日志 `Microsoft-Windows-PushNotification-Platform/Operational` 里记着
+/// `Id=3150 … PolicyReason [GlobalSettingDisabled]`。
+/// → 发送前先查开关，**如实报告**，别让用户以为已经提醒过了。
+pub fn global_block_reason(global_enabled: Option<bool>) -> Option<&'static str> {
+    match global_enabled {
+        Some(false) => Some("Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试"),
+        _ => None,
+    }
+}
+
+/// Windows 的**全局通知总开关**（`HKCU\…\CurrentVersion\PushNotifications\ToastEnabled`）。
+///
+/// - `Some(true)` = 开着；`Some(false)` = **全局关着**（toast 会被静默丢弃）；
+/// - `None` = **读不到**（键不存在 / 非 Windows）→ 按「开着」处理，不拦。
+pub fn global_toasts_enabled() -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        imp::global_toasts_enabled()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
 /// 确保当前 exe 拥有这个 AUMID（**Windows 专有**；其他平台直接返回 `Ok`）。
 ///
 /// 返回**快捷方式路径**（便于日志与排查）。
@@ -31,11 +60,14 @@ pub fn ensure_aumid(app_id: &str) -> Result<Option<String>, String> {
 #[cfg(target_os = "windows")]
 mod imp {
     use windows::core::{Interface, HSTRING, PCWSTR};
-    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::Foundation::{ERROR_SUCCESS, PROPERTYKEY};
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
     };
     use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
@@ -100,5 +132,54 @@ mod imp {
             outcome?;
         }
         Ok(lnk.to_string_lossy().to_string())
+    }
+
+    /// 读 `HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications\ToastEnabled`。
+    ///
+    /// **这个开关是「全局」的**——关着时**所有**应用的 toast 都被 Windows 静默丢弃
+    /// （事件日志 `Id=3150` / `PolicyReason [GlobalSettingDisabled]`），
+    /// 而 `notify-rust` 照样返回成功。
+    ///
+    /// **注意**：改完这个开关**必须重启 `WpnUserService_<sid>`**（或注销重登）才生效——
+    /// 通知平台服务会把策略**缓存**在内存里（真机踩过：连改两次注册表都没变化）。
+    pub fn global_toasts_enabled() -> Option<bool> {
+        let subkey = HSTRING::from("Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications");
+        let value = HSTRING::from("ToastEnabled");
+        let mut data: u32 = 0;
+        let mut size: u32 = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR::from_raw(subkey.as_ptr()),
+                PCWSTR::from_raw(value.as_ptr()),
+                RRF_RT_REG_DWORD,
+                None,
+                Some(&mut data as *mut u32 as *mut std::ffi::c_void),
+                Some(&mut size),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        Some(data != 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_disabled_global_switch_is_reported_instead_of_a_false_success() {
+        assert_eq!(
+            global_block_reason(Some(false)),
+            Some("Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试")
+        );
+    }
+
+    #[test]
+    fn an_enabled_or_unknown_global_switch_does_not_block() {
+        assert_eq!(global_block_reason(Some(true)), None);
+        assert_eq!(global_block_reason(None), None);
     }
 }

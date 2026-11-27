@@ -291,6 +291,16 @@ fn ensure_aumid_once() -> Result<(), String> {
 
 /// 发系统通知（**独立于 Tauri 运行时**）。
 fn send_system(notification: &Notification) -> ChannelResult {
+    // **全局通知开关关着时，Windows 会静默丢弃 toast**（`notify-rust` 照样返回成功）。
+    // 真机踩过：日志写「已发送」、屏幕上什么都没有 → 发送前先查开关，**如实报告**。
+    let global = crate::checkin::system_notify::global_toasts_enabled();
+    if let Some(reason) = crate::checkin::system_notify::global_block_reason(global) {
+        return ChannelResult {
+            channel: "系统通知".to_string(),
+            ok: false,
+            detail: reason.to_string(),
+        };
+    }
     // 先注册 AUMID（注册失败也要继续发——大不了被系统丢掉）
     let aumid = ensure_aumid_once();
     let mut toast = notify_rust::Notification::new();
