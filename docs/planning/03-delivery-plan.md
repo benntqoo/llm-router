@@ -158,6 +158,15 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 **T20 Copilot OAuth** `2d` · 依赖 T2
 - device flow、`ghu_` token 存 vault、copilot token 换取与 30min 刷新（02 §6.2 四步）。
 - 验收：全流程单测 + 手动一次真实授权。
+- **卡片补全（2026-11-27，头头批准开卡前补）**：口径见 02 §6.2 + **§6.2.1**（§13 v0.27）。
+  - **触发**：用户在 UI 点「GitHub Copilot → 设备授权」→ 后端发起 device flow；**前端按 `interval` 轮询后端**，后端**不做后台长任务**（应用关掉即中断，属正常——重新发起即可）。
+  - **四步**：① `POST /login/device/code`（`client_id` + `scope=read:user`）→ `user_code` / `verification_uri` / `interval`(5s) / `expires_in`(900s)；② UI 显示 `user_code` 与验证网址，**用户自己在浏览器输入并确认**；③ 轮询 `POST /login/oauth/access_token` → GitHub token（`ghu_`，长期）；④ `GET https://api.github.com/copilot_internal/v2/token` → Copilot token（~25~30min）。
+  - **`device_code` 不出后端**：后端内存保存会话，IPC 只回 `flow_id` + `user_code` + `verification_uri` （`device_code` 是能换出 token 的凭据，**不进 IPC**）。
+  - **存储**：GitHub token → 保险库 `kind='oauth_gh_token'`；Copilot token → 保险库 `kind='oauth_copilot_token'` + `expires_at`；**零明文**、不回显、不进日志。
+  - **刷新**：过期前 **5 min** 自动重取（`ensure_fresh()`；adapter 侧由 **T21** 调）。
+  - **合规与风险**：`/copilot_internal/v2/token` 是**社区观察到的内部端点**（GitHub 未公开承诺稳定）；走 **GitHub 官方** device flow，**不做**指纹伪造/验证码绕过/签名伪造（§5.7）。
+  - **验收判据（本卡）**：① device flow 单测（**本地 mock 上游，不出网**）；② 轮询状态机单测（pending / slow_down / expired / denied / success）；③ Copilot token 换取 + 过期刷新单测；④ 凭证落库**四层零明文**；⑤ **手动一次真实授权**（真机走完 ①~④，拿到 GitHub token + Copilot token）。
+  - **边界（不做）**：出站 `/chat/completions` 转发与 **R-6 伪装头**（属 **T21**）；**ToS 确认弹窗与启用开关**（属 **T24**；本卡的 Copilot 渠道**默认关闭** `enabled=0`）；模型目录拉取（属 T21）。
 
 **T21 Copilot 出站适配 + 实测** `2d` · 依赖 T20 T6
 - R-6 伪装头（以参考仓库源码核实固化）、出站转发、实测矩阵第 8 列。

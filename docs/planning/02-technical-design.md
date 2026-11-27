@@ -455,6 +455,43 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 
 **合规声明（必须写进 UI 首次启用弹窗）**：将 Copilot 额度用于第三方客户端违反 GitHub Copilot ToS，账号可能受限。用户显式确认后才启用。
 
+#### 6.2.1 协议细节与口径（T20 落地，2026-11-27 核实）
+
+**外部事实**（多个社区实现一致：opencode-github-copilot / corvus / xcodeai / zeroclaw-providers / synaps-core）：
+
+| 项 | 值 |
+|---|---|
+| OAuth client_id | `Iv1.b507a08c87ecfe98`（VS Code Copilot 的**公开** client_id，**不是密钥**，用户无须填） |
+| scope | `read:user`（最小权限） |
+| ① device code | `POST https://github.com/login/device/code`（`Accept: application/json`、`Content-Type: application/x-www-form-urlencoded`、`User-Agent: GitHubCopilotChat/…`）→ `device_code` / `user_code` / `verification_uri` / `interval`（**默认 5 s**）/ `expires_in`（**默认 900 s**） |
+| ③ 轮询 | `POST https://github.com/login/oauth/access_token`（`grant_type=urn:ietf:params:oauth:grant-type:device_code`）→ `access_token`（**`ghu_` / `gho_` 前缀，长期有效**） |
+| ④ token 换取 | `GET https://api.github.com/copilot_internal/v2/token`（`Authorization: token <gh_token>`）→ `{ token, expires_at, endpoints }`（`expires_at` 是 **float** Unix 秒；`endpoints.api` 可能给出**该账号实际要用的 API 域名**） |
+| 出站 base | 默认 `https://api.githubcopilot.com`（**若换取响应给了 `endpoints.api` 则以它为准**） |
+
+**轮询状态机**（GitHub 的 device flow 错误码）：
+
+| 返回 | 含义 | 处理 |
+|---|---|---|
+| `authorization_pending` | 用户还没在浏览器点确认 | 等 `interval` 秒再轮询 |
+| `slow_down` | 轮询太快 | 间隔 **+5 s** |
+| `expired_token` | `device_code` 过期（900 s） | 让用户重新发起 |
+| `access_denied` | 用户拒绝授权 | 结束并提示 |
+| 有 `access_token` | 授权成功 | 换 Copilot token |
+
+**存储与刷新**：
+
+- **GitHub token（长期）** → **保险库**，`credential.kind = 'oauth_gh_token'`（**零明文**、不回显、不进日志）；
+- **Copilot token（约 25~30 min）** → **保险库** `credential.kind = 'oauth_copilot_token'` + **`expires_at` 精确到秒**（§9 的列已就位），**另加进程内缓存**（避免每次出站都解密）；
+- **刷新**：过期前 **5 min** 自动重取（`ProviderAdapter::refresh()` 由 **T21** 的 adapter 调用；本层提供 `ensure_token()`——缓存命中就用，否则用保险库里的 GitHub token 重取）。
+
+**边界与风险（必须写进 UI 与留档）**：
+
+- `/copilot_internal/v2/token` 是**社区观察到的内部端点**，GitHub **未公开承诺稳定** → 可能随时变更或撤销（参考实现普遍在注释里声明这一点）；
+- **不做**指纹伪造、验证码绕过、签名伪造（AGENT.md §5.7）——设备流是 **GitHub 官方 OAuth**，走官方路径；
+- **本卡只取凭证**：出站 `/chat/completions` 转发与 **R-6 伪装头**（`Editor-Version` / `Editor-Plugin-Version` / `Copilot-Integration-Id` / `User-Agent`）属 **T21**；
+- **合规**：Copilot 渠道**默认关闭**（`enabled = 0`），**首次启用的 ToS 确认弹窗属 T24**（AGENT.md §5.5）——本卡不提供启用开关。
+
+
 ### 6.3 WorkBuddy（登录态型）
 
 **本机实测（2026-11-25，只读扫描）：**
@@ -1359,3 +1396,4 @@ python scripts/security_check.py `
 | v0.24 | 2026-11-27 | T18 **ModelScope 真签到 + 魔粒字段形状实测收敛**：① **真签到成功**——访问令牌 → `Cookie: m_session_id=<令牌>` → `GET /api/v1/users/login/info` **HTTP 200**、`Success=true`、`Message="success"`，**277 ms**，**落库 `ok=1`**（走应用内 `scheduler::run_now`，与 UI「立即执行」同一条路径）；② **魔粒流水真实形状收敛**——`data.records[]`，金额字段 = **`total_amount`**（不是 `amount` / `points`）、日期字段 = **`gmt_created`**（**只有日期、没有时分秒**）、类型 = `type=EARN` + 规则 = `rule_key`；当日实测三条：`daily_active` **200** + `infocomplement_profile_experience` 50 + `infocomplement_email_verification` 50 → **只有 `daily_active` 是「每日签到」那一笔**（另两条是一次性资料奖励，不算进本次签到）；③ **奖励口径改为「签到前后差值」**——签到前取当日 `daily_active` 总额作基线、签到后再取一次，**差值 > 0 才是本次到账**；差值 = 0 → 判**「今天已领过」**（`points = null`、**不回写额度池**，与 §3 MiniMax 口径一致）——因为当日那条流水**整天都在**，直接取当日总额会让**同一天的第 2、3 次运行**被当成新到账、**额度池重复计数**；④ **网页会话 Cookie 也能开 `/openapi/v1/*`**（与 Bearer 回同一份流水）；⑤ **签到接口的响应体只是用户资料**（含 `GitlabAccessToken` 等敏感字段）→ 插件**不存响应体**（`body_preview` 留空），站点也**不提供「今日魔粒 / 已领」信号**；⑥ **§5 未验证项收敛**：ModelScope 只剩「差值 > 0 分支待次日首次运行」；⑦ **环境提示**：本机 `SetCursorPos` 被环境屏蔽（光标坐标钉死）→ UI 自动化点不动按钮，改走 `scheduler::run_now` 做真机验证 |
 | v0.25 | 2026-11-27 | T18/M3 **通知卡（T19）**：① **新增 §7.5 通知口径**——落点 = `scheduler::run_site` 之后（**结果已落库之后**），一处覆盖**四条执行路径**（应用 tick / UI 立即执行 / CLI `--checkin-once` / **Windows 计划任务（应用关闭时）**）；**成功与失败都通知**（失败永远通知 = §5.7「撞到验证码 = 失败并通知」落地，成功可关）；文案**必含站点名与原因**，零敏感信息（不带凭据/响应体）；② **系统通知用 `notify-rust`**——**刻意不用 Tauri 通知插件**：CLI / 计划任务路径**没有 Tauri app handle**，用插件就只能在应用开着时通知，**覆盖不了「应用关闭时」**这条 M3 判据；③ **Webhook 三种格式**（企微群机器人 / 飞书群机器人 / Telegram Bot）共用一个配置，Telegram 另需 `chat_id`；④ **配置落点**：`app_setting` 只存**非密文**项（总开关 / 成功也通知 / 类型 / **凭据 id** / chat_id），**webhook 地址与 bot token 进保险库**（`kind='webhook'`，挂占位渠道「通知」——`credential.channel_id` 是 NOT NULL 外键），**零明文**：不落设置表、不进日志、不回显 IPC；⑤ **通知失败不影响签到结果**（只记日志、不重试、不回显 URL）；⑥ **边界**：不含邮件/短信/钉钉/通知历史/模板自定义；系统通知依赖 OS 通知权限，Telegram 在网络受限区域不可达 |
 | v0.26 | 2026-11-27 | T19 **系统通知「静默丢弃」的根因与如实报告**（头头反馈「屏幕上没有」后查出来的）：① **新增 §7.5 §6**——Windows 的 toast 有**两层**独立的静默拦截，任一层挡住都**静默丢弃**（`notify-rust` 照样返回成功、日志写着「已发送」、屏幕上什么都没有）：**① 调用进程没有对应 AUMID**（Windows 10 1607+ 要求进程拥有 `System.AppUserModel.ID`）→ 自建 AUMID + COM 注册开始菜单快捷方式；**② 全局通知总开关关着**（`HKCU\…\CurrentVersion\PushNotifications\ToastEnabled = 0`）→ **所有**应用的 toast 都被拦；② **根因定位方法（别再走错路）**：事件日志 `Microsoft-Windows-PushNotification-Platform/Operational` 的 `Id=3150 … PolicyReason [GlobalSettingDisabled]` 是决定性证据；**别的应用同样中招** → 所以「连 PowerShell 原生 toast 也不显示」是**同一个全局开关**，**不是** AUMID 问题；③ **两个坑**：改完注册表**必须重启 `WpnUserService_<sid>`**（或注销重登）才生效——通知平台服务把策略**缓存**在内存里（连改两次注册表、当场重发都还是被拦）；④ **投递成功的判据**（比「API 返回成功」可靠）：事件日志出现 `Id=3153 Toast … is delivered to <AUMID> on session N`，且通知库 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表里有对应 payload（**被丢弃的 toast 从不入库**）；⑤ **代码侧补「如实报告」**：发送前读全局开关（`system_notify::global_toasts_enabled` + 纯函数 `global_block_reason`），关着就报「Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试」，**不再谎报「已发送」** |
+| v0.27 | 2026-11-27 | M4 **T20 Copilot OAuth（卡片补全 + 协议细节）**：① **新增 §6.2.1**——把 §6.2 的四步落成**可实现的协议细节**：client_id `Iv1.b507a08c87ecfe98`（VS Code 的**公开** client_id，**不是密钥**、用户无须填）、scope `read:user`、三个端点、轮询错误码状态机（`authorization_pending` / `slow_down`(+5s) / `expired_token` / `access_denied` / 成功）、Copilot token 响应形状 `{token, expires_at(float), endpoints}`（**`endpoints.api` 以它为准**）；② **存储口径**：GitHub token（长期）→ 保险库 `kind='oauth_gh_token'`；Copilot token（~25~30min）→ 保险库 `kind='oauth_copilot_token'` + `expires_at`（§9 的列）+ 进程内缓存，**过期前 5 min 自动重取**；③ **风险声明**：`/copilot_internal/v2/token` 是**社区观察到的内部端点**，GitHub 未公开承诺稳定 → 可能随时变更；④ **边界**：本卡**只取凭证**——出站转发与 R-6 伪装头属 **T21**，**ToS 确认弹窗与启用开关属 T24**（渠道**默认关闭** `enabled=0`，AGENT.md §5.5）；⑤ **合规**：走 GitHub **官方** device flow，**不做**指纹伪造/验证码绕过/签名伪造（§5.7） |
