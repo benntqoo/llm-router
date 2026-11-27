@@ -119,6 +119,8 @@ src-tauri/src/
 仓库根目录另有运维脚本（**不进应用二进制**，只用于验证与文档生成）：
 
 ```
+sidecar/                 # 浏览器辅轨 sidecar（02 §7.4 §3）：Node + Playwright，
+                         #   持久化 profile 复用登录态，跑 MiniMax Code 签到
 scripts/
   channel_matrix.py     # 渠道实测矩阵执行器（02 §10.1）：经网关跑 6 项，产出 docs/reviews/channel-matrix-*.md
   pi_models.py          # 生成 pi 的 models.json / settings.json 片段（02 §6.5），别名从应用库直读
@@ -772,6 +774,100 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 - 站点插件默认全关，启用即视为用户知晓自动化签到可能违反站点条款。
 - 不内置任何"反风控"能力（不伪造指纹、不绕验证码；撞到验证码即失败并通知）。
 
+### 7.4 站点插件口径（T18 落地）
+
+**1. 插件机制（`checkin_site.plugin` 的取值与分派）**
+
+- `plugin` 是**站点类型**，决定「这次签到怎么打」：
+
+  | 取值 | 来源 | 执行方式 |
+  |---|---|---|
+  | `har` | 用户自建（T15 导入模板） | 走 **T16 重放引擎**（`checkin::replay`） |
+  | `modelscope` | **内置**（T18） | 走 **`checkin::sites::modelscope`**：接口固定、断言固定、用户只提供登录态 |
+  | `minimax_code` | **内置**（T18） | 走 **`checkin::sites::minimax_code`** → **浏览器辅轨**（`checkin::sidecar`） |
+
+- 内置插件与 HAR 模板**共用同一套结果语义**：分类仍用 02 §7.1.3 §4 的 8 类 `ReplayClass`，`ok = 1` 仅当 `success`，`message` 是可直接用于通知的中文原因。
+- **内置插件带正确的断言**——这正是 T16/T17 留档里那条已知限制的解法（导入模板会带着**录制时的状态码**：ModelScope 匿名态 401 / 真实成功 200，用户必须自己改）。内置插件的断言**随插件发布**，用户不用改。
+- **插件结果可带积分**（`Reward { amount, unit, raw }`）→ 落 `checkin_result.reward_json`（T16 留空的字段，本卡填上）→ 见本节 §4。
+
+**2. ModelScope 插件（内置，接口型）**
+
+- **签到**：`GET https://www.modelscope.cn/api/v1/users/login/info`。
+- **对账**：`GET https://www.modelscope.cn/openapi/v1/magicubes/transactions`（取魔粒余额 / 流水）。
+- **认证**：**两套体系**（**已实测**，2026-11-27 匿名态 + 假凭据探测）——
+  - `/api/v1/*` = **网页会话 Cookie**（签到走这套；与 T15 抓的 HAR 夹具同源）；
+  - `/openapi/v1/*` = **开放平台 Bearer token**（`/openapi/v1/users/me` 的报错原文是 `missing or invalid Authorization header`）——**不是网页 Cookie**。
+- **凭据需求（渐进增强）**：
+  - **网页 Cookie 是必需的**（用户在应用里填 → 进保险库 `credential`，`kind = 'cookie'`；**不落模板、不落库、不进日志**）——**签到靠它**；
+  - **开放平台 Bearer token 是可选的**——**只有它能查魔粒**；没有它时**签到仍然成功**，只是 `reward` 为空（**不因为查不到积分就判签到失败**）；
+  - 是否接受「网页 Cookie 也能开 `/openapi/v1/*`」**待登录态实测**（见 §5）。
+- **接口面（已实测，2026-11-27 匿名态）**：
+
+  | 路径 | 匿名态 | 用途 |
+  |---|---|---|
+  | `GET /api/v1/users/login/info` | **401** `{"Code":10019901001,"Message":"禁止访问","Success":false}` | **触发当日签到** |
+  | `GET /openapi/v1/magicubes/transactions` | **401** `{"success":false,"code":"InvalidAuthentication"}` | 对账（流水） |
+  | `GET /openapi/v1/magicubes/balance` | **401** `{"success":false,"code":"InvalidAuthentication"}` | **魔粒余额**（同样存在，探测得出） |
+  | `GET /api/v1/users/binding` | **200** `{"Code":200,"Data":{…},"Message":"success"}` | 匿名可读——**证明 `/api/v1/*` 成功响应体的形状**：`Code` / `Data` / `Message` / `Success` |
+  | `GET /api/v1/users/me` | 400 `{"Code":10010104001,"Message":"获取用户信息失败…"}` | 存在 |
+
+  不存在的路径回 `404 page not found` → **可以用「401 统一错误体 vs 404」在无登录态时判定接口是否存在**（本卡的接口面就是这么探出来的）。
+- **断言**：判成功必须断言 **JSON 业务字段**，不能只看状态码——
+  - `/api/v1/*` 系列：成功时 `Success == true`（`Code == 200`）；失败时 `Success == false` + `Message` 是中文原因（如「禁止访问」）。
+  - `/openapi/v1/*` 系列：成功时 `success == true`；失败时 `code == "InvalidAuthentication"` + `message`。
+  - 依据：`/api/v1/users/binding` 匿名可读且回 `Success`/`Code` 两套字段 → **`/api/v1/*` 与 `/openapi/v1/*` 是两套不同的响应体约定**。
+- **积分提取的 JSON 路径**：登录态下的成功响应字段名**未实测**（见 §5「未验证项」）。插件内置**默认路径**，并允许站点 `config_json` **覆盖**（`reward.path`）——默认路径等实测后回填。
+
+**3. MiniMax Code 插件（内置，辅轨型）**
+
+- **为什么必须走辅轨（不能走 HAR 主轨）**：其签到接口为 `GET /minimax-cloud/api/v1/signin/status`（读签到面板）与 `POST /minimax-cloud/api/v1/signin/claim`（领取当日奖励），请求带 **OAuth bearer + `x-timestamp` + `x-signature` + `yy`** 等头——**签名每次都变**（客户端公开盐值派生），HAR 模板化无法重放；自己实现签名算法 = **逆向客户端私有协议**，撞 AGENT.md §5.7「不做签名伪造」。**让浏览器自己算签名**（页面自己的 JS 完成）既可行又合规。
+- **辅轨形态**（承 02 §7.1「sidecar 起 Playwright chromium 持久化 profile」）：
+  - `sidecar/`（仓库根，Node 脚本）：`playwright` 驱动**浏览器**跑签到流程，**持久化 profile** 复用登录态；
+  - **浏览器**：优先用**系统 Chrome**（`channel: "chrome"`），没有则回落 Playwright 自带 chromium——**不强制下载 150MB**；
+  - **Rust ↔ sidecar 协议**：**CLI 协议**——Rust 每次调辅轨就**起一个 Node 进程**跑一个动作，
+    **stdout 输出 JSON**，用完即退。比本地 HTTP 更少活动部件：**没有端口占用/冲突、没有孤儿进程、
+    没有"本地 socket 要不要鉴权"的问题**。动作有三个：
+
+    | 动作 | 作用 |
+    |---|---|
+    | `health` | 探活 + 报浏览器可用性 + profile 路径 |
+    | `login` | 拉起**有头**浏览器到登录页，等用户**手动登录**（登录态写进持久化 profile）→ 供一次性交接 |
+    | `checkin` | 打开签到页 → 触发签到 → **从页面自己的网络响应里取结果**（不解析 DOM 里的数字）→ 返回 `{ok, points, day, message}` |
+
+    - **登录态交接**：用户只在浏览器里登录一次，profile 落盘后**之后都是无头运行**；
+    - **超时**：辅轨动作的耗时**不受重放引擎的 30s 限制**（浏览器启动 + 页面加载更慢），
+      按动作分别给（`checkin` 90s / `login` 5min）。
+
+  - **结果以网络响应为准**：辅轨不自己算积分，**读页面自己发出的 `/signin/claim` 响应**——站点怎么算就怎么记，避免「页面显示与接口不一致」时误报。
+- **登录态的判定信号（真机实测，2026-11-27）**：**「登录」按钮还在 = 没登录**——
+  匿名态 `agent.minimax.cn` 页面上有**两个** `BUTTON` 文本为「登录」（页头 + 首页卡片）；
+  登录成功后它们消失（换成用户信息）。辅轨据此判登录态，**不看 URL、不猜**。
+  - **必须等页面渲染完再判**：该站是前端渲染，`DOMContentLoaded` 时按钮还没挂上——
+    此时「登录按钮数 == 0」会被**误判成已登录**（真机踩过：`login` 动作秒回「登录完成」）。
+    判据用「**页面上出现按钮**」（`waitForSelector("button")`）而不是 `networkidle`
+    ——该站有持续请求，`networkidle` 实测要等 20 s 才超时；
+  - **登录成功的判定要连续两次读到 0 个按钮**（间隔 1 s）**且至少停留 5 s**——单次读数不可靠。
+- **profile 与 AGENT.md §5.3 的边界**：持久化 profile 里的会话凭证**由浏览器自己加密保管**（Windows DPAPI / macOS Keychain），**应用不读取、不导出、不入库、不进 IPC**；AGENT.md §5.3 的「凭证零明文」约束的是**我们的存储路径**（保险库 / IPC / 日志 / 库文件），辅轨的浏览器 profile 是**第三方组件的凭证存储**，落在应用数据目录、不进 git。
+- **签到幂等**：重复领取返回 `claim_result = 2` / 业务码 `AlreadyClaimed` → **判为「今天已领」而不是失败**。
+
+**4. 积分回写 `account.quota_json`（本项目的差异化点：签到与额度池同源）**
+
+- 签到拿到积分 → 更新该站点**归属账号**的 `account.quota_json`（**额度快照**，不是余额真值）。
+- `quota_json` 的形状：`{"points": 400, "unit": "magicube", "source": "checkin", "updated_at": <unix>}`；**只增不减的语义由取数方负责**——签到侧**只写「本次拿到了多少」**，不猜测账户总额。
+- **写回与签到结果解耦**：签到成功但回写失败 → **签到仍算成功**（结果已落 `checkin_result`），回写失败记日志 + 提示，**不回滚签到**。
+- **归属账号的落点**（与 §7.1.2 的「站点归属渠道」同源）：内置站点建站时按站点名建一条**占位渠道**（`provider = 'custom'`），再取 §8.2 的**默认账号** `acct_default_<channel_id>`；站点 `config_json` 里记 `channelId` / `accountId`。
+  - 理由：`credential.channel_id` 与 `account.channel_id` 都是 `NOT NULL REFERENCES channel(id)`（§9）——**站点没有渠道就没有地方挂凭据，也没有账号可写积分**；
+  - 与 T15 的 HAR 模板站点**同一套归属口径**（一个站点 = 一个渠道 + 一个默认账号）。
+- **合并写，不覆盖限额字段**：`quota_json` 里 `points` / `unit` / `source` / `updated_at` 与 §8.2 的限额字段（`rpm` / `rpd` / `tpm` / `tpd` / `learned_at` / `last_rate_limit`）**并存**——回写只改这四个键，**不动**其它键；`source = "checkin"` 用来与限额来源 `upstream_headers` 区分。
+
+**5. 边界与未验证项**
+
+- 本卡**不含**：通知（T19）、多站点批量编排 UI、浏览器 profile 的跨机迁移、辅轨的分发形态（见下）。
+- **未验证（登录态相关，待头头提供登录态后回填）**：① ModelScope 登录态下 `transactions` / `balance` 成功响应的**魔粒字段路径**（当前是候选路径，站点配置 `reward.path` 可覆盖）；② MiniMax Code 页面上签到入口的 **DOM 选择器**（当前是文案候选）；③ 两站的**真签到成功**链路；④ MiniMax Code 的**每日积分与连签天数**（03 T18 卡片写的「每日 400 积分、第 4/7 天各 1000」是**未实测的口径**）。
+- **真机已验证的部分（2026-11-27）**：两站的**失败路径**已在真实站点上跑通——ModelScope 用错误 Cookie → **HTTP 401** → 判 `credential_invalid`（152 ms）；MiniMax Code 未登录 → 辅轨开真实浏览器读页面 → 判 `not_logged_in`（2.1 s）。即**「能打到真站点 + 断言与分类正确」已验证**，**「成功路径」待登录态**。
+- **辅轨的已知成本**：依赖 **Node 运行时**（本机实测 v22.16.0 ✓）+ `playwright` npm 包（`sidecar/` 目录，`npm install`）。**「开箱即用」的打包分发形态不在本卡**——另排。
+- **删站点不清凭据**：`checkin_delete_site` 只在 `config_json` 是 HAR 模板时清理凭据；**内置站点的凭据留在保险库**（下次建同名站点会复用同一渠道）。**已记 backlog**。
+
 ---
 
 ## 8. 用量统计
@@ -1139,3 +1235,5 @@ python scripts/security_check.py `
 | v0.16 | 2026-11-27 | T16 重放引擎回填：**新增 §7.1.3 重放引擎口径**——① **变量注入**（敏感变量按 `credential_id` 从保险库解密、非敏感变量用 `default`；**缺凭据不发请求**直接分类 `credential_missing`；替换发生在值内部；**未知占位符拒绝重放**→`template_invalid`）；② **请求构造**（**query 以模板 `request.query` 数组为准重建**——HAR 的 url 自带 query 与 `queryString` 重复，先剥 URL 再重建，否则参数发两遍；**剔除 `Host` 与 `Content-Length`**——由客户端按实际 URL/请求体生成，留着录制旧值会把请求打歪；连接 10s / 整请求 30s，**引擎自己不重试**，重试与冷却属 T17）；③ **响应断言**（`assert.status` 是**期望状态码**而非录制值，导入时先填录制值占位；新增可选 `assert.jsonPaths`（点号路径 + 数组下标 + `equals`），状态码与 JSON 路径是"与"关系；**旧模板兼容**——新字段一律可选）；④ **错误分类**（`success` / `assert_failed` / `network_error` / `credential_missing` / `template_invalid` / `credential_invalid`(401·403) / `rate_limited`(429) / `http_error`，「可重试」沿用 §3.3 判据；**不猜验证码**——不内置验证码识别，验证码表现为断言不符，归 `assert_failed`/`http_error`）；⑤ **结果落库**（每次重放写一行 `checkin_result`，`ok=1` 仅当 `success`；**响应体不进库**——只在内存里留 512 字节截断片段，防 csrf/token 密文落库；`reward_json` 留空，积分回写属 T18/T17）；⑥ **边界**（T16 只做引擎：无调度 / 无计划任务 / 无通知 / 无浏览器辅轨 / 无 UI 触发入口，「立即执行一次」按钮留 T17·T18） |
 | v0.17 | 2026-11-27 | T17 调度器与系统兜底回填：**新增 §7.2.1 调度与补签口径**——① **调度模型**（每分钟 tick 一次；`cron` crate 解析 5 字段；**本地时区** `chrono::Local` 解释 cron 表达式，不是 UTC；`schedule` 空 = 不参与调度，`enabled = 0` 不跑）；② **应跑判定（去重）**——`due_at` = 最近一次应触发时刻（≤ now，由 cron 的下一次触发倒推紧邻的前一次）；`last_attempt` = 该站点最近一次尝试的 `checkin_result.ts`；**`last_attempt >= due_at` → 本周期已跑过、跳过**（落库去重 ⇒ **跨重启也成立**）；③ **错过补签**——应用启动与系统计划任务唤起时做**同一套判定**，关应用期间漏掉的周期自动补上；**不因失败立刻重试**（同周期只跑一次），要立刻再试用「立即执行一次」；④ **系统兜底**——Windows 每个启用站点注册**一个**计划任务（`LLM Router Checkin - <site_id>`，动作 `"<exe>" --checkin-once --site <site_id>`；cron → `/sc hourly`/`minute /mo N`/`daily`/`weekly` 映射，**其余表达式退回每天一次**，宁可多跑不可漏跑）、macOS launchd plist（`StartCalendarInterval` / `StartInterval`）；**注册时机** = 启用或改 cron 时注册、停用或删除时注销；**CLI 入口** `--checkin-once [--site <id>]`（**不起 UI、不起网关**，跑完退出）；⑤ **边界**（不含通知 T19 / 积分回写 T18 / 浏览器辅轨 / 云同步；**调度层不重试**） |
 | v0.18 | 2026-11-27 | T17 真机验收后的口径修订（**§7.2.1 §4 同步改写**）：① **任务名以连字符为准**（`LLM Router Checkin - <site_id>`，与代码 `system::TASK_PREFIX` 一致；v0.17 行里的 `·` 是笔误，已一并订正）；② **频率映射补「分钟字段 `*` → `/sc minute /mo 1`」**——真机实测发现 `* * * * *` 曾落进"未识别 → 每天一次"，会把"每分钟"降级成"每天"→ **系统兜底漏跑**，已修并加回归单测；③ **「任务不存在」= 已注销**（注销走**先查后删**，不靠错误文案匹配）——`schtasks` 的报错文案随系统语言变（英文 "ERROR: The system cannot find the file specified." / 中文 "错误: 系统找不到指定的文件。"），按字符串匹配必然漏判；④ **系统命令输出按系统 OEM 代码页解码**（无控制台的 GUI 进程里 `schtasks` 按 OEM 输出，中文 Windows = GBK/936；直接按 UTF-8 解出乱码），解码顺序 UTF-8 → UTF-16LE → OEM → 有损兜底；⑤ **补齐 T17 的 UI 入口**（T16 留档里"立即执行一次"明确记在 T17/T18）：签到面板新增**调度区**——cron 输入 / 启用开关 / 「立即执行」/「同步系统兜底任务」/ 最近执行记录表（`src/checkin/schedule.ts` 为纯函数模块，`node --test` 可跑） |
+| v0.19 | 2026-11-27 | T18 站点插件回填：**新增 §7.4 站点插件口径**——① **插件机制**（`checkin_site.plugin` 取值 = `har`（用户自建，走 T16 重放引擎）/ `modelscope` / `minimax_code`（内置）；内置插件与 HAR 模板**共用 02 §7.1.3 §4 的 8 类 `ReplayClass` 结果语义**；**内置插件带正确断言**——解掉 T16/T17 留档那条「导入模板带录制时的状态码、用户得自己改」的限制）；② **ModelScope 插件**（`GET /api/v1/users/login/info` 签到 + `GET /openapi/v1/magicubes/transactions` 对账；网页会话 Cookie 进保险库；**断言必须走 JSON 路径**——**已实测匿名态两个接口都返回 HTTP 401**（`{"Success":false,"Message":"禁止访问"}` 与 `{"code":"InvalidAuthentication"}`），只看状态码会把"未登录"误判成成功；魔粒字段路径**未实测**，内置默认路径 + 允许 `config_json` 覆盖）；③ **MiniMax Code 插件走辅轨**（签到接口 `GET/POST /minimax-cloud/api/v1/signin/status|claim` 带 **OAuth bearer + `x-timestamp` + `x-signature`**——签名每次都变 → **HAR 模板化不可行**，自己实现签名 = 逆向客户端私有协议、撞 AGENT.md §5.7 → **让浏览器自己算签名**；辅轨 = `sidecar/` Node + Playwright + **持久化 profile**，优先用**系统 Chrome**（`channel: "chrome"`）、不强制下载 150MB；Rust ↔ sidecar 走 **CLI 协议**（每次起一个 Node 进程跑一个动作 `health` / `login` / `checkin`，**stdout 吐 JSON**，用完即退——无端口占用、无孤儿进程、无本地 socket 鉴权问题）；**结果以页面自己的网络响应为准**，不解析 DOM 里的数字；`AlreadyClaimed`/`claim_result=2` 判「今天已领」而非失败；**profile 的凭证由浏览器自己加密保管，应用不读不导不入库不进 IPC**——AGENT.md §5.3 约束的是我们的存储路径）；④ **积分回写 `account.quota_json`**（`{"points","unit","source","updated_at"}` 快照；**归属账号** = 站点占位渠道下的默认账号 `acct_default_<channel_id>`（与 §7.1.2「站点归属渠道」同源）；**合并写**——只改这四个键，不覆盖 §8.2 的限额字段；**写回失败不回滚签到**）；⑤ **边界与未验证项**（通知属 T19；辅轨依赖 Node 运行时，`sidecar/` 需 `npm install`，**「开箱即用」的打包分发不在本卡**；登录态相关的三项待实测） |
+| v0.20 | 2026-11-27 | T18 **真机验收后的口径修订**：① **§7.4 §3 补「登录态判定信号」**（真机实测：匿名态 `agent.minimax.cn` 页面有**两个**「登录」按钮 → **按钮还在 = 没登录**；**必须等页面渲染完再判**——前端渲染站 `DOMContentLoaded` 时按钮还没挂上，会把「按钮数 == 0」**误判成已登录**（真机实测 `login` 动作秒回「登录完成」）；判据用 `waitForSelector("button")` 而**不是 `networkidle`**——该站有持续请求，`networkidle` 实测要等 20 s 才超时；登录成功要**连续两次读到 0** 且**至少停留 5 s**）；② **§7.4 §5 补真机已验部分与新边界**（**失败路径已在真实站点跑通**：ModelScope 用错误 Cookie → **HTTP 401** → 判 `credential_invalid`（152 ms）；MiniMax Code 未登录 → 辅轨开真实浏览器读页面 → 判 `not_logged_in`（2.1 s）——即「**能打到真站点 + 断言与分类正确**」已验证，「**成功路径**」待登录态；**删站点不清内置站点的凭据**——`checkin_delete_site` 只清 HAR 模板的凭据 → 已记 backlog）；③ **§7.4 §4 的归属与合并语义已在 v0.19 行补齐**（占位渠道 → 默认账号 `acct_default_<channel_id>`；`quota_json` 只改 `points`/`unit`/`source`/`updated_at` 四个键）；④ **真机揪出并修掉 4 个 bug**（辅轨同名变量 TDZ / 插件没覆盖 trait 的 `default_schedule` 导致 MiniMax 默认 cron 错 / `login` 动作的渲染前假阳性 / `checkin` 动作的渲染前误判登录态——后两个的修法即 ①） |
