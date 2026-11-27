@@ -139,21 +139,63 @@ pub struct CopilotToken {
     pub api_base: String,
 }
 
+/// 出站 HTTP 客户端（**只给 OAuth 端点用**）。
+///
+/// **`connect_timeout` 收紧到 8 s**：本机实测 `github.com` 的 DNS **轮换两个 IP**——
+/// `20.205.243.166` 正常（0.4 s），`20.247.166.64` 是**黑洞**（TCP 握手无响应，
+/// 一直等到超时）→ 命中黑洞的那次请求必然失败。收紧 connect 超时后，
+/// 一次失败只花 8 s，随后由 `send_with_retry` 重试（大概率换个 IP 就通了）。
+pub fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|err| format!("构造 HTTP 客户端失败：{err}"))
+}
+
+/// 发一次请求；**网络层失败（超时 / 连不上）时重试**。
+///
+/// **为什么需要**：见 [`http_client`] 的说明——命中黑洞 IP 时单次请求必然超时。
+/// GitHub 的三个端点操作都是**幂等**的（取设备码 / 轮询 / 换 token）→ **重试安全**。
+///
+/// **只重试网络层错误**（超时 / 连不上）；HTTP 状态码由调用方判定，**不重试**。
+async fn send_with_retry(
+    attempts: u32,
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    let mut last = "请求失败".to_string();
+    for attempt in 1..=attempts.max(1) {
+        match build().send().await {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                let transient = err.is_timeout() || err.is_connect();
+                last = http_error(&err);
+                if !transient || attempt >= attempts {
+                    return Err(last);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400 * u64::from(attempt))).await;
+            }
+        }
+    }
+    Err(last)
+}
+
 /// ① 发起设备授权。
 pub async fn start_device_flow(
     client: &reqwest::Client,
     endpoints: &Endpoints,
 ) -> Result<DeviceFlow, String> {
     let body = form_body(&[("client_id", CLIENT_ID), ("scope", SCOPE)]);
-    let response = client
-        .post(&endpoints.device_code_url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| format!("发起设备授权失败：{}", http_error(&err)))?;
+    let response = send_with_retry(3, || {
+        client
+            .post(&endpoints.device_code_url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .body(body.clone())
+    })
+    .await
+    .map_err(|err| format!("发起设备授权失败：{err}"))?;
     let status = response.status();
     let text = response
         .text()
@@ -208,15 +250,16 @@ pub async fn poll_device_flow(
             "urn:ietf:params:oauth:grant-type:device_code",
         ),
     ]);
-    let response = client
-        .post(&endpoints.access_token_url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| format!("轮询授权结果失败：{}", http_error(&err)))?;
+    let response = send_with_retry(3, || {
+        client
+            .post(&endpoints.access_token_url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .body(body.clone())
+    })
+    .await
+    .map_err(|err| format!("轮询授权结果失败：{err}"))?;
     let status = response.status();
     let text = response
         .text()
@@ -253,14 +296,15 @@ pub async fn fetch_copilot_token(
     endpoints: &Endpoints,
     gh_token: &str,
 ) -> Result<CopilotToken, String> {
-    let response = client
-        .get(&endpoints.copilot_token_url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::AUTHORIZATION, format!("token {gh_token}"))
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .send()
-        .await
-        .map_err(|err| format!("换取 Copilot token 失败：{}", http_error(&err)))?;
+    let response = send_with_retry(3, || {
+        client
+            .get(&endpoints.copilot_token_url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::AUTHORIZATION, format!("token {gh_token}"))
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+    })
+    .await
+    .map_err(|err| format!("换取 Copilot token 失败：{err}"))?;
     let status = response.status();
     let text = response
         .text()
@@ -356,6 +400,13 @@ pub fn cache() -> &'static TokenCache {
 }
 
 impl TokenCache {
+    /// 新建一个**独立**的缓存（生产用全局那个；**单测用独立实例**避免互相干扰）。
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
     /// 缓存里的 token（**可能已过期**）。
     pub fn peek(&self) -> Option<CopilotToken> {
         self.inner.lock().ok().and_then(|guard| guard.clone())
@@ -431,16 +482,18 @@ pub fn disconnect(vault: &Vault, channel_id: &str) -> Result<(), String> {
 
 /// 取一个**可用的** Copilot token：缓存命中就用；否则用保险库里的 GitHub token 重取。
 ///
-/// T21 的 adapter 调这个（`ProviderAdapter::refresh()` 也走这里）。
+/// `cache` **显式传入**（生产传全局 `cache()`）——单测要**独立实例**，否则
+/// 并行跑的用例会互相污染缓存、测不出「到底有没有重取」。
 pub async fn ensure_token(
     client: &reqwest::Client,
     endpoints: &Endpoints,
     vault: &Vault,
     channel_id: &str,
+    cache: &TokenCache,
 ) -> Result<CopilotToken, String> {
     let now = now_secs();
-    if cache().is_fresh(now) {
-        if let Some(token) = cache().peek() {
+    if cache.is_fresh(now) {
+        if let Some(token) = cache.peek() {
             return Ok(token);
         }
     }
@@ -449,7 +502,7 @@ pub async fn ensure_token(
     })?;
     let token = fetch_copilot_token(client, endpoints, &gh_token).await?;
     store_copilot_token(vault, channel_id, &token)?;
-    cache().put(token.clone());
+    cache.put(token.clone());
     Ok(token)
 }
 
@@ -606,6 +659,31 @@ mod tests {
         store.remove(&id);
         assert!(store.get(&id).is_none());
     }
+
+    #[tokio::test]
+    async fn the_network_layer_retries_transient_failures() {
+        // 本机实测：`github.com` 的 DNS 轮换到一个**黑洞 IP** 时单次请求必然超时
+        // → 网络层错误必须重试（三个端点操作都幂等）。
+        let client = reqwest::Client::new();
+        // 借一个回环端口再放掉 → 连接被拒（网络层错误）
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定回环端口");
+        let port = listener.local_addr().expect("取本机地址").port();
+        drop(listener);
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = send_with_retry(3, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.get(format!("http://127.0.0.1:{port}/nope"))
+        })
+        .await
+        .expect_err("连不上应当报错");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "网络层错误应重试到 3 次"
+        );
+        assert_eq!(err, "连接失败");
+    }
 }
 
 /// **本地 mock 上游**（**测试专用**）。
@@ -630,6 +708,8 @@ pub(crate) mod testing {
     pub struct MockUpstream {
         /// 已经轮询了几次（决定这次返回什么）。
         polls: AtomicUsize,
+        /// ④ 被调了几次（换 Copilot token）。
+        copilot_token_calls: AtomicUsize,
         /// 设备码请求体。
         device_code_body: Mutex<Option<String>>,
         /// 每次轮询的请求体。
@@ -646,6 +726,11 @@ pub(crate) mod testing {
         /// 轮询次数。
         pub fn poll_count(&self) -> usize {
             self.polls.load(Ordering::SeqCst)
+        }
+
+        /// ④（换 Copilot token）被调了几次。
+        pub fn copilot_token_calls(&self) -> usize {
+            self.copilot_token_calls.load(Ordering::SeqCst)
         }
 
         /// 设备码请求体。
@@ -674,6 +759,9 @@ pub(crate) mod testing {
             // 错误分支：GitHub token 无效（401）/ 没有订阅（403）
             .route("/bad-token/copilot_internal/v2/token", get(bad_token))
             .route("/no-subscription/copilot_internal/v2/token", get(no_subscription))
+            // 终态分支：设备码过期 / 用户拒绝
+            .route("/expired/login/oauth/access_token", post(always_expired))
+            .route("/denied/login/oauth/access_token", post(always_denied))
             .with_state(Arc::clone(&recorder));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -726,6 +814,7 @@ pub(crate) mod testing {
         State(rec): State<Arc<MockUpstream>>,
         headers: HeaderMap,
     ) -> axum::Json<serde_json::Value> {
+        rec.copilot_token_calls.fetch_add(1, Ordering::SeqCst);
         *rec.auth_header.lock().unwrap() = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -735,6 +824,16 @@ pub(crate) mod testing {
             "expires_at": crate::vault::now_secs() + 1800,
             "endpoints": {"api": "https://api.githubcopilot.com"},
         }))
+    }
+
+    /// 终态：设备码过期。
+    async fn always_expired() -> axum::Json<serde_json::Value> {
+        axum::Json(json!({"error": "expired_token"}))
+    }
+
+    /// 终态：用户拒绝授权。
+    async fn always_denied() -> axum::Json<serde_json::Value> {
+        axum::Json(json!({"error": "access_denied"}))
     }
 
     /// ④ 的 401 分支（GitHub token 无效）。

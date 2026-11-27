@@ -133,10 +133,7 @@ async fn retry_copilot_token(state: &AppState, endpoints: &Endpoints) {
         },
         Err(err) => fail(format!("列渠道失败：{err}")),
     };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
+    let client = match copilot::http_client() {
         Ok(client) => client,
         Err(err) => fail(format!("构造 HTTP 客户端失败：{err}")),
     };
@@ -144,7 +141,7 @@ async fn retry_copilot_token(state: &AppState, endpoints: &Endpoints) {
         Ok(vault) => vault,
         Err(err) => fail(format!("读保险库失败：{err}")),
     };
-    match copilot::ensure_token(&client, endpoints, &vault, &channel_id).await {
+    match copilot::ensure_token(&client, endpoints, &vault, &channel_id, copilot::cache()).await {
         Ok(token) => println!(
             "已用入库的 GitHub token 换到 Copilot token（到期时刻 {}）",
             token.expires_at

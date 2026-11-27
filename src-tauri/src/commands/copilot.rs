@@ -5,8 +5,6 @@
 //! **密文红线**：`device_code` 与两个 token **都不出后端**——
 //! IPC 只回 `flow_id` / `user_code` / `verification_uri` / 状态 / 过期时间。
 
-use std::time::Duration;
-
 use serde::Serialize;
 use tauri::State;
 
@@ -217,12 +215,9 @@ fn find_copilot_channel(state: &AppState) -> Result<Option<(String, bool, String
         .map(|row| (row.id, row.enabled, row.base_url)))
 }
 
-/// 出站 HTTP 客户端（**只给 OAuth 端点用**；超时 30 s）。
+/// 出站 HTTP 客户端（**只给 OAuth 端点用**；超时与重试策略在 `providers::oauth::copilot` 里）。
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|err| format!("构造 HTTP 客户端失败：{err}"))
+    copilot::http_client()
 }
 
 #[cfg(test)]
@@ -479,5 +474,97 @@ mod tests {
         assert_eq!(default.device_code_url, copilot::DEVICE_CODE_URL);
         assert_eq!(default.access_token_url, copilot::ACCESS_TOKEN_URL);
         assert_eq!(default.copilot_token_url, copilot::COPILOT_TOKEN_URL);
+    }
+
+    #[tokio::test]
+    async fn the_expired_and_denied_states_end_the_flow() {
+        let (base, _mock) = copilot::testing::start().await;
+        let (_dir, state) = state();
+
+        // 终态一：设备码过期
+        let expired = copilot::Endpoints {
+            device_code_url: format!("{base}/login/device/code"),
+            access_token_url: format!("{base}/expired/login/oauth/access_token"),
+            copilot_token_url: format!("{base}/copilot_internal/v2/token"),
+        };
+        let view = copilot_authorize_start_of(&state, &expired)
+            .await
+            .expect("① 发起设备授权");
+        let poll = copilot_authorize_poll_of(&state, &view.flow_id, &expired)
+            .await
+            .expect("③ 轮询");
+        assert_eq!(poll.state, "expired");
+        assert!(
+            copilot_authorize_poll_of(&state, &view.flow_id, &expired)
+                .await
+                .is_err(),
+            "终态后会话应当销毁"
+        );
+
+        // 终态二：用户拒绝
+        let denied = copilot::Endpoints {
+            device_code_url: format!("{base}/login/device/code"),
+            access_token_url: format!("{base}/denied/login/oauth/access_token"),
+            copilot_token_url: format!("{base}/copilot_internal/v2/token"),
+        };
+        let view = copilot_authorize_start_of(&state, &denied)
+            .await
+            .expect("① 发起设备授权");
+        let poll = copilot_authorize_poll_of(&state, &view.flow_id, &denied)
+            .await
+            .expect("③ 轮询");
+        assert_eq!(poll.state, "denied");
+
+        // 两种终态都**没有**落任何凭据
+        let status = copilot_status_of(&state).expect("查状态");
+        assert!(!status.authorized);
+    }
+
+    #[tokio::test]
+    async fn ensure_token_refetches_when_the_cached_token_is_near_expiry() {
+        let (base, mock) = copilot::testing::start().await;
+        let endpoints = copilot::Endpoints::local(&base);
+        let (_dir, state) = state();
+
+        let channel_id = crate::store::channels::ensure_oauth_channel(
+            &state.store,
+            CHANNEL_NAME,
+            OAUTH_PROVIDER,
+            copilot::DEFAULT_API_BASE,
+        )
+        .expect("建 Copilot 渠道行");
+        let vault = state.vault.read().expect("读保险库");
+        copilot::store_github_token(&vault, &channel_id, "MOCK-GH-TOKEN").expect("存 GitHub token");
+
+        let client = copilot::http_client().expect("构造客户端");
+        // **独立缓存实例**（生产用全局那个）→ 不受并行用例干扰
+        let cache = copilot::TokenCache::new();
+
+        // 缓存空 → 用保险库里的 GitHub token 换
+        let token = copilot::ensure_token(&client, &endpoints, &vault, &channel_id, &cache)
+            .await
+            .expect("换取 Copilot token");
+        assert_eq!(mock.copilot_token_calls(), 1);
+        assert_eq!(token.token, "MOCK-COPILOT-TOKEN");
+
+        // 缓存新鲜 → 直接用，**不再打上游**
+        let again = copilot::ensure_token(&client, &endpoints, &vault, &channel_id, &cache)
+            .await
+            .expect("命中缓存");
+        assert_eq!(mock.copilot_token_calls(), 1, "缓存新鲜就不该再打上游");
+        assert_eq!(again.token, token.token);
+
+        // 缓存里的 token 离过期不足 5 min → 判为需重取 → 重新打上游
+        cache.put(copilot::CopilotToken {
+            token: "STALE-TOKEN".to_string(),
+            expires_at: crate::vault::now_secs() + 100,
+            api_base: copilot::DEFAULT_API_BASE.to_string(),
+        });
+        let refreshed = copilot::ensure_token(&client, &endpoints, &vault, &channel_id, &cache)
+            .await
+            .expect("临近过期应当重取");
+        assert_eq!(mock.copilot_token_calls(), 2, "临近过期应当重取");
+        assert_eq!(refreshed.token, "MOCK-COPILOT-TOKEN");
+        assert_ne!(refreshed.token, "STALE-TOKEN");
     }
 }
