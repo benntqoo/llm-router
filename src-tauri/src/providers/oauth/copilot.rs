@@ -98,6 +98,41 @@ pub const COPILOT_TOKEN_KIND: &str = "oauth_copilot_token";
 /// 设备授权请求的 User-Agent（GitHub 对无 UA 的请求会拒）。
 const USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
 
+/// 可选：**覆盖**内置的 `github.com` 候选 IP 池（逗号分隔，如 `1.2.3.4,5.6.7.8`）。
+///
+/// 边缘 IP **会变** → 变了用这个环境变量顶，**不用改代码**。
+pub const ENV_GITHUB_IPS: &str = "LLMR_GITHUB_IPS";
+
+/// `github.com` 的**候选 IP 池**（公网边缘地址；本机实测能服务 OAuth POST 的优先在前）。
+///
+/// **为什么是「池 + 轮换」而不是「钉一个」**（本机实测 2026-11-27，详见 02 §6.2.1）：
+/// - 同一个 IP 的成功率**随时间翻转**：`20.27.177.113` 21:15 时 5/5 通、21:47 时 0/5；
+/// - **失败模式因请求方法而异**：`20.200.245.247` 的 `GET /login/device` 5/5 通，
+///   但 `POST /login/oauth/access_token` **0/3**；
+/// - 系统 DNS 连续 16 次解析**全是同一个 A 记录**（ISP 侧有缓存）→ 动态发现候选**不可行**；
+/// - 钉死单个 IP 会把设备码的 **900 s** 寿命全耗在一条坏路径上。
+///
+/// **兜底**：`ClientPool` 的**最后一个 client 走普通 DNS** → 池内 IP 全失效时仍有一条路。
+const GITHUB_IP_POOL: [&str; 15] = [
+    // ── 2026-11-27 22:0x 实测 POST `/login/oauth/access_token` 2/2 通的 ──
+    "20.205.243.166",
+    "20.200.245.249",
+    "57.155.223.240",
+    "20.247.166.64",
+    "20.27.177.113",
+    // ── 同族的其他边缘地址（当时不通，但**好坏会随时间翻转**，轮换才撞得到）──
+    "20.205.243.168",
+    "20.200.245.245",
+    "20.200.245.247",
+    "20.200.245.250",
+    "20.27.177.116",
+    "20.201.28.148",
+    "20.201.28.151",
+    "20.26.156.210",
+    "20.26.156.215",
+    "20.248.137.48",
+];
+
 /// 设备授权会话（① 的响应）。
 #[derive(Debug, Clone)]
 pub struct DeviceFlow {
@@ -139,34 +174,132 @@ pub struct CopilotToken {
     pub api_base: String,
 }
 
-/// 出站 HTTP 客户端（**只给 OAuth 端点用**）。
+/// 构造一个出站 HTTP 客户端（**只给 OAuth 端点用**）。
 ///
-/// **`connect_timeout` 收紧到 8 s**：本机实测 `github.com` 的 DNS **轮换两个 IP**——
-/// `20.205.243.166` 正常（0.4 s），`20.247.166.64` 是**黑洞**（TCP 握手无响应，
-/// 一直等到超时）→ 命中黑洞的那次请求必然失败。收紧 connect 超时后，
-/// 一次失败只花 8 s，随后由 `send_with_retry` 重试（大概率换个 IP 就通了）。
-pub fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(8))
-        .timeout(std::time::Duration::from_secs(15))
+/// - `connect_timeout` **3 s**、单请求总超时 **8 s**：GitHub OAuth 正常 < 2 s
+///   → 失败一次代价小，能在设备码寿命（900 s）内多试很多次；
+/// - `pin` 为 `Some` 时把 `github.com` **钉到该 IP**（见 [`ClientPool`]）。
+fn build_client(pin: Option<std::net::SocketAddr>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(8));
+    if let Some(addr) = pin {
+        builder = builder.resolve("github.com", addr);
+    }
+    builder
         .build()
         .map_err(|err| format!("构造 HTTP 客户端失败：{err}"))
 }
 
+/// 候选 IP 列表：环境变量优先，否则用内置池。
+fn candidate_ips() -> Vec<String> {
+    candidate_ips_from(std::env::var(ENV_GITHUB_IPS).ok())
+}
+
+/// 从环境变量的原始值解析候选 IP（**拆出来是为了单测不用改进程级环境变量**）。
+fn candidate_ips_from(raw: Option<String>) -> Vec<String> {
+    match raw {
+        Some(text) => text
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        None => GITHUB_IP_POOL.iter().map(|item| item.to_string()).collect(),
+    }
+}
+
+/// 出站客户端池：每个候选 IP 一个 client，**轮换**使用。
+///
+/// **为什么要池**（本机实测 2026-11-27，详见 02 §6.2.1）：本机到 `github.com` 的链路
+/// 时好时坏，钉死单个 IP 会把设备码的 900 s 寿命全耗在一条坏路径上。
+///
+/// **兜底**：池子**最后一个 client 走普通 DNS** → 池内 IP 全部失效时仍有一条路。
+pub struct ClientPool {
+    clients: Vec<reqwest::Client>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ClientPool {
+    /// 构造池子：候选 IP 各一个 client，**末尾追加一个走普通 DNS 的**（兜底）。
+    fn build() -> Result<Self, String> {
+        let mut clients = Vec::new();
+        for raw in candidate_ips() {
+            let Ok(ip) = raw.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            let addr = std::net::SocketAddr::new(ip, 443);
+            if let Ok(client) = build_client(Some(addr)) {
+                clients.push(client);
+            }
+        }
+        // 兜底 client：走普通 DNS（池内 IP 全失效时仍有一条路）
+        clients.push(build_client(None)?);
+        Ok(Self {
+            clients,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// 取下一个 client（**轮换**：每次重试换一个候选 IP）。
+    fn next_client(&self) -> &reqwest::Client {
+        let len = self.clients.len().max(1);
+        let idx = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % len;
+        &self.clients[idx]
+    }
+
+    /// 池子大小（**含**末尾那个走普通 DNS 的兜底 client）。
+    pub fn len(&self) -> usize {
+        self.clients.len()
+    }
+}
+
+static POOL: OnceLock<Result<ClientPool, String>> = OnceLock::new();
+
+/// 全局客户端池（进程内复用，避免每次请求都重建 TLS 配置）。
+pub fn pool() -> Result<&'static ClientPool, String> {
+    POOL.get_or_init(|| ClientPool::build())
+        .as_ref()
+        .map_err(|err| err.clone())
+}
+
 /// 发一次请求；**网络层失败（超时 / 连不上）时重试**。
 ///
-/// **为什么需要**：见 [`http_client`] 的说明——命中黑洞 IP 时单次请求必然超时。
-/// GitHub 的三个端点操作都是**幂等**的（取设备码 / 轮询 / 换 token）→ **重试安全**。
+/// **为什么需要**：见 [`ClientPool`]——本机到 `github.com` 的链路时好时坏，
+/// 命中坏路径时单次请求必然超时。GitHub 的三个端点操作都是**幂等**的
+/// （取设备码 / 轮询 / 换 token）→ **重试安全**。
 ///
-/// **只重试网络层错误**（超时 / 连不上）；HTTP 状态码由调用方判定，**不重试**。
+/// **每次重试换一个候选 IP**（轮换，见 [`ClientPool`]）。
+///
+/// **只重试网络层错误**（超时 / 连不上）；HTTP 状态码由调用方判定，**不重试**
+/// ——**例外**：`retry_on_status` 指定的那些状态码。
+///
+/// **为什么要给状态码开口子**：GitHub 的 OAuth **业务错误全是 HTTP 200 + JSON `error`**
+/// （`authorization_pending` / `slow_down` / `expired_token` / `access_denied` 都实测过是 200）。
+/// 所以 ①②③ 上**任何非 2xx 都意味着「这个边缘节点没正确服务该端点」**（实测会随机回 400/403，
+/// 且**同一时刻换个节点就正常**）→ 换下一个候选 IP 重试，而不是当成业务失败。
 async fn send_with_retry(
     attempts: u32,
-    build: impl Fn() -> reqwest::RequestBuilder,
+    build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    retry_on_status: fn(reqwest::StatusCode) -> bool,
 ) -> Result<reqwest::Response, String> {
+    let pool = pool()?;
     let mut last = "请求失败".to_string();
     for attempt in 1..=attempts.max(1) {
-        match build().send().await {
-            Ok(response) => return Ok(response),
+        let client = pool.next_client();
+        match build(client).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if retry_on_status(status) && attempt < attempts {
+                    last = format!("GitHub 返回 HTTP {}", status.as_u16());
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * u64::from(attempt)))
+                        .await;
+                    continue;
+                }
+                return Ok(response);
+            }
             Err(err) => {
                 let transient = err.is_timeout() || err.is_connect();
                 last = http_error(&err);
@@ -181,23 +314,24 @@ async fn send_with_retry(
 }
 
 /// ① 发起设备授权。
-pub async fn start_device_flow(
-    client: &reqwest::Client,
-    endpoints: &Endpoints,
-) -> Result<DeviceFlow, String> {
+pub async fn start_device_flow(endpoints: &Endpoints) -> Result<DeviceFlow, String> {
     let body = form_body(&[("client_id", CLIENT_ID), ("scope", SCOPE)]);
-    let response = send_with_retry(3, || {
-        client
-            .post(&endpoints.device_code_url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .body(body.clone())
-    })
+    let response = send_with_retry(
+        5,
+        |client| {
+            client
+                .post(&endpoints.device_code_url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .body(body.clone())
+        },
+        // ① 的业务响应永远是 200 + JSON；**非 2xx = 这个节点没服务好该端点** → 换候选 IP
+        |status| !status.is_success(),
+    )
     .await
     .map_err(|err| format!("发起设备授权失败：{err}"))?;
-    let status = response.status();
-    let text = response
+    let status = response.status();    let text = response
         .text()
         .await
         .map_err(|err| format!("读取设备码响应失败：{}", http_error(&err)))?;
@@ -238,7 +372,6 @@ pub async fn start_device_flow(
 
 /// ③ 轮询一次授权结果（**一次调用只轮询一次**；间隔由前端按 `interval` 控制）。
 pub async fn poll_device_flow(
-    client: &reqwest::Client,
     endpoints: &Endpoints,
     device_code: &str,
 ) -> Result<PollOutcome, String> {
@@ -250,14 +383,20 @@ pub async fn poll_device_flow(
             "urn:ietf:params:oauth:grant-type:device_code",
         ),
     ]);
-    let response = send_with_retry(3, || {
-        client
-            .post(&endpoints.access_token_url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .body(body.clone())
-    })
+    let response = send_with_retry(
+        5,
+        |client| {
+            client
+                .post(&endpoints.access_token_url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .body(body.clone())
+        },
+        // ③ 的业务响应（`authorization_pending` / `slow_down` / `expired_token` /
+        // `access_denied` / 成功）**实测全是 HTTP 200**；非 2xx = 节点没服务好 → 换候选 IP
+        |status| !status.is_success(),
+    )
     .await
     .map_err(|err| format!("轮询授权结果失败：{err}"))?;
     let status = response.status();
@@ -292,17 +431,22 @@ pub async fn poll_device_flow(
 
 /// ④ 用 GitHub token 换 Copilot token。
 pub async fn fetch_copilot_token(
-    client: &reqwest::Client,
     endpoints: &Endpoints,
     gh_token: &str,
 ) -> Result<CopilotToken, String> {
-    let response = send_with_retry(3, || {
-        client
-            .get(&endpoints.copilot_token_url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::AUTHORIZATION, format!("token {gh_token}"))
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-    })
+    let response = send_with_retry(
+        5,
+        |client| {
+            client
+                .get(&endpoints.copilot_token_url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::AUTHORIZATION, format!("token {gh_token}"))
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+        },
+        // ④ 的 **401 / 403 是业务错误**（token 无效 / 没有订阅）→ **不能重试**；
+        // 只有 5xx 才当网络问题重试（且 ④ 的主机是 `api.github.com`，**不在钉 IP 范围内**）
+        |status| status.is_server_error(),
+    )
     .await
     .map_err(|err| format!("换取 Copilot token 失败：{err}"))?;
     let status = response.status();
@@ -485,7 +629,6 @@ pub fn disconnect(vault: &Vault, channel_id: &str) -> Result<(), String> {
 /// `cache` **显式传入**（生产传全局 `cache()`）——单测要**独立实例**，否则
 /// 并行跑的用例会互相污染缓存、测不出「到底有没有重取」。
 pub async fn ensure_token(
-    client: &reqwest::Client,
     endpoints: &Endpoints,
     vault: &Vault,
     channel_id: &str,
@@ -500,7 +643,7 @@ pub async fn ensure_token(
     let gh_token = load_github_token(vault, channel_id)?.ok_or_else(|| {
         "还没有 GitHub token——先做一次设备授权".to_string()
     })?;
-    let token = fetch_copilot_token(client, endpoints, &gh_token).await?;
+    let token = fetch_copilot_token(endpoints, &gh_token).await?;
     store_copilot_token(vault, channel_id, &token)?;
     cache.put(token.clone());
     Ok(token)
@@ -662,19 +805,22 @@ mod tests {
 
     #[tokio::test]
     async fn the_network_layer_retries_transient_failures() {
-        // 本机实测：`github.com` 的 DNS 轮换到一个**黑洞 IP** 时单次请求必然超时
-        // → 网络层错误必须重试（三个端点操作都幂等）。
-        let client = reqwest::Client::new();
+        // 本机实测：`github.com` 的链路时好时坏，命中坏路径时单次请求必然超时
+        // → 网络层错误必须重试（三个端点操作都幂等），且**每次重试换一个候选 IP**。
         // 借一个回环端口再放掉 → 连接被拒（网络层错误）
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定回环端口");
         let port = listener.local_addr().expect("取本机地址").port();
         drop(listener);
 
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let err = send_with_retry(3, || {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            client.get(format!("http://127.0.0.1:{port}/nope"))
-        })
+        let err = send_with_retry(
+            3,
+            |client| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                client.get(format!("http://127.0.0.1:{port}/nope"))
+            },
+            |status| !status.is_success(),
+        )
         .await
         .expect_err("连不上应当报错");
         assert_eq!(
@@ -683,6 +829,48 @@ mod tests {
             "网络层错误应重试到 3 次"
         );
         assert_eq!(err, "连接失败");
+    }
+
+    #[test]
+    fn the_client_pool_keeps_a_dns_fallback_and_rotates() {
+        // 池子 = 候选 IP 各一个 + **末尾一个走普通 DNS 的兜底**
+        let pool = pool().expect("构造客户端池");
+        assert!(pool.len() >= 2, "池子至少要有兜底 client");
+        // 轮换：连续取两个应当不是同一个（除非池里只有兜底那一个）
+        let first = pool.next_client() as *const reqwest::Client;
+        let second = pool.next_client() as *const reqwest::Client;
+        if pool.len() > 1 {
+            assert_ne!(first, second, "每次重试应当换一个候选 IP");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_http_error_is_retried_on_another_candidate() {
+        // 「坏边缘节点」：第 1 次回 HTTP 400。OAuth 的**业务错误实测全是 200 + JSON**，
+        // 所以裸 4xx = 这个节点没服务好该端点 → **换候选 IP 重试**（而不是当成业务失败）。
+        let (base, mock) = testing::start().await;
+        let endpoints = Endpoints {
+            device_code_url: format!("{base}/login/device/code"),
+            access_token_url: format!("{base}/flaky/login/oauth/access_token"),
+            copilot_token_url: format!("{base}/copilot_internal/v2/token"),
+        };
+        let outcome = poll_device_flow(&endpoints, "MOCK-DEVICE-CODE")
+            .await
+            .expect("应当重试到成功");
+        assert_eq!(outcome, PollOutcome::Pending);
+        assert_eq!(mock.poll_count(), 2, "第 1 次的 400 应当被换 IP 重试掉");
+    }
+
+    #[test]
+    fn the_env_var_overrides_the_builtin_ip_pool() {
+        // 候选 IP 来自环境变量时，内置池被**完全替换**
+        let ips = candidate_ips_from(Some("203.0.113.7, 203.0.113.8 ,".to_string()));
+        assert_eq!(
+            ips,
+            vec!["203.0.113.7".to_string(), "203.0.113.8".to_string()]
+        );
+        // 没给环境变量 → 用内置池
+        assert_eq!(candidate_ips_from(None).len(), GITHUB_IP_POOL.len());
     }
 }
 
@@ -699,6 +887,7 @@ pub(crate) mod testing {
     use axum::extract::State;
     use axum::http::header::AUTHORIZATION;
     use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum::Router;
     use serde_json::json;
@@ -762,6 +951,8 @@ pub(crate) mod testing {
             // 终态分支：设备码过期 / 用户拒绝
             .route("/expired/login/oauth/access_token", post(always_expired))
             .route("/denied/login/oauth/access_token", post(always_denied))
+            // 「坏边缘节点」分支：第 1 次回 HTTP 400（不是 OAuth 业务错误），第 2 次起正常
+            .route("/flaky/login/oauth/access_token", post(flaky_edge))
             .with_state(Arc::clone(&recorder));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -787,6 +978,18 @@ pub(crate) mod testing {
             "interval": 5,
             "expires_in": 900,
         }))
+    }
+
+    /// 「坏边缘节点」：第 1 次回 HTTP 400，第 2 次起正常。
+    ///
+    /// 模拟本机实测到的现象——**同一个 IP 在不同时刻一个能服务该端点、一个不能**
+    /// （会随机回 400/403；OAuth 的业务错误实测**全是 HTTP 200 + JSON `error`**）。
+    async fn flaky_edge(State(rec): State<Arc<MockUpstream>>) -> axum::response::Response {
+        if rec.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            axum::http::StatusCode::BAD_REQUEST.into_response()
+        } else {
+            axum::Json(json!({"error": "authorization_pending"})).into_response()
+        }
     }
 
     /// ③ 轮询：第 1 次 pending、第 2 次 slow_down、第 3 次授权成功。

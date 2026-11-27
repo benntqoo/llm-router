@@ -60,8 +60,7 @@ pub async fn copilot_authorize_start_of(
     state: &AppState,
     endpoints: &Endpoints,
 ) -> Result<DeviceFlowView, String> {
-    let client = http_client()?;
-    let flow = copilot::start_device_flow(&client, endpoints).await?;
+    let flow = copilot::start_device_flow(endpoints).await?;
     let flow_id = copilot::flows().insert(flow.clone());
     // 渠道行先建好（**默认关闭**）：UI 能看到「有一个 Copilot 渠道，但还没授权」
     let _ = ensure_oauth_channel(
@@ -91,8 +90,7 @@ pub async fn copilot_authorize_poll_of(
     let flow = copilot::flows()
         .get(flow_id)
         .ok_or_else(|| "授权会话已过期或不存在——请重新发起设备授权".to_string())?;
-    let client = http_client()?;
-    let outcome = copilot::poll_device_flow(&client, endpoints, &flow.device_code).await?;
+    let outcome = copilot::poll_device_flow(endpoints, &flow.device_code).await?;
     match outcome {
         PollOutcome::Pending => Ok(CopilotPollView {
             state: "pending".to_string(),
@@ -139,7 +137,7 @@ pub async fn copilot_authorize_poll_of(
                 let vault = state.vault.read().map_err(|err| err.to_string())?;
                 copilot::store_github_token(&vault, &channel_id, &gh_token)?;
             }
-            let token = copilot::fetch_copilot_token(&client, endpoints, &gh_token).await?;
+            let token = copilot::fetch_copilot_token(endpoints, &gh_token).await?;
             {
                 let vault = state.vault.read().map_err(|err| err.to_string())?;
                 copilot::store_copilot_token(&vault, &channel_id, &token)?;
@@ -213,11 +211,6 @@ fn find_copilot_channel(state: &AppState) -> Result<Option<(String, bool, String
         .into_iter()
         .find(|row| row.provider == OAUTH_PROVIDER || row.name == CHANNEL_NAME)
         .map(|row| (row.id, row.enabled, row.base_url)))
-}
-
-/// 出站 HTTP 客户端（**只给 OAuth 端点用**；超时与重试策略在 `providers::oauth::copilot` 里）。
-fn http_client() -> Result<reqwest::Client, String> {
-    copilot::http_client()
 }
 
 #[cfg(test)]
@@ -430,14 +423,13 @@ mod tests {
     #[tokio::test]
     async fn the_copilot_token_failures_are_readable() {
         let (base, _mock) = copilot::testing::start().await;
-        let client = reqwest::Client::new();
 
         let unauthorized = copilot::Endpoints {
             device_code_url: format!("{base}/login/device/code"),
             access_token_url: format!("{base}/login/oauth/access_token"),
             copilot_token_url: format!("{base}/bad-token/copilot_internal/v2/token"),
         };
-        let err = copilot::fetch_copilot_token(&client, &unauthorized, "gh")
+        let err = copilot::fetch_copilot_token(&unauthorized, "gh")
             .await
             .expect_err("401 应当报错");
         assert!(err.contains("无效"), "{err}");
@@ -447,7 +439,7 @@ mod tests {
             access_token_url: format!("{base}/login/oauth/access_token"),
             copilot_token_url: format!("{base}/no-subscription/copilot_internal/v2/token"),
         };
-        let err = copilot::fetch_copilot_token(&client, &forbidden, "gh")
+        let err = copilot::fetch_copilot_token(&forbidden, "gh")
             .await
             .expect_err("403 应当报错");
         assert!(err.contains("订阅"), "{err}");
@@ -514,6 +506,12 @@ mod tests {
             .await
             .expect("③ 轮询");
         assert_eq!(poll.state, "denied");
+        assert!(
+            copilot_authorize_poll_of(&state, &view.flow_id, &denied)
+                .await
+                .is_err(),
+            "终态后会话应当销毁"
+        );
 
         // 两种终态都**没有**落任何凭据
         let status = copilot_status_of(&state).expect("查状态");
@@ -536,19 +534,18 @@ mod tests {
         let vault = state.vault.read().expect("读保险库");
         copilot::store_github_token(&vault, &channel_id, "MOCK-GH-TOKEN").expect("存 GitHub token");
 
-        let client = copilot::http_client().expect("构造客户端");
         // **独立缓存实例**（生产用全局那个）→ 不受并行用例干扰
         let cache = copilot::TokenCache::new();
 
         // 缓存空 → 用保险库里的 GitHub token 换
-        let token = copilot::ensure_token(&client, &endpoints, &vault, &channel_id, &cache)
+        let token = copilot::ensure_token(&endpoints, &vault, &channel_id, &cache)
             .await
             .expect("换取 Copilot token");
         assert_eq!(mock.copilot_token_calls(), 1);
         assert_eq!(token.token, "MOCK-COPILOT-TOKEN");
 
         // 缓存新鲜 → 直接用，**不再打上游**
-        let again = copilot::ensure_token(&client, &endpoints, &vault, &channel_id, &cache)
+        let again = copilot::ensure_token(&endpoints, &vault, &channel_id, &cache)
             .await
             .expect("命中缓存");
         assert_eq!(mock.copilot_token_calls(), 1, "缓存新鲜就不该再打上游");
@@ -560,7 +557,7 @@ mod tests {
             expires_at: crate::vault::now_secs() + 100,
             api_base: copilot::DEFAULT_API_BASE.to_string(),
         });
-        let refreshed = copilot::ensure_token(&client, &endpoints, &vault, &channel_id, &cache)
+        let refreshed = copilot::ensure_token(&endpoints, &vault, &channel_id, &cache)
             .await
             .expect("临近过期应当重取");
         assert_eq!(mock.copilot_token_calls(), 2, "临近过期应当重取");
