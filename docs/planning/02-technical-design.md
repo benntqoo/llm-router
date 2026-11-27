@@ -478,6 +478,30 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 | `access_denied` | 用户拒绝授权 | 结束并提示 |
 | 有 `access_token` | 授权成功 | 换 Copilot token |
 
+**网络层容错（本机实测，2026-11-27）**：
+
+本机到 `github.com` 的链路**时好时坏**——这是 OAuth 三个端点能不能走通的决定性因素（实测数据）：
+
+| 实测项 | 结果 |
+|---|---|
+| 同一 IP 的成功率随时间翻转 | `20.27.177.113` 21:15 时 5/5 通、21:47 时 0/5；`20.247.166.64` 早前是黑洞、22:05 时 POST 2/2 通 |
+| **同时刻**对同一 IP 各打一次 GET / POST | `20.200.245.247` GET 302 / POST **200**；`140.82.112.3` GET 302 / POST **200** → **「GET 通、POST 不通」是时间差，不是边缘属性**（早前那组 0/3 是在不同时间测的，结论作废） |
+| 随机回非 2xx | 同一 IP 会随机回 **400 / 403**（**不是** OAuth 业务错误） |
+| `api.github.com` 的 IP 配 SNI=`github.com` | 5/5 秒回，但 **HTTP 400**（后端不认这个组合）→ **不可用** |
+| 系统 DNS 连续 16 次解析 `github.com` | **全是同一个 A 记录**（ISP 侧有缓存，不轮询）→ 动态发现候选 IP **不可行** |
+| 同一 IP 的成功率随时间翻转 | `20.27.177.113` 21:15 时 5/5 通、21:47 时 0/5；`20.205.243.166` 21:23 与 21:5x 均 5/5 |
+
+**口径**：
+
+- **候选 IP 池 + 轮换**：内置一组 `github.com` 公网边缘 IP，**每次重试换下一个候选**——钉死单个 IP 会把设备码的 900 s 寿命全耗在一条坏路径上（实测：钉 `20.27.177.113` 后连续 40 次轮询全超时，设备码到期作废）；
+- **「非 2xx」也换 IP 重试**：GitHub 的 OAuth **业务错误实测全是 HTTP 200 + JSON `error`**（`authorization_pending` / `slow_down` / `expired_token` / `access_denied` 都实测过是 200）→ ①②③ 上**任何非 2xx 都意味着「这个节点没正确服务该端点」**，换候选重试；④ 的 **401 / 403 是业务错误**（token 无效 / 没有订阅）→ **不重试**；
+- **DNS 兜底**：池子末尾**始终保留一个走普通 DNS 的 client** → 池内 IP 全部失效时仍有一条路；
+- **超时收紧**：connect **3 s** / 单请求总超时 **8 s**（GitHub OAuth 正常 < 2 s）→ 失败一次代价小，能在设备码寿命内多试很多次；
+- **只重试网络层错误**（超时 / 连不上），**HTTP 状态码不重试**（交给 §6.2.1 的轮询状态机判定）；
+- **可覆盖**：环境变量 `LLMR_GITHUB_IPS`（逗号分隔）替换内置池——边缘 IP 会变，**不用改代码**。
+
+**风险**：内置 IP 是 GitHub 的公网边缘地址，**会随时间变更**；靠「轮换 + DNS 兜底 + 环境变量覆盖」三层兜住。
+
 **存储与刷新**：
 
 - **GitHub token（长期）** → **保险库**，`credential.kind = 'oauth_gh_token'`（**零明文**、不回显、不进日志）；
@@ -1397,3 +1421,4 @@ python scripts/security_check.py `
 | v0.25 | 2026-11-27 | T18/M3 **通知卡（T19）**：① **新增 §7.5 通知口径**——落点 = `scheduler::run_site` 之后（**结果已落库之后**），一处覆盖**四条执行路径**（应用 tick / UI 立即执行 / CLI `--checkin-once` / **Windows 计划任务（应用关闭时）**）；**成功与失败都通知**（失败永远通知 = §5.7「撞到验证码 = 失败并通知」落地，成功可关）；文案**必含站点名与原因**，零敏感信息（不带凭据/响应体）；② **系统通知用 `notify-rust`**——**刻意不用 Tauri 通知插件**：CLI / 计划任务路径**没有 Tauri app handle**，用插件就只能在应用开着时通知，**覆盖不了「应用关闭时」**这条 M3 判据；③ **Webhook 三种格式**（企微群机器人 / 飞书群机器人 / Telegram Bot）共用一个配置，Telegram 另需 `chat_id`；④ **配置落点**：`app_setting` 只存**非密文**项（总开关 / 成功也通知 / 类型 / **凭据 id** / chat_id），**webhook 地址与 bot token 进保险库**（`kind='webhook'`，挂占位渠道「通知」——`credential.channel_id` 是 NOT NULL 外键），**零明文**：不落设置表、不进日志、不回显 IPC；⑤ **通知失败不影响签到结果**（只记日志、不重试、不回显 URL）；⑥ **边界**：不含邮件/短信/钉钉/通知历史/模板自定义；系统通知依赖 OS 通知权限，Telegram 在网络受限区域不可达 |
 | v0.26 | 2026-11-27 | T19 **系统通知「静默丢弃」的根因与如实报告**（头头反馈「屏幕上没有」后查出来的）：① **新增 §7.5 §6**——Windows 的 toast 有**两层**独立的静默拦截，任一层挡住都**静默丢弃**（`notify-rust` 照样返回成功、日志写着「已发送」、屏幕上什么都没有）：**① 调用进程没有对应 AUMID**（Windows 10 1607+ 要求进程拥有 `System.AppUserModel.ID`）→ 自建 AUMID + COM 注册开始菜单快捷方式；**② 全局通知总开关关着**（`HKCU\…\CurrentVersion\PushNotifications\ToastEnabled = 0`）→ **所有**应用的 toast 都被拦；② **根因定位方法（别再走错路）**：事件日志 `Microsoft-Windows-PushNotification-Platform/Operational` 的 `Id=3150 … PolicyReason [GlobalSettingDisabled]` 是决定性证据；**别的应用同样中招** → 所以「连 PowerShell 原生 toast 也不显示」是**同一个全局开关**，**不是** AUMID 问题；③ **两个坑**：改完注册表**必须重启 `WpnUserService_<sid>`**（或注销重登）才生效——通知平台服务把策略**缓存**在内存里（连改两次注册表、当场重发都还是被拦）；④ **投递成功的判据**（比「API 返回成功」可靠）：事件日志出现 `Id=3153 Toast … is delivered to <AUMID> on session N`，且通知库 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表里有对应 payload（**被丢弃的 toast 从不入库**）；⑤ **代码侧补「如实报告」**：发送前读全局开关（`system_notify::global_toasts_enabled` + 纯函数 `global_block_reason`），关着就报「Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试」，**不再谎报「已发送」** |
 | v0.27 | 2026-11-27 | M4 **T20 Copilot OAuth（卡片补全 + 协议细节）**：① **新增 §6.2.1**——把 §6.2 的四步落成**可实现的协议细节**：client_id `Iv1.b507a08c87ecfe98`（VS Code 的**公开** client_id，**不是密钥**、用户无须填）、scope `read:user`、三个端点、轮询错误码状态机（`authorization_pending` / `slow_down`(+5s) / `expired_token` / `access_denied` / 成功）、Copilot token 响应形状 `{token, expires_at(float), endpoints}`（**`endpoints.api` 以它为准**）；② **存储口径**：GitHub token（长期）→ 保险库 `kind='oauth_gh_token'`；Copilot token（~25~30min）→ 保险库 `kind='oauth_copilot_token'` + `expires_at`（§9 的列）+ 进程内缓存，**过期前 5 min 自动重取**；③ **风险声明**：`/copilot_internal/v2/token` 是**社区观察到的内部端点**，GitHub 未公开承诺稳定 → 可能随时变更；④ **边界**：本卡**只取凭证**——出站转发与 R-6 伪装头属 **T21**，**ToS 确认弹窗与启用开关属 T24**（渠道**默认关闭** `enabled=0`，AGENT.md §5.5）；⑤ **合规**：走 GitHub **官方** device flow，**不做**指纹伪造/验证码绕过/签名伪造（§5.7） |
+| v0.28 | 2026-11-27 | M4 **T20 网络层容错（判据⑤ 真机授权受阻后的根因与修法）**：① **新增 §6.2.1「网络层容错」**——本机到 `github.com` **时好时坏**，且**失败模式因请求方法而异**：`GET /login/device` 能通的 IP，`POST /login/oauth/access_token` 可能 0/N（实测 `20.205.243.166` POST 3/3，`20.200.245.247` / `20.26.156.215` / `140.82.112.3` / `140.82.114.4` 虽 GET 3~5/5 但 **POST 0/3**）；② **两条已证伪的绕法**（别再走）：**`api.github.com` 的 IP 配 SNI=`github.com`** → 5/5 秒回但 **HTTP 400**（后端不认）；**动态 DNS 发现候选 IP** → 系统 DNS 连续 16 次解析**全是同一个 A 记录**（ISP 侧有缓存，不轮询）；③ **修法口径**：**候选 IP 池 + 每次重试轮换**（钉死单个 IP 会把 900 s 设备码寿命全耗在一条坏路径上——实测钉 `20.27.177.113` 后连续 40 次轮询全超时、设备码到期作废）+ **池尾保留一个走普通 DNS 的 client 兜底** + **超时收紧到 connect 3 s / 总 8 s**（GitHub OAuth 正常 < 2 s）+ **只重试网络层错误**、HTTP 状态码交给轮询状态机 + **环境变量 `LLMR_GITHUB_IPS`（逗号分隔）可覆盖内置池**（边缘 IP 会变）；④ **不改协议面**：端点 / client_id / scope / 状态机 / 存储口径 / 边界**全部不动**，只动传输层容错 |
