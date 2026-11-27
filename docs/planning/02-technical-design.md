@@ -264,7 +264,7 @@ harness (pi 等)
 | R-3 | 出站 URL = `channel.base_url` + 渠道路径模板（见 §6.1 预设表；MiniMax/GLM 路径与 OpenAI 不同） | 全部 |
 | R-4 | 注入 `stream_options: {"include_usage": true}`（流式时） | 声明支持者：DeepSeek/Kimi/百炼/硅基流动/Copilot；MiniMax 不注入（其流式自带 usage，注入多余字段有 400 风险，标"待实测"） |
 | R-5 | query 追加 `GroupId=<group_id>`（仅当渠道 `meta_json.group_id` 非空） | MiniMax 国内 profile，见 §4.2 |
-| R-6 | 追加 Copilot 伪装头：`editor-version` / `editor-plugin-version` / `copilot-integration-id` / `user-agent`（具体值以参考仓库源码为准，见 §6.2） | Copilot |
+| R-6 | 追加 Copilot 伪装头：`editor-version` / `editor-plugin-version` / `copilot-integration-id` / `user-agent`（**具体值见 §6.2.2**，另有每次请求动态的 `x-request-id`） | Copilot |
 | R-7 | 剥离 hop-by-hop 头（`connection` / `keep-alive` / `transfer-encoding` / `content-length` 重算） | 全部 |
 | R-8 | 不认识的 body 字段一律透传（含 `tools` / `tool_choice` / `temperature` / `reasoning_effort` 等） | 全部 |
 
@@ -451,7 +451,7 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 3. 轮询 `POST https://github.com/login/oauth/access_token`（`grant_type=urn:ietf:params:oauth:grant-type:device_code`）→ GitHub token（`ghu_`，长期有效，vault 存储）。
 4. **Token 换取**：`GET https://api.github.com/copilot_internal/v2/token`（Bearer ghu_）→ Copilot token（JWT，**~30 分钟有效**）→ 内存缓存，过期前 5min 自动重取（R-6 伪装头也用于此请求）。
 
-**出站**：`POST https://api.githubcopilot.com/chat/completions`，Bearer = Copilot token，附 editor 伪装头（具体 UA/版本串以参考仓库源码为准，实现任务 T21 中核实并固化到常量）。
+**出站**：`POST {endpoints.api}/chat/completions`（**不带 `/v1`**），Bearer = **Copilot token**，附 R-6 伪装头（**具体取值与来源见 §6.2.2**，T21 已固化到常量）。
 
 **合规声明（必须写进 UI 首次启用弹窗）**：将 Copilot 额度用于第三方客户端违反 GitHub Copilot ToS，账号可能受限。用户显式确认后才启用。
 
@@ -514,6 +514,76 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 - **不做**指纹伪造、验证码绕过、签名伪造（AGENT.md §5.7）——设备流是 **GitHub 官方 OAuth**，走官方路径；
 - **本卡只取凭证**：出站 `/chat/completions` 转发与 **R-6 伪装头**（`Editor-Version` / `Editor-Plugin-Version` / `Copilot-Integration-Id` / `User-Agent`）属 **T21**；
 - **合规**：Copilot 渠道**默认关闭**（`enabled = 0`），**首次启用的 ToS 确认弹窗属 T24**（AGENT.md §5.5）——本卡不提供启用开关。
+
+#### 6.2.2 出站适配口径（T21 落地，2026-11-27 核实）
+
+**R-6 伪装头（四项固定 + 一项动态）**
+
+| 头 | 值 | 来源 |
+|---|---|---|
+| `copilot-integration-id` | `vscode-chat` | liter-llm（docs.rs `provider/github_copilot.rs` 静态头）、npm `@opeoginni/github-copilot-openai-compatible` README |
+| `editor-version` | `vscode/1.104.1` | npm README（明确给 `Editor-Version: vscode/1.104.1`）。**取值分歧**：liter-llm 用 `vscode/1.95.0`、`ericc-ch/copilot-api` 动态探测 VS Code 版本（兜底 `1.104.3`）、`Alorse/copilot-to-api` 按客户端写成 `Neovim/0.6.1` → **头是按客户端变的**。本卡**取 npm 那个**（其协议契约与本项目一致：OpenAI 兼容 + `/chat/completions`），**且是常量**——版本串变了改常量即可，**不用动协议** |
+| `editor-plugin-version` | `copilot-chat/0.26.7` | liter-llm（`COPILOT_VERSION="0.26.7"`）、npm README |
+| `user-agent` | `GitHubCopilotChat/0.26.7` | 同上（与 T20 授权请求用的 UA 同串） |
+| `x-request-id` | **每次请求动态**的 UUID v4 | liter-llm（每次请求生成）、bjornmelin（`X-Request-Id`） |
+
+**真机验证（2026-11-27）**：以上四项 + `x-request-id` 经**真实上游**
+`https://api.individual.githubcopilot.com/chat/completions` **实测通过**——上游正常回话
+（流式 6~12 帧，内容真实），**没有**报任何头缺失或鉴权错误；出站报文由
+`cargo run --example copilot_outbound` 原样打印（`Authorization` 打码）。
+
+**明确不发的头（边界，不是遗漏）**：
+
+- **`machine-id`**：bjornmelin 有发，但那是**设备指纹** → 撞 AGENT.md §5.7「不内置任何风控规避能力」；liter-llm 与 npm 参考实现都**不发** → **不实现**；
+- **`openai-intent` / `openai-organization` / `x-github-api-version` / `x-vscode-user-agent-library-version`**：liter-llm 有发，npm 参考实现**没发**；R-6 是「改写器不是转换器」（§5.6）→ **只认 §4.1 明列的四项**，不擅自加。
+
+**出站 URL 与鉴权**
+
+| 项 | 值 | 依据 |
+|---|---|---|
+| URL | `{endpoints.api}` + `/chat/completions`（**不带 `/v1`**） | liter-llm（路径 `/chat/completions` / `/embeddings` / `/models`）、npm（codex 走 `/responses`，其余走 `/chat/completions`） |
+| base | **④ 的 `endpoints.api` 为准**（本账号实测 `https://api.individual.githubcopilot.com`），缺省 `https://api.githubcopilot.com` | §6.2.1 |
+| 鉴权 | `Authorization: Bearer <Copilot token>`（**Copilot token**，~30 min 短期凭据） | §6.2.1 |
+| R-4 | **注入** `stream_options.include_usage`（Copilot 声明支持） | §4.1 |
+
+**凭证供给口径（关键，与 T20 的分工）**
+
+**OAuth 型渠道的凭证由 adapter 自己供给，网关不解密。** 理由：GitHub token（`ghu_`，长期）与 Copilot token（~30 min）**不能互换**——前者只能用来换后者。若沿用网关「按 `credential.kind` 选一条」的旧口径，Copilot token 一过期就会**误取 GitHub token** 当 Bearer → 必然 401。
+
+- `CopilotAdapter::complete()` 出站前调 `ensure_token()`（T20 提供）：**缓存命中且离过期 ≥ 300 s** → 直接用；否则用保险库里的 GitHub token 重取（回写保险库 + 缓存）。
+- 网关侧：`fallback.rs` 对 `kind = oauth` 的候选**不解密**（`CallContext.credential = None`），凭证一律由 adapter 供给；WorkBuddy（T23）沿用同一口径。
+- `refresh()`（02 §6.4「OAuth 型必须实现」）：Copilot 的凭证刷新**发生在 `complete()` 内按需进行**（`ensure_token` 自带续期），`refresh()` 不单独取渠道上下文 → 保持 no-op 并在此说明。
+- **注入方式**：`AdapterDeps`（vault + Copilot 端点 + token 缓存）→ 网关的 `Forwarder` 持有它 → **生产用真实端点 + 全局缓存，测试用本地 mock 端点 + 独立缓存**（并行用例互不污染，**不出网**）。
+
+**模型目录口径**
+
+`GET {endpoints.api}/models`（Bearer + R-6 头）→ OpenAI 风格的 `{"data": [...], "object": "list"}`。
+
+**真机实测（2026-11-27，账号 `api.individual.githubcopilot.com`，原始条目 39 条 → 收录 19 条）**：
+
+| 字段 | 实测取值 | 用途 |
+|---|---|---|
+| `id` | 如 `gpt-4o-mini-2024-07-18` / `kimi-k3-copilot` / `copilot-search-a` | **上游真实模型名**（R-1 的替换目标）**兼**对外别名 |
+| `name` | 如 `GPT-4o mini` | 展示名（UI 用） |
+| `policy.state` | `enabled` / `disabled` / **缺省**（该键整个没有） | `disabled` → **不收录**（策略禁用） |
+| `capabilities.type` | `chat` / `embeddings` / `decisions` | **不是 `chat` → 不收录**（见下） |
+| `supported_endpoints` | **路径形式**：`/chat/completions`、`/responses`、`/responses/ws:`、`/v1/decisions`、`/v1/systemone`；**老模型没有这个键** | **含 chat 端点才收录**（端点字段缺失 → 按 chat 收） |
+| `capabilities.supports.*` / `capabilities.limits.*` / `capabilities.family` / `vendor` | `tool_calls` / `streaming` / `vision` / `max_context_window_tokens`（实测 128000 / 260000 / 1048576…）/ `family` / `vendor`（`Azure OpenAI`） | 展示用 |
+
+**收录规则（三条，缺一不可）**：
+
+1. `policy.state == "disabled"` → **不收录**；
+2. `capabilities.type` **存在且不是 `chat`** → **不收录**（`embeddings` / `decisions` 走别的端点，v1 **不做协议转换**，收录了也打不通）；
+3. `supported_endpoints` **存在但不含 chat 端点** → **不收录**（`/responses`、`/responses/ws:` 这类只有 Responses 端点的模型）。
+
+**端点字段有两种形状，都要认**（**这是真机实测踩到的坑**）：真实上游给的是**路径**（`/chat/completions`），而社区 schema（opencode `github-copilot/models.ts`）里是**短名**（`chat`）→ 实现按「**路径含 `chat/completions` 或短名等于 `chat`**」判定，两种都收。
+
+**落库口径**（`model` 表）：
+
+- **别名 = `id`**（例 `gpt-4o-mini-2024-07-18`）；**别名已被别的渠道占用 → 跳过**（不抢、不覆盖），并在结果里报出来；
+- **用户改过别名**（同一 `upstream_id` 挂在别的别名下）→ **跳过**（尊重用户的命名）；
+- 目录里**没有**的旧模型 → **置为禁用**（`enabled = 0`），**不物理删除**（避免连带删掉 `route_member` 编排；与 `save_channel` 的既有语义一致）；
+- 渠道本身**仍默认关闭**（`enabled = 0`）→ 模型**不会**出现在 `GET /v1/models`；启用开关属 T24。
 
 
 ### 6.3 WorkBuddy（登录态型）
@@ -1285,14 +1355,21 @@ cost_micros = round( ( 可计费输入   × input_per_1m
 
 | 项 | DeepSeek | Kimi | GLM | MiniMax国际 | MiniMax国内 | 百炼 | 硅基流动 | Copilot | WorkBuddy |
 |---|---|---|---|---|---|---|---|---|---|
-| 非流式 chat | | | | | | | | | |
-| 流式 chat | | | | | | | | | |
-| tool_calls | | | | | | | | | |
-| usage 返回 | | | | | | | | | |
-| reasoning 字段 | | n/a | | ✔已验证 | | | | | |
-| 多轮上下文 | | | | | | | | | |
+| 非流式 chat | | | | | | | | ✔已验证 | |
+| 流式 chat | | | | | | | | ✔已验证 | |
+| tool_calls | | | | | | | | · 未测 | |
+| usage 返回 | | | | | | | | ✔已验证 | |
+| reasoning 字段 | | n/a | | ✔已验证 | | | | n/a | |
+| 多轮上下文 | | | | | | | | · 未测 | |
 
 判据：全绿才能在预设中标 `stable`；部分绿标 `partial`（UI 明示哪些特性不可用）。
+
+> **Copilot 列（T21，2026-11-27 真机实测，账号 `api.individual.githubcopilot.com`）**：
+> ① **非流式 chat ✔** —— 经真网关 `gpt-4o-mini-2024-07-18` 回「我是一个基于人工智能技术的智能助手…」；
+> ② **流式 chat ✔** —— 15 个 SSE 帧真实内容直通（`[DONE]` 直通）；
+> ③ **usage 返回 ✔** —— `usage_log` 落库 `status=success`、`tokens=13/19`、**`estimated=0`**（上游 usage 精确值，**未走估算**）；
+> ④ `tool_calls` / `多轮上下文` **未测**（**不猜**）；`reasoning` 字段对所测模型 **n/a**。
+> 留档：`docs/reviews/T21-copilot-outbound.md`。
 
 **执行方式（T10 落地）**：`scripts/channel_matrix.py` 对**已在应用里配好的渠道**经网关跑
 上表前 7 列的 6 项，产物落到 `docs/reviews/channel-matrix-<日期>.md`（主矩阵 + 逐项证据 +
@@ -1422,3 +1499,5 @@ python scripts/security_check.py `
 | v0.26 | 2026-11-27 | T19 **系统通知「静默丢弃」的根因与如实报告**（头头反馈「屏幕上没有」后查出来的）：① **新增 §7.5 §6**——Windows 的 toast 有**两层**独立的静默拦截，任一层挡住都**静默丢弃**（`notify-rust` 照样返回成功、日志写着「已发送」、屏幕上什么都没有）：**① 调用进程没有对应 AUMID**（Windows 10 1607+ 要求进程拥有 `System.AppUserModel.ID`）→ 自建 AUMID + COM 注册开始菜单快捷方式；**② 全局通知总开关关着**（`HKCU\…\CurrentVersion\PushNotifications\ToastEnabled = 0`）→ **所有**应用的 toast 都被拦；② **根因定位方法（别再走错路）**：事件日志 `Microsoft-Windows-PushNotification-Platform/Operational` 的 `Id=3150 … PolicyReason [GlobalSettingDisabled]` 是决定性证据；**别的应用同样中招** → 所以「连 PowerShell 原生 toast 也不显示」是**同一个全局开关**，**不是** AUMID 问题；③ **两个坑**：改完注册表**必须重启 `WpnUserService_<sid>`**（或注销重登）才生效——通知平台服务把策略**缓存**在内存里（连改两次注册表、当场重发都还是被拦）；④ **投递成功的判据**（比「API 返回成功」可靠）：事件日志出现 `Id=3153 Toast … is delivered to <AUMID> on session N`，且通知库 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表里有对应 payload（**被丢弃的 toast 从不入库**）；⑤ **代码侧补「如实报告」**：发送前读全局开关（`system_notify::global_toasts_enabled` + 纯函数 `global_block_reason`），关着就报「Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试」，**不再谎报「已发送」** |
 | v0.27 | 2026-11-27 | M4 **T20 Copilot OAuth（卡片补全 + 协议细节）**：① **新增 §6.2.1**——把 §6.2 的四步落成**可实现的协议细节**：client_id `Iv1.b507a08c87ecfe98`（VS Code 的**公开** client_id，**不是密钥**、用户无须填）、scope `read:user`、三个端点、轮询错误码状态机（`authorization_pending` / `slow_down`(+5s) / `expired_token` / `access_denied` / 成功）、Copilot token 响应形状 `{token, expires_at(float), endpoints}`（**`endpoints.api` 以它为准**）；② **存储口径**：GitHub token（长期）→ 保险库 `kind='oauth_gh_token'`；Copilot token（~25~30min）→ 保险库 `kind='oauth_copilot_token'` + `expires_at`（§9 的列）+ 进程内缓存，**过期前 5 min 自动重取**；③ **风险声明**：`/copilot_internal/v2/token` 是**社区观察到的内部端点**，GitHub 未公开承诺稳定 → 可能随时变更；④ **边界**：本卡**只取凭证**——出站转发与 R-6 伪装头属 **T21**，**ToS 确认弹窗与启用开关属 T24**（渠道**默认关闭** `enabled=0`，AGENT.md §5.5）；⑤ **合规**：走 GitHub **官方** device flow，**不做**指纹伪造/验证码绕过/签名伪造（§5.7） |
 | v0.28 | 2026-11-27 | M4 **T20 网络层容错（判据⑤ 真机授权受阻后的根因与修法）**：① **新增 §6.2.1「网络层容错」**——本机到 `github.com` **时好时坏**，且**失败模式因请求方法而异**：`GET /login/device` 能通的 IP，`POST /login/oauth/access_token` 可能 0/N（实测 `20.205.243.166` POST 3/3，`20.200.245.247` / `20.26.156.215` / `140.82.112.3` / `140.82.114.4` 虽 GET 3~5/5 但 **POST 0/3**）；② **两条已证伪的绕法**（别再走）：**`api.github.com` 的 IP 配 SNI=`github.com`** → 5/5 秒回但 **HTTP 400**（后端不认）；**动态 DNS 发现候选 IP** → 系统 DNS 连续 16 次解析**全是同一个 A 记录**（ISP 侧有缓存，不轮询）；③ **修法口径**：**候选 IP 池 + 每次重试轮换**（钉死单个 IP 会把 900 s 设备码寿命全耗在一条坏路径上——实测钉 `20.27.177.113` 后连续 40 次轮询全超时、设备码到期作废）+ **池尾保留一个走普通 DNS 的 client 兜底** + **超时收紧到 connect 3 s / 总 8 s**（GitHub OAuth 正常 < 2 s）+ **只重试网络层错误**、HTTP 状态码交给轮询状态机 + **环境变量 `LLMR_GITHUB_IPS`（逗号分隔）可覆盖内置池**（边缘 IP 会变）；④ **不改协议面**：端点 / client_id / scope / 状态机 / 存储口径 / 边界**全部不动**，只动传输层容错 |
+| v0.29 | 2026-11-27 | M4 **T21 Copilot 出站适配（卡片补全 + R-6 取值固化）**：① **新增 §6.2.2 出站适配口径**——**R-6 四项固定头 + 一项动态头**（`copilot-integration-id: vscode-chat` / `editor-version: vscode/1.104.1` / `editor-plugin-version: copilot-chat/0.26.7` / `user-agent: GitHubCopilotChat/0.26.7` / `x-request-id: <UUID v4，每次请求不同>`），取值与来源逐条列出；**取值分歧已裁决**（`editor-version`：liter-llm `vscode/1.95.0` / npm `vscode/1.104.1` / ericc-ch 动态探测兜底 `1.104.3` / copilot-to-api 按客户端写 `Neovim/0.6.1` → **头是按客户端变的**；本卡取 npm 那个，**且是常量**——版本串变了改常量即可，不用动协议）；② **明确不发的头**（边界，不是遗漏）：**`machine-id`**（**设备指纹** → 撞 §5.7；liter-llm 与 npm 参考实现都不发）、`openai-intent` / `openai-organization` / `x-github-api-version` / `x-vscode-user-agent-library-version`（R-6 只认 §4.1 明列的四项，§5.6 改写器不是转换器）；③ **出站 URL 与鉴权**：`POST {endpoints.api}/chat/completions`（**不带 `/v1`**）+ `Authorization: Bearer <Copilot token>`（**不是 GitHub token**）+ R-4 注入 `stream_options.include_usage`；④ **凭证供给口径（本卡最关键的一条）**：**OAuth 型渠道的凭证由 adapter 自己供给，网关不解密**——GitHub token（`ghu_`，长期）与 Copilot token（~30 min）**不能互换**，沿用网关「按 `credential.kind` 选一条」的旧口径会在 token 过期时**误取 GitHub token** 当 Bearer → 必然 401；`CopilotAdapter::complete()` 出站前调 `ensure_token()`（过期前 300 s 自动重取）；`refresh()` 因**拿不到渠道上下文**保持 no-op 并写明理由；注入方式 = `AdapterDeps`（vault + Copilot 端点 + token 缓存）→ 网关 `Forwarder` 持有 → **生产真实端点 + 全局缓存 / 测试本地 mock 端点 + 独立缓存**（不出网、并行用例互不污染）；⑤ **模型目录口径**：`GET {endpoints.api}/models` → `{"data":[…]}`（字段 `id` / `name` / `policy.state` / `supported_endpoints` / `capabilities.*`）→ **别名 = `id`**、**别名被别的渠道占用则跳过**、**目录里没有的旧模型置为禁用**（不物理删除，避免连带删掉 `route_member` 编排）；**只收录 `policy.state != disabled` 且 `supported_endpoints` 含 `chat` 的模型**（codex 类只支持 `/responses` → v1 **不做协议转换**）；⑥ **边界**：**ToS 弹窗与启用开关属 T24**（本卡**不提供**启用入口）、**不实现 `/responses` 与 `/messages`**、`machine-id` 不实现 |
+| v0.30 | 2026-11-27 | M4 **T21 真机实测修订（模型目录口径按真实响应订正）**：① **§6.2.2「模型目录口径」按真机响应重写**——真实上游的 `supported_endpoints` 给的是**路径**（`/chat/completions`、`/responses`、`/responses/ws:`、`/v1/decisions`），**不是**社区 schema 里的短名（`chat`）→ v0.29 写的「含 `chat` 才收录」在真实数据上**等于没过滤**，实测把 `text-embedding-3-small` 等 3 个 **embeddings** 模型与一批只支持 `/responses` 的模型一起收了进来；② **收录规则补第二条**：`capabilities.type` **存在且不是 `chat`** → 不收录（真实取值有 `chat` / `embeddings` / `decisions`）；③ **端点判定两种形状都认**（路径含 `chat/completions` **或**短名等于 `chat`）——路径与短名各留一条单测；④ **实测数据**：账号 `api.individual.githubcopilot.com` 的 `/models` 原始 **39 条 → 收录 19 条**（`policy.state=disabled` 8 条、`capabilities.type != chat` 3 条、只支持 `/responses` 9 条被排除）；⑤ **真机四证**：R-6 四头 + `x-request-id` 经真实上游**实测通过**（上游正常回话，无头缺失/鉴权错误）、**经真网关流式对话成功**（`gpt-4o-mini-2024-07-18`，6~12 帧真实内容）、`usage_log` 落库 `status=success`（`tokens=13/22`、`estimated=0`、耗时 2999~3575 ms）、**四层零明文**（官方执行器明文命中 0 条 + `ghu_`/`eyJ`/`Bearer` 形态扫描 0 命中）；⑥ **订正后的落库语义**经真机验证：上轮误收的 3 个 embedding 模型在重新同步时**被置为禁用而非物理删除**（`model` 表 22 行 / 启用 19 行）；⑦ **新增落库口径**：`supported_endpoints` 缺失的老模型（`gpt-4o` 家族）**按 chat 收**（`capabilities.type=chat`，真机实测能对话）；⑧ **不改协议面**：R-6 取值 / 出站 URL / 凭证供给口径 / 边界**全部不动**，只修收录规则 |

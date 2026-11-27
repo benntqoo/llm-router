@@ -172,6 +172,15 @@ M4 中 WorkBuddy 存在协议不确定性（T22 抓包），允许降级交付�
 **T21 Copilot 出站适配 + 实测** `2d` · 依赖 T20 T6
 - R-6 伪装头（以参考仓库源码核实固化）、出站转发、实测矩阵第 8 列。
 - 验收：经网关流式对话成功；token 过期后自动续。
+- **卡片补全（2026-11-27，头头批准开卡前补）**：口径见 02 **§6.2.2** + §6.2.1（§13 **v0.29**）。
+  - **产出**：`providers::copilot`（`CopilotAdapter` + R-6 常量 + 模型目录拉取与解析）+ `providers::config_from_row` 的 copilot 分支 + `providers::adapter_for` 认领 `copilot` + `commands::copilot` 增 **1 个 IPC**（刷新模型目录）+ 前端「刷新模型目录」区块。
+  - **出站**：`POST {endpoints.api}/chat/completions`（**不带 `/v1`**）；`Authorization: Bearer <Copilot token>`（**是 Copilot token，不是 GitHub token**）；R-6 **四项固定头** + **每次请求动态**的 `x-request-id`（UUID v4）。
+  - **R-6 取值（2026-11-27 多来源交叉核实）**：`copilot-integration-id: vscode-chat` / `editor-version: vscode/1.104.1` / `editor-plugin-version: copilot-chat/0.26.7` / `user-agent: GitHubCopilotChat/0.26.7`。取值依据与「为什么取这一个」见 02 §6.2.2 的来源表。
+  - **凭证供给（关键口径）**：**OAuth 型渠道的凭证由 adapter 自己供给**——网关**不解密** OAuth 凭证，`CopilotAdapter` 出站前调 `ensure_token()`（过期前 300 s 自动重取，复用 T20 的保险库 + 缓存）。**理由**：GitHub token（`ghu_`，长期）与 Copilot token（~30 min）**不能互换**（前者只能换后者）；沿用网关「按 `credential.kind` 选一条」的旧口径，Copilot token 一过期就会**误取 GitHub token** 当 Bearer → 必然 401。
+  - **模型目录**：`GET {endpoints.api}/models`（Bearer + R-6 头）→ `{"data":[…]}`（字段 `id` / `name` / `policy.state` / `supported_endpoints` / `capabilities.*`）→ 落 `model` 表：**别名 = `id`**；**别名被别的渠道占用 → 跳过**（不抢不覆盖）；**目录里没有的旧模型 → 置为禁用**（不物理删除，避免连带删掉 `route_member` 编排）。
+  - **验收判据（本卡）**：① R-6 四头**逐头断言值** + `x-request-id` 每次都不同；② 出站 URL 与 Bearer 单测（**断言用的是 Copilot token 而非 GitHub token**）；③ **token 过期后自动续**单测（本地 mock，**不出网**）；④ 模型目录解析与落库单测（含**别名冲突跳过**与**旧模型禁用**两条分支）；⑤ **经网关流式对话成功**（本地 mock 上游走**真网关**）；⑥ 02 §10.1 实测矩阵**第 8 列（Copilot）至少 3 项**回填。
+  - **边界（不做）**：**ToS 弹窗与启用开关**（属 **T24**；本卡**不提供**启用入口——真机验收时**手工**把渠道 `enabled` 置 1 属**验收步骤**、不是产品功能）；`/responses` 与 `/messages` 端点（**v1 入站仅 OpenAI chat**，§5.6 不做协议转换 → 只收录**走 chat 端点**的模型）；`machine-id` 头（**设备指纹**，撞 §5.7）；`openai-intent` / `openai-organization` / `x-github-api-version`（**R-6 只认 §4.1 明列的四项**，不擅自加）；WorkBuddy 抓包与 adapter（属 T22 / T23）。
+  - **完成状态（2026-11-27）**：**6 条判据逐条实测全绿**（本地 mock 单测 + e2e + **真机真实上游**）；**真机四证**：① **R-6 四头 + `x-request-id` 经真实上游实测通过**（`https://api.individual.githubcopilot.com/chat/completions` 正常回话，**无头缺失/鉴权错误**）② **经真网关流式对话成功**（`gpt-4o-mini-2024-07-18`，15 帧真实内容直通）+ **非流式成功** ③ `usage_log` 落库 `status=success`（`tokens=13/19`、**`estimated=0`**、耗时 2999~5071 ms）④ **四层零明文**（官方执行器明文命中 0 条 + `ghu_`/`eyJ`/`Bearer` 形态扫描 0 命中）；**真机揪出并修掉两个真问题**：**① 端点字段形状错了**——真实 `supported_endpoints` 给的是**路径**（`/chat/completions`）而非社区 schema 的短名（`chat`）→ 原过滤**等于没生效**，实测误收了 3 个 **embeddings** 模型与一批只支持 `/responses` 的模型 → 补 `capabilities.type != chat` 一条规则 + 两种形状都认（02 §6.2.2，§13 **v0.30**）；**② 真机验收工具把渠道留在开启态**——验收进程被管道中断，`process::exit` 不跑析构 → 改用 **Drop 守卫**保证任何退出路径都还原渠道（AGENT.md §5.5「反代默认关闭」）。留档 `docs/reviews/T21-copilot-outbound.md`；**边界遵守**：本卡**未提供**启用入口（真机验收临时开、测完自动还原，实测终态 `enabled=0`）；**未实现** `/responses` 与 `machine-id`。
 
 **T22 WorkBuddy 协议确认（抓包）** `2–3d` · 依赖 无（可与 T20 并行）
 - 目标：确认 ① `~/.workbuddy/app/users/<hash>/` 内登录态字段；② 上游 API host 与鉴权头；③ device-id 是否参与签名。
