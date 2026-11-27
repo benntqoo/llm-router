@@ -154,7 +154,41 @@ pub async fn run_site(
     let outcome = execute(vault, engine, site).await;
     record(store, &site.id, &outcome);
     write_back_reward(store, site, &outcome);
+    // 通知（T19，02 §7.5）：**结果已落库之后**才发；**发不出去不影响签到结果**。
+    notify_result(store, vault, engine.client(), site, &outcome).await;
     outcome
+}
+
+/// 发签到结果通知（**失败不影响签到结果**：只记日志、不重试、不回显地址）。
+///
+/// **一处落点覆盖全部执行路径**：应用内每分钟 tick / UI「立即执行」/
+/// CLI `--checkin-once` / **Windows 计划任务（应用关闭时）**。
+pub async fn notify_result(
+    store: &Store,
+    vault: &Arc<RwLock<Vault>>,
+    client: &reqwest::Client,
+    site: &SiteRow,
+    outcome: &ReplayOutcome,
+) {
+    let settings = crate::checkin::notify::load_settings(store);
+    if !settings.enabled {
+        return;
+    }
+    // 成功可关；**失败永远通知**（AGENT.md §5.7：撞到验证码 = 失败并通知）
+    if outcome.ok && !settings.notify_success {
+        return;
+    }
+    let notification = crate::checkin::notify::build_notification(
+        &site.name,
+        outcome.ok,
+        outcome.class.as_str(),
+        &outcome.message,
+        outcome.reward.as_ref(),
+    );
+    let results = crate::checkin::notify::send(client, &settings, vault, &notification).await;
+    for result in results {
+        println!("[notify] {}：{}", result.channel, result.detail);
+    }
 }
 
 /// 按插件类型执行一次签到（**不分派到别处**）。

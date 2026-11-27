@@ -45,6 +45,10 @@ async-trait = "0.1.92"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 # cron 表达式解析与匹配（T17：调度器，02 §7.2）
 cron = "0.12"
+# 系统通知（T19：02 §7.5）
+# **刻意不用 Tauri 通知插件**：CLI `--checkin-once` 与 Windows 计划任务路径**没有
+# Tauri app handle**，用插件就只能在应用开着时通知，覆盖不了「应用关闭时也通知」。
+notify-rust = "4.11"
 # 本地时区（cron 表达式按用户所在时区解释；02 §7.2.1）
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 流式管道：Stream 组合（stream.rs 的逐帧转发与错误收尾）
@@ -54,7 +58,17 @@ tiktoken-rs = "0.12.1"
 
 # Windows DPAPI（主密钥由 OS 原生保护，绑定当前用户）
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Globalization"] }
+# COM / Shell：AUMID 注册（T19 系统通知）
+windows = { version = "0.62.2", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
 
 # macOS Keychain（主密钥由 OS 原生保护）
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -202,6 +202,9 @@ pub fn run() {
             commands::checkin::checkin_plugin_login,
             commands::checkin::checkin_sidecar_health,
             commands::checkin::checkin_site_reward,
+            commands::notify::notify_get_config,
+            commands::notify::notify_set_config,
+            commands::notify::notify_test,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

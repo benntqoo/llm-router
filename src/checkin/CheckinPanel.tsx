@@ -27,6 +27,13 @@ import {
   formatRelative,
   validateCron,
 } from "./schedule";
+import {
+  describeNotifyState,
+  needsChatId,
+  webhookPlaceholder,
+  webhookUrlToSend,
+  WEBHOOK_KINDS,
+} from "./notify";
 import type {
   BuiltinSite,
   ChannelOption,
@@ -34,6 +41,9 @@ import type {
   HarImport,
   LoginSummary,
   MarkedVariable,
+  NotifyChannelResult,
+  NotifyConfig,
+  NotifyConfigInput,
   ResultView,
   RunSummary,
   SaveTemplateInput,
@@ -84,6 +94,67 @@ export default function CheckinPanel() {
   /** 登录态输入框的草稿（`siteId` → 明文；**只活在内存里**，提交后清空）。 */
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({});
   const [sidecarHealth, setSidecarHealth] = useState<SidecarHealth | null>(null);
+  // ── T19 通知 ──
+  const [notifyConfig, setNotifyConfig] = useState<NotifyConfig | null>(null);
+  /** webhook 地址草稿（**只活在内存里**；保存后清空，地址永不回显）。 */
+  const [webhookDraft, setWebhookDraft] = useState("");
+  const [chatIdDraft, setChatIdDraft] = useState("");
+  /** 「清除 webhook」的待办（点「清除」才置位）。 */
+  const [clearWebhook, setClearWebhook] = useState(false);
+
+  const refreshNotify = useCallback(async () => {
+    try {
+      const config = await invoke<NotifyConfig>("notify_get_config");
+      setNotifyConfig(config);
+      setChatIdDraft(config.telegramChatId ?? "");
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const saveNotify = useCallback(async () => {
+    if (!notifyConfig) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const input: NotifyConfigInput = {
+        enabled: notifyConfig.enabled,
+        systemEnabled: notifyConfig.systemEnabled,
+        notifySuccess: notifyConfig.notifySuccess,
+        webhookKind: notifyConfig.webhookKind || null,
+        // 空输入 = 不动；点过「清除」= 传空串
+        webhookUrl: clearWebhook ? "" : webhookUrlToSend(webhookDraft),
+        telegramChatId: chatIdDraft.trim() || null,
+      };
+      const saved = await invoke<NotifyConfig>("notify_set_config", { input });
+      setNotifyConfig(saved);
+      setWebhookDraft("");
+      setClearWebhook(false);
+      setNotice("通知配置已保存。");
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [notifyConfig, webhookDraft, chatIdDraft, clearWebhook]);
+
+  const testNotify = useCallback(async () => {
+    setBusy(true);
+    try {
+      const results = await invoke<NotifyChannelResult[]>("notify_test");
+      const summary = results
+        .map((item) => `${item.channel}：${item.ok ? "已发送" : item.detail}`)
+        .join("；");
+      setNotice(summary || "没有可用的通知通道。");
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
 
   const refreshSites = useCallback(async () => {
     try {
@@ -126,7 +197,8 @@ export default function CheckinPanel() {
     invoke<SidecarHealth>("checkin_sidecar_health")
       .then((row) => setSidecarHealth(row))
       .catch(() => setSidecarHealth(null));
-  }, [refreshSites, refreshResults]);
+    void refreshNotify();
+  }, [refreshSites, refreshResults, refreshNotify]);
 
   // 相对时间要自己走（不然「下次：3 分钟后」会一直停在旧值）
   useEffect(() => {
@@ -731,6 +803,139 @@ export default function CheckinPanel() {
               ))}
             </tbody>
           </table>
+        </>
+      )}
+
+      <h3>结果通知（T19）</h3>
+      {notifyConfig === null ? (
+        <p className="muted">通知配置没读出来。</p>
+      ) : (
+        <>
+          <p className="muted">
+            每次签到（<b>应用开着、关着都一样</b>——计划任务那条路也走同一段代码）
+            都会发结果通知：<b>失败永远通知</b>（含站点名与原因），成功可关。
+            webhook 地址与 token <b>只进加密保险库</b>——不落库、不回显、不进日志。
+          </p>
+          <div className="muted">
+            {describeNotifyState(
+              notifyConfig.enabled,
+              notifyConfig.systemEnabled,
+              notifyConfig.notifySuccess,
+              notifyConfig.webhookConfigured,
+            )}
+          </div>
+          <div className="row-inline">
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={notifyConfig.enabled}
+                disabled={busy}
+                onChange={(e) =>
+                  setNotifyConfig({ ...notifyConfig, enabled: e.target.checked })
+                }
+              />
+              开启通知
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={notifyConfig.systemEnabled}
+                disabled={busy}
+                onChange={(e) =>
+                  setNotifyConfig({ ...notifyConfig, systemEnabled: e.target.checked })
+                }
+              />
+              系统通知（弹窗）
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={notifyConfig.notifySuccess}
+                disabled={busy}
+                onChange={(e) =>
+                  setNotifyConfig({ ...notifyConfig, notifySuccess: e.target.checked })
+                }
+              />
+              成功也通知
+            </label>
+          </div>
+          <div className="row-inline">
+            <label>
+              webhook 类型
+              <select
+                value={notifyConfig.webhookKind ?? ""}
+                disabled={busy}
+                onChange={(e) =>
+                  setNotifyConfig({
+                    ...notifyConfig,
+                    webhookKind: e.target.value || null,
+                  })
+                }
+              >
+                {WEBHOOK_KINDS.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="muted">
+              {WEBHOOK_KINDS.find(
+                (item) => item.value === (notifyConfig.webhookKind ?? ""),
+              )?.hint ?? ""}
+            </div>
+          </div>
+          {(notifyConfig.webhookKind ?? "") !== "" && (
+            <div className="row-inline">
+              <label>
+                webhook 地址
+                <input
+                  type="password"
+                  value={clearWebhook ? "" : webhookDraft}
+                  placeholder={webhookPlaceholder(notifyConfig.webhookKind)}
+                  disabled={busy || clearWebhook}
+                  onChange={(e) => {
+                    setWebhookDraft(e.target.value);
+                    setClearWebhook(false);
+                  }}
+                />
+              </label>
+              <div className="muted">
+                {clearWebhook
+                  ? "保存后会清除已配置的地址。"
+                  : notifyConfig.webhookConfigured
+                    ? "已配置（地址不回显；留空 = 保持不变）。"
+                    : "还没配置。"}
+              </div>
+              {notifyConfig.webhookConfigured && !clearWebhook && (
+                <button onClick={() => setClearWebhook(true)} disabled={busy}>
+                  清除
+                </button>
+              )}
+            </div>
+          )}
+          {needsChatId(notifyConfig.webhookKind) && (
+            <div className="row-inline">
+              <label>
+                Telegram chat_id
+                <input
+                  type="text"
+                  value={chatIdDraft}
+                  placeholder="-1001234567890"
+                  disabled={busy}
+                  onChange={(e) => setChatIdDraft(e.target.value)}
+                />
+              </label>
+            </div>
+          )}
+          <div className="row-inline">
+            <button onClick={() => void saveNotify()} disabled={busy}>
+              保存
+            </button>
+            <button onClick={() => void testNotify()} disabled={busy}>
+              测试通知
+            </button>
+          </div>
         </>
       )}
 

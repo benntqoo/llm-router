@@ -153,6 +153,9 @@ async fn start_mock() -> (String, Arc<MockState>) {
 fn app_state() -> (tempfile::TempDir, AppState) {
     let dir = tempfile::tempdir().expect("临时目录");
     let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
+    // **测试环境关掉通知**（T19）：通知默认开 → 每条用例都会弹一次系统通知，
+    // 变成噪音。通知本身的用例在 `tests/checkin_notify_e2e.rs` 里显式打开。
+    let _ = llm_router_lib::store::settings::set_setting(&store, "notify_enabled", "0");
     let vault = Arc::new(RwLock::new(
         Vault::open(Arc::clone(&store), dir.path().join("vault.bin"), None).expect("打开保险库"),
     ));

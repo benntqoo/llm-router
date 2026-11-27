@@ -167,3 +167,42 @@ export type ChannelOption = {
   name: string;
   provider: string;
 };
+
+/** 通知配置（T19；**没有地址**——地址在加密保险库里，不回显）。 */
+export type NotifyConfig = {
+  /** 总开关（关 = 一律不发）。 */
+  enabled: boolean;
+  /** 系统通知（弹窗）开关。 */
+  systemEnabled: boolean;
+  /** 成功也通知（失败永远通知）。 */
+  notifySuccess: boolean;
+  /** webhook 类型（`wecom` / `lark` / `telegram` / `null` = 不用）。 */
+  webhookKind: string | null;
+  /** webhook 是否已配置。 */
+  webhookConfigured: boolean;
+  /** Telegram 的 chat_id。 */
+  telegramChatId: string | null;
+};
+
+/** 保存通知配置的入参（**地址只在这次提交里出现一次**）。 */
+export type NotifyConfigInput = {
+  enabled: boolean;
+  systemEnabled: boolean;
+  notifySuccess: boolean;
+  webhookKind: string | null;
+  /**
+   * webhook 地址：
+   * - `null` → **不动**（保持原样）；
+   * - `""` → **清除**；
+   * - 有值 → **设置**（进保险库）。
+   */
+  webhookUrl: string | null;
+  telegramChatId: string | null;
+};
+
+/** 一个通知通道的发送结果（**脱敏**：不含地址）。 */
+export type NotifyChannelResult = {
+  channel: string;
+  ok: boolean;
+  detail: string;
+};
