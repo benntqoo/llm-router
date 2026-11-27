@@ -969,6 +969,21 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 - 本节**不含**：邮件 / 短信 / 钉钉 / 企微**应用**消息、通知历史与已读状态、模板自定义、@人。
 - 系统通知依赖 **OS 通知权限**（Windows 专注助手会挡；macOS 需授权）；Telegram 在**网络受限**区域不可达（大陆用户默认推荐企微 / 飞书）。
 
+**6. 系统通知的「静默丢弃」与如实报告（真机实测，2026-11-27）**
+
+Windows 的 toast 有**两层**独立的拦截，任一层挡住都会**静默丢弃**（`notify-rust` 照样返回成功，日志写着「已发送」、屏幕上什么都没有）：
+
+| 层 | 机制 | 现场取证 | 修法 |
+|---|---|---|---|
+| ① **调用进程没有对应 AUMID** | Windows 10 1607+ 要求调用进程拥有该 `System.AppUserModel.ID`，否则**丢弃** | `PushNotifications\Backup\<AUMID>` 里没有我们的记录 | 自建 AUMID + COM 注册开始菜单快捷方式（`checkin::system_notify::ensure_aumid`） |
+| ② **全局通知总开关关着** | `HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications\ToastEnabled = 0` → **所有**应用的 toast 被拦 | 事件日志 `Microsoft-Windows-PushNotification-Platform/Operational`：`Id=3150 … PolicyReason [GlobalSettingDisabled]` | **如实报告**：发送前读这个开关，关着就报「Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试」，**不再谎报成功** |
+
+- **②层的两个坑（真机踩过）**：
+  - 改完注册表**必须重启 `WpnUserService_<sid>`**（或注销重登）才生效——通知平台服务把策略**缓存**在内存里（连改两次注册表、当场重发都还是 `GlobalSettingDisabled`）；
+  - 这个开关是**全局**的：它关着时**别的应用的 toast 同样被拦**（本机另一个应用的通知也记着同一条 `Id=3150`）→ 所以「PowerShell 原生 toast 也不显示」**不是** AUMID 问题，别再往那条路查。
+- **投递成功的判据**（比「API 返回成功」可靠）：事件日志出现 `Id=3153 Toast … is delivered to <AUMID> on session N`，且通知库 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表里有对应 payload（被丢弃的 toast **从不入库**）。
+
+
 ---
 
 ## 8. 用量统计
@@ -1343,3 +1358,4 @@ python scripts/security_check.py `
 | v0.23 | 2026-11-27 | T18 **登录态口径改用「访问令牌」（不再手抄 Cookie）**：① **§7.4 §2 改写凭据口径**——魔搭的**开放平台访问令牌**（`ms-…`，个人中心 → 访问令牌 → 点一下复制）**可直接当网页会话用**（`Cookie: m_session_id=<令牌>` → `GET /api/v1/users/login/info` 即触发当日签到），且**同一个令牌就是 `/openapi/v1/*` 的 Bearer**（查魔粒）→ **一个令牌，签到 + 魔粒全包**；② **判别规则**（纯函数 + 单测）：密文**含 `=`** → 原始 Cookie 头（老路保留）；**不含 `=`** → 访问令牌；③ **记下两条走不通的路（都不内置）**——「让应用开浏览器自动登录」与「浏览器接管会话」：魔搭登录页的**人机验证专门拦自动化浏览器**（真机实测：Chrome 顶部挂着「自动测试软件正在控制 Chrome」，滑块报 `验证失败（error:22phmt）`、滑块根本没渲染），而**反检测 / 绕过验证码是 §5.7 红线**；**浏览器接管那套实现已在同轮全部撤销**（辅轨 `session` 动作、`run_secret`、IPC、前端按钮均已删，不留半成品）；④ **奖励口径**：魔粒改从 `/openapi/v1/magicubes/transactions` 算（**不用余额接口**——余额是总额，与「本次拿到多少」语义不符）；⑤ **密文边界不变**：令牌**只进保险库**，不回显、不进日志、不进 IPC 明文；⑥ **手抄 Cookie 那条路保留**（备选 / 排障），但不再是推荐路径 |
 | v0.24 | 2026-11-27 | T18 **ModelScope 真签到 + 魔粒字段形状实测收敛**：① **真签到成功**——访问令牌 → `Cookie: m_session_id=<令牌>` → `GET /api/v1/users/login/info` **HTTP 200**、`Success=true`、`Message="success"`，**277 ms**，**落库 `ok=1`**（走应用内 `scheduler::run_now`，与 UI「立即执行」同一条路径）；② **魔粒流水真实形状收敛**——`data.records[]`，金额字段 = **`total_amount`**（不是 `amount` / `points`）、日期字段 = **`gmt_created`**（**只有日期、没有时分秒**）、类型 = `type=EARN` + 规则 = `rule_key`；当日实测三条：`daily_active` **200** + `infocomplement_profile_experience` 50 + `infocomplement_email_verification` 50 → **只有 `daily_active` 是「每日签到」那一笔**（另两条是一次性资料奖励，不算进本次签到）；③ **奖励口径改为「签到前后差值」**——签到前取当日 `daily_active` 总额作基线、签到后再取一次，**差值 > 0 才是本次到账**；差值 = 0 → 判**「今天已领过」**（`points = null`、**不回写额度池**，与 §3 MiniMax 口径一致）——因为当日那条流水**整天都在**，直接取当日总额会让**同一天的第 2、3 次运行**被当成新到账、**额度池重复计数**；④ **网页会话 Cookie 也能开 `/openapi/v1/*`**（与 Bearer 回同一份流水）；⑤ **签到接口的响应体只是用户资料**（含 `GitlabAccessToken` 等敏感字段）→ 插件**不存响应体**（`body_preview` 留空），站点也**不提供「今日魔粒 / 已领」信号**；⑥ **§5 未验证项收敛**：ModelScope 只剩「差值 > 0 分支待次日首次运行」；⑦ **环境提示**：本机 `SetCursorPos` 被环境屏蔽（光标坐标钉死）→ UI 自动化点不动按钮，改走 `scheduler::run_now` 做真机验证 |
 | v0.25 | 2026-11-27 | T18/M3 **通知卡（T19）**：① **新增 §7.5 通知口径**——落点 = `scheduler::run_site` 之后（**结果已落库之后**），一处覆盖**四条执行路径**（应用 tick / UI 立即执行 / CLI `--checkin-once` / **Windows 计划任务（应用关闭时）**）；**成功与失败都通知**（失败永远通知 = §5.7「撞到验证码 = 失败并通知」落地，成功可关）；文案**必含站点名与原因**，零敏感信息（不带凭据/响应体）；② **系统通知用 `notify-rust`**——**刻意不用 Tauri 通知插件**：CLI / 计划任务路径**没有 Tauri app handle**，用插件就只能在应用开着时通知，**覆盖不了「应用关闭时」**这条 M3 判据；③ **Webhook 三种格式**（企微群机器人 / 飞书群机器人 / Telegram Bot）共用一个配置，Telegram 另需 `chat_id`；④ **配置落点**：`app_setting` 只存**非密文**项（总开关 / 成功也通知 / 类型 / **凭据 id** / chat_id），**webhook 地址与 bot token 进保险库**（`kind='webhook'`，挂占位渠道「通知」——`credential.channel_id` 是 NOT NULL 外键），**零明文**：不落设置表、不进日志、不回显 IPC；⑤ **通知失败不影响签到结果**（只记日志、不重试、不回显 URL）；⑥ **边界**：不含邮件/短信/钉钉/通知历史/模板自定义；系统通知依赖 OS 通知权限，Telegram 在网络受限区域不可达 |
+| v0.26 | 2026-11-27 | T19 **系统通知「静默丢弃」的根因与如实报告**（头头反馈「屏幕上没有」后查出来的）：① **新增 §7.5 §6**——Windows 的 toast 有**两层**独立的静默拦截，任一层挡住都**静默丢弃**（`notify-rust` 照样返回成功、日志写着「已发送」、屏幕上什么都没有）：**① 调用进程没有对应 AUMID**（Windows 10 1607+ 要求进程拥有 `System.AppUserModel.ID`）→ 自建 AUMID + COM 注册开始菜单快捷方式；**② 全局通知总开关关着**（`HKCU\…\CurrentVersion\PushNotifications\ToastEnabled = 0`）→ **所有**应用的 toast 都被拦；② **根因定位方法（别再走错路）**：事件日志 `Microsoft-Windows-PushNotification-Platform/Operational` 的 `Id=3150 … PolicyReason [GlobalSettingDisabled]` 是决定性证据；**别的应用同样中招** → 所以「连 PowerShell 原生 toast 也不显示」是**同一个全局开关**，**不是** AUMID 问题；③ **两个坑**：改完注册表**必须重启 `WpnUserService_<sid>`**（或注销重登）才生效——通知平台服务把策略**缓存**在内存里（连改两次注册表、当场重发都还是被拦）；④ **投递成功的判据**（比「API 返回成功」可靠）：事件日志出现 `Id=3153 Toast … is delivered to <AUMID> on session N`，且通知库 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表里有对应 payload（**被丢弃的 toast 从不入库**）；⑤ **代码侧补「如实报告」**：发送前读全局开关（`system_notify::global_toasts_enabled` + 纯函数 `global_block_reason`），关着就报「Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试」，**不再谎报「已发送」** |

@@ -20,7 +20,7 @@
 | 通知落点覆盖**四条执行路径**（含**应用关闭时**的计划任务） | ✅ 已验证（真机计划任务 → webhook 真送达） | §4.2 ③ |
 | webhook 地址**四层零明文**（库 / WAL / SHM / 保险库） | ✅ 已验证（**真机全库**扫描） | §4.2 ④ |
 | 通知失败**不影响签到结果落库** | ✅ 已验证 | §4.1 e2e ④ |
-| **系统通知横幅肉眼可见** | ❌ **未验证**（本机取不到 shell 合成层的证据） | §5 ① |
+| **系统通知横幅肉眼可见** | 🟡 **已投递、待目视确认**（事件日志 `Id=3153 delivered` + 通知库有记录；肉眼仍待头头确认） | §4.2 ⑤ · §5 ① |
 | **真实企微 / 飞书 / Telegram 群机器人** | ❌ **未验证**（只验了本地接收器 + 真实 HTTP 路径 + 真实请求体形状） | §5 ② |
 
 **一句话**：通知这条链**代码通、文案对、密文边界干净、落点一处覆盖四条路径**，并且**在应用完全关闭的情况下
@@ -120,6 +120,29 @@ python scripts/security_check.py --store "$env:APPDATA\llm-router\store.db" \
 ```
 
 **⑤ AUMID 注册落地**：开始菜单出现 `LLM Router.lnk`（1134 B）——Windows toast 的前置条件已就位。
+（注册本身也被系统确认：`PushNotifications\Backup\LLM Router` → `Setting = s:banner,s:toast,s:audio,c:toast,c:ringing`。）
+
+**⑥ 横幅投递链路的客观取证（这一条查出了真根因）**
+
+头头反馈「屏幕上没有」→ 查 `Microsoft-Windows-PushNotification-Platform/Operational` 事件日志：
+
+```
+Id=3150 处理本地通知失败： NotificationType [toast]，TrackingId [15743] AppId [LLM Router]
+        PolicyReason [GlobalSettingDisabled] HResult [Settings prevent the notification type from being delivered.]
+```
+
+→ **不是代码问题**：Windows 的**全局通知总开关**关着（`HKCU\…\CurrentVersion\PushNotifications\ToastEnabled = 0`），
+**所有**应用的 toast 都被拦——日志里另一个应用的 `NotifyIconGeneratedAumid_…` 同样记着 `GlobalSettingDisabled`
+（这解释了「连 PowerShell 原生 toast 也不显示」，此前误以为是我们 AUMID 的问题）。
+
+**修法与验证**：
+1. 打开两个全局开关（`PushNotifications\ToastEnabled = 1`、`Notifications\Settings\NOC_GLOBAL_SETTING_TOASTS_ENABLED = 1`）→ **当场重发仍被拦**（通知平台服务**缓存**了策略）；
+2. **重启 `WpnUserService_<sid>`** → 重发 → 事件日志变成
+   `Id=3153 Toast with notification tracking id 15750 is delivered to LLM Router on session 2.`，**不再有 `Id=3150`**；
+3. 通知库 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 里**出现了我们的记录**
+   （`NotificationHandler.PrimaryId = 'LLM Router'`，`Notification` 里 Id=15749/15750/15751 的 payload 是
+   「LLM Router 通知测试 / 看到这条横幅 = 系统通知通道已打通…」）——**被丢弃的 toast 从不入库**，
+   所以「库里有记录」是投递成功的硬信号。
 
 ### 4.3 真机揪出并修掉的问题
 
@@ -128,6 +151,8 @@ python scripts/security_check.py --store "$env:APPDATA\llm-router\store.db" \
 | ① | `notify-rust` 报「已发送」但**屏幕什么都没有** | Windows 10 1607+ 的 toast 要求**调用进程拥有该 AUMID**；**非 powershell 进程冒用 PowerShell 的 AUMID 会被 OS 静默丢弃**（API 仍返回成功——日志说成功、屏幕什么都没有） | 自建 AUMID（`LLM Router`）+ COM 注册开始菜单快捷方式 + 写 `System.AppUserModel.ID`；进程内 `OnceLock` **只注册一次** | 开始菜单快捷方式已生成；横幅可见性仍待目视确认（§5 ①） |
 | ② | 企微 / 飞书的错误信息里带出**地址**（地址里含 key / bot token） | reqwest 错误默认把 URL 拼进消息 | `redact_request_error` 归一成「请求超时 / 连接失败 / HTTP `<code>` / 请求失败」四类，**零地址** | 单测断言错误里既没有 key 也没有 host |
 | ③ | e2e 跑起来**真的弹系统通知**（测试环境不该打扰人） | e2e 用的真 `app_setting` | `checkin_plugin_e2e.rs` 的 `app_state()` 写 `notify_enabled=0`；通知 e2e 里 `system_enabled=false`（系统通知那条路**留到真机验**） | 全量回归不再弹 toast |
+| ④ | toast 日志写「已发送」，**屏幕上什么都没有**（第二轮根因） | Windows 有**两层**静默拦截：① 调用进程没有对应 AUMID；② **全局通知总开关**关着（`PushNotifications\ToastEnabled = 0`）→ 事件日志 `Id=3150 … PolicyReason [GlobalSettingDisabled]`，而 `notify-rust` 照样返回成功 | ① 自建 AUMID + COM 注册开始菜单快捷方式（已做）；② **发送前读全局开关，关着就如实报失败**，不再谎报「已发送」（`system_notify::global_toasts_enabled` + 纯函数 `global_block_reason` + 2 条单测） | 真机两个场景实测：开关关 → 报「Windows 全局通知已关闭（设置 → 系统 → 通知）——请打开后再试」；开关开 → 「已发送」 |
+| ⑤ | 改了注册表**当场重发仍被拦**（`GlobalSettingDisabled` 不变） | 通知平台服务 `WpnUserService_<sid>` 把策略**缓存**在内存里 | 改完开关**重启 `WpnUserService_<sid>`**（或注销重登）才生效 | 重启后事件日志变成 `Id=3153 … is delivered to LLM Router on session 2`，且通知库出现我们的 payload 记录 |
 
 ---
 
@@ -135,7 +160,7 @@ python scripts/security_check.py --store "$env:APPDATA\llm-router\store.db" \
 
 | # | 未验证项 | 需要什么 | 解锁后要回填什么 |
 |---|---|---|---|
-| ① | **系统通知横幅肉眼可见** | 头头在触发后**看一眼屏幕** | 本机 GDI（`ImageGrab`）与 DXGI（`dxcam`）都取不到 shell 合成的横幅，系统通知库也不记我们这类「无历史条目」的 toast；**本机连 PowerShell 原生 toast 同样不显示**，疑似系统层面（专注助手 / 通知设置）拦截。代码侧已修掉一个**真实**根因（AUMID 静默丢弃），**横幅可见性仍待目视确认** |
+| ① | **系统通知横幅肉眼可见** | 头头在触发后**看一眼屏幕** | **已投递、待目视**：事件日志 `Id=3153 … is delivered to LLM Router on session 2` + 通知库 `wpndatabase.db` 里已有我们的 payload（**被丢弃的 toast 从不入库**）→ 投递链路是通的；但横幅是否真的出现在屏幕上，仍需头头目视确认（Windows 11 的横幅是 shell 合成层，GDI/DXGI 都截不到） |
 | ② | **真实企微 / 飞书 / Telegram 群机器人** | 头头给一个**群机器人地址**（**当密文进保险库**，不经聊天记录留存） | 三种格式在真实群的接收端行为（企微文本消息有长度上限、Telegram 必填 `chat_id`）+ 真实返回体 |
 | ③ | **多群 / 多通道同时发** | 不在本卡 | webhook 现在**只有一个地址**；要同时发多个群得改配置结构（backlog） |
 | ④ | **调度器自身异常时的告警** | 不在本卡 | 通知只覆盖**签到结果**；调度器压根没跑起来（保险库锁着等）→ **没人通知** |
@@ -153,6 +178,10 @@ python scripts/security_check.py --store "$env:APPDATA\llm-router\store.db" \
 7. **测试通知不受总开关限制**（用户点了就是要试通道），但**不会发真实签到结果**。
 8. **计划任务指向开发态二进制** `target/debug/llm-router.exe` → `cargo clean` 会让兜底任务失效（T17 已知限制，本卡未变）。
 9. **系统通知只覆盖签到结果**，调度器自身异常不告警（§5 ④）。
+10. **Windows 全局通知总开关会静默吃掉所有 toast**——所以发送前会先读
+    `HKCU\…\PushNotifications\ToastEnabled`，关着就**如实报失败**（不再谎报「已发送」）。
+    另注：这个开关改完**要重启 `WpnUserService_<sid>`**（或注销重登）才生效（服务缓存策略）；
+    本机该开关原本是关的，本轮为验证已**打开**（原值 `0`，回滚命令见 §4.2 ⑥）。
 
 ---
 
@@ -160,8 +189,8 @@ python scripts/security_check.py --store "$env:APPDATA\llm-router\store.db" \
 
 | 项 | 结果 |
 |---|---|
-| `cargo test --all-targets` | **458 项全绿**（0 失败、4 ignored、0 编译告警） |
+| `cargo test --all-targets` | **460 项全绿**（0 失败、4 ignored、0 编译告警） |
 | `cargo check --all-targets` | **0 warning** |
 | 前端单测 | **49/49** |
 | `npm run build` | 通过（33 modules，gzip **64.24 kB**） |
-| 提交 | **口径与任务卡** `464f42c`（02 §7.5 + §13 v0.25 + 03 T19 卡片）· **代码** `4b6f0ee`（通知模块 + 3 个 IPC + 前端区块 + 测试）· **留档与账本** `581de44`（本文件 + HANDOFF） |
+| 提交 | **口径与任务卡** `464f42c`（02 §7.5 + §13 v0.25 + 03 T19 卡片）· **代码** `4b6f0ee`（通知模块 + 3 个 IPC + 前端区块 + 测试）· **留档与账本** `581de44`（本文件 + HANDOFF）· **全局开关如实报告**（`system_notify::global_toasts_enabled` + `global_block_reason` + 2 条单测 + Cargo feature `Win32_System_Registry`，见 `git log`） |
