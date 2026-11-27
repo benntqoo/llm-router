@@ -21,6 +21,12 @@ use crate::checkin::sites;
 use crate::store::checkin::SiteRow;
 use crate::vault::Vault;
 
+/// 登录类动作（**登录交接** / **会话接管**）的超时（秒）。
+///
+/// **15 分钟**：真人登录要输密码 / 收 2FA / 走人机验证，5 分钟太紧
+/// （真机踩过：用户还在输验证码，交接窗口就到期了）。
+pub const LOGIN_TIMEOUT_SECS: u64 = 900;
+
 /// 插件执行上下文。
 pub struct PluginContext<'a> {
     /// 站点行。

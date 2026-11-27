@@ -39,20 +39,23 @@ use llm_router_lib::AppState;
 /// mock 的行为开关。
 #[derive(Clone, Copy, PartialEq, Default)]
 enum MockMode {
-    /// 签到成功 + 魔粒可查。
+    /// 签到成功 + 魔粒可查（**签到后才出现当日 `daily_active` 流水**）。
     #[default]
     Full,
     /// 签到成功，但魔粒接口 401（**没有开放平台 token 的情形**）。
     NoBalance,
     /// 登录态无效（匿名态 401）。
     Unauthorized,
+    /// **今天已领过**：当日 `daily_active` 流水**签到前就已经在**（差值 = 0）。
+    AlreadyClaimed,
 }
 
 #[derive(Default)]
 struct MockState {
     hits: AtomicUsize,
     signin_hits: AtomicUsize,
-    balance_hits: AtomicUsize,
+    /// 魔粒流水接口被打了多少次（**签到前基线 + 签到后各一次**）。
+    transactions_hits: AtomicUsize,
     /// 收到的 Cookie 头（**明文**——测试里用来断言真的把登录态发出去了）。
     seen_cookie: RwLock<Option<String>>,
     mode: RwLock<MockMode>,
@@ -91,11 +94,15 @@ async fn signin_handler(
     }
 }
 
-async fn balance_handler(
+/// 魔粒流水接口（**真机实测形状**：2026-11-27 登录态实测）。
+///
+/// - 金额字段 = `total_amount`；日期字段 = `gmt_created`；类型 = `type`；规则 = `rule_key`；
+/// - **当日 `daily_active` 那条 = 200 魔粒**；资料类一次性奖励（`infocomplement_*`）不算签到奖励。
+async fn transactions_handler(
     axum::extract::State(state): axum::extract::State<Arc<MockState>>,
 ) -> impl IntoResponse {
     state.hits.fetch_add(1, Ordering::SeqCst);
-    state.balance_hits.fetch_add(1, Ordering::SeqCst);
+    state.transactions_hits.fetch_add(1, Ordering::SeqCst);
     match state.mode() {
         // 签到成功但**查不到魔粒**（没有开放平台 token 的情形）与登录态失效都回 401
         MockMode::NoBalance | MockMode::Unauthorized => (
@@ -103,7 +110,22 @@ async fn balance_handler(
             r#"{"success":false,"code":"InvalidAuthentication","message":"Invalid authentication"}"#,
         )
             .into_response(),
-        _ => (StatusCode::OK, r#"{"data":{"points":400}}"#).into_response(),
+        // **签到前**还没有当日流水（签到才触发到账）→ 基线 = 0
+        MockMode::Full if state.signin_hits.load(Ordering::SeqCst) == 0 => (
+            StatusCode::OK,
+            r#"{"data":{"page":1,"page_size":20,"total":0,"records":[]},"request_id":"r0","success":true}"#,
+        )
+            .into_response(),
+        // 签到后 → 当日 `daily_active` 200 魔粒（+ 两条一次性资料奖励，**不算进签到奖励**）
+        MockMode::Full | MockMode::AlreadyClaimed => (
+            StatusCode::OK,
+            r#"{"data":{"page":1,"page_size":20,"total":3,"records":[
+                {"type":"EARN","rule_key":"daily_active","total_amount":200,"count":1,"expire_days":1,"gmt_created":"2026-11-27"},
+                {"type":"EARN","rule_key":"infocomplement_profile_experience","total_amount":50,"count":1,"gmt_created":"2026-11-27"},
+                {"type":"EARN","rule_key":"infocomplement_email_verification","total_amount":50,"count":1,"gmt_created":"2026-11-27"}
+            ]},"request_id":"r1","success":true}"#,
+        )
+            .into_response(),
     }
 }
 
@@ -111,7 +133,10 @@ async fn start_mock() -> (String, Arc<MockState>) {
     let state = Arc::new(MockState::default());
     let app = Router::new()
         .route("/api/v1/users/login/info", get(signin_handler))
-        .route("/openapi/v1/magicubes/balance", get(balance_handler))
+        .route(
+            "/openapi/v1/magicubes/transactions",
+            get(transactions_handler),
+        )
         .with_state(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -203,9 +228,15 @@ async fn modelscope_plugin_signs_in_and_writes_the_reward_everywhere() {
     );
 
     // 积分：返回值 + reward_json + account.quota_json
+    // （**实测口径**：当日每日签到那一笔 `daily_active` = 200 魔粒；资料类一次性奖励不算）
     let reward = outcome.reward.as_ref().expect("应拿到积分");
-    assert_eq!(reward.amount, 400);
+    assert_eq!(reward.amount, 200);
     assert_eq!(reward.unit, "magicube");
+    assert!(
+        outcome.message.contains("本次到账 +200"),
+        "回执应说明本次到账多少：{}",
+        outcome.message
+    );
 
     let rows = state
         .store
@@ -214,7 +245,7 @@ async fn modelscope_plugin_signs_in_and_writes_the_reward_everywhere() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].ok);
     let reward_json = rows[0].reward_json.as_deref().expect("reward_json 不该为空");
-    assert!(reward_json.contains("\"amount\":400"), "实际 {reward_json}");
+    assert!(reward_json.contains("\"amount\":200"), "实际 {reward_json}");
     assert!(reward_json.contains("\"unit\":\"magicube\""), "实际 {reward_json}");
 
     // 账号额度快照
@@ -228,9 +259,42 @@ async fn modelscope_plugin_signs_in_and_writes_the_reward_everywhere() {
     let account_id = config.account_id.expect("站点应有归属账号");
     let snapshot = llm_router_lib::store::account::read_reward(&state.store, &account_id)
         .expect("应有积分快照");
-    assert_eq!(snapshot.points, 400);
+    assert_eq!(snapshot.points, 200);
     assert_eq!(snapshot.unit, "magicube");
     assert_eq!(snapshot.source, "checkin");
+}
+
+#[tokio::test]
+async fn a_second_run_on_the_same_day_does_not_count_the_reward_twice() {
+    // **幂等口径**（02 §7.4 §2）：当日那条 `daily_active` 流水**整天都在** →
+    // 第二次运行签到前后的差值 = 0 → 判**「今天已领过」**：`points = null`、**不回写额度池**。
+    let (mock_url, mock) = start_mock().await;
+    mock.set_mode(MockMode::AlreadyClaimed);
+    let (_dir, state) = app_state();
+    let site_id = modelscope_site(&state, &mock_url);
+
+    let outcome = run(&state, &site_id).await;
+    assert!(outcome.ok, "{}", outcome.message);
+    assert!(
+        outcome.message.contains("今天已领过"),
+        "回执应说明今天已领过：{}",
+        outcome.message
+    );
+    assert!(outcome.reward.is_none(), "已领过 → 本次没有新增积分");
+
+    // 额度池**不被写**（避免同一天重复计数）
+    let row = state
+        .store
+        .with_conn(|conn| checkin::get_site(conn, &site_id))
+        .expect("读站点")
+        .expect("站点应存在");
+    let config: PluginSiteConfig =
+        serde_json::from_str(row.config_json.as_deref().expect("配置")).expect("配置应能解析");
+    let account_id = config.account_id.expect("站点应有归属账号");
+    assert!(
+        llm_router_lib::store::account::read_reward(&state.store, &account_id).is_none(),
+        "已领过时不该写额度池"
+    );
 }
 
 #[tokio::test]
@@ -245,11 +309,16 @@ async fn modelscope_plugin_reports_an_invalid_credential() {
     assert!(!outcome.ok);
     assert_eq!(outcome.class, ReplayClass::CredentialInvalid);
     assert!(outcome.reward.is_none(), "失败不该有积分");
-    assert!(mock.balance_hits.load(Ordering::SeqCst) == 0, "失败后不该再查魔粒");
+    // 签到**前**查过一次基线，签到失败后**不再查第二次**
+    assert_eq!(
+        mock.transactions_hits.load(Ordering::SeqCst),
+        1,
+        "签到失败后不该再查第二次魔粒"
+    );
 }
 
 #[tokio::test]
-async fn signin_still_succeeds_when_the_balance_cannot_be_read() {
+async fn signin_still_succeeds_when_the_transactions_cannot_be_read() {
     // **渐进增强**：没有开放平台 token → 魔粒查不到 → **签到仍然成功**，只是没积分
     let (mock_url, mock) = start_mock().await;
     mock.set_mode(MockMode::NoBalance);
@@ -259,7 +328,12 @@ async fn signin_still_succeeds_when_the_balance_cannot_be_read() {
     let outcome = run(&state, &site_id).await;
     assert!(outcome.ok, "{}", outcome.message);
     assert!(outcome.reward.is_none(), "查不到魔粒时不应有积分");
-    assert_eq!(mock.balance_hits.load(Ordering::SeqCst), 1, "还是应该尝试查一次魔粒");
+    // 签到前基线 + 签到后各查一次
+    assert_eq!(
+        mock.transactions_hits.load(Ordering::SeqCst),
+        2,
+        "还是应该尝试查魔粒（签到前基线 + 签到后）"
+    );
 }
 
 #[tokio::test]

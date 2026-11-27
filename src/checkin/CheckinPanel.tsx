@@ -593,7 +593,7 @@ export default function CheckinPanel() {
                           <input
                             type="password"
                             value={secretDrafts[site.id] ?? ""}
-                            placeholder="网页会话 Cookie"
+                            placeholder="访问令牌 ms-…（或网页会话 Cookie）"
                             onChange={(e) =>
                               setSecretDrafts((current) => ({
                                 ...current,
@@ -611,7 +611,7 @@ export default function CheckinPanel() {
                         <div className="muted">
                           {site.credentialReady
                             ? "登录态已填（存加密保险库）——可以再填一次覆盖"
-                            : "还没填：F12 → Network → 任一站点请求 → Request Headers → Cookie"}
+                            : "还没填：魔搭「个人中心 → 访问令牌 → 新建 → 复制」，把 ms- 开头的令牌粘进来（不用 F12）"}
                         </div>
                       </>
                     )}

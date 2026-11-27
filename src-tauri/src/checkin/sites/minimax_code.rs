@@ -42,7 +42,7 @@ pub const CHECKIN_TIMEOUT_SECS: u64 = 90;
 ///
 /// **15 分钟**：真人登录要输密码 / 收 2FA / 走扫码，5 分钟太紧
 /// （真机踩过：用户还在输验证码，交接窗口就到期了）。
-pub const LOGIN_TIMEOUT_SECS: u64 = 900;
+pub use crate::checkin::plugin::LOGIN_TIMEOUT_SECS;
 
 /// 辅轨 `checkin` 的返回（**sidecar 的输出契约**）。
 #[derive(Debug, Clone, Deserialize)]
