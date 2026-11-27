@@ -21,7 +21,9 @@ use crate::store::{Result, Store, StoreError};
 pub const CUSTOM_PROVIDER: &str = "custom";
 
 /// OAuth 型渠道的 provider 标识（Copilot；T20）。
-pub const OAUTH_PROVIDER: &str = "copilot";
+///
+/// **唯一真值在 `providers::copilot::PROVIDER`**（适配器按它认领渠道）。
+pub const OAUTH_PROVIDER: &str = crate::providers::copilot::PROVIDER;
 
 /// 确保存在一条 **OAuth 型**渠道行，返回渠道 id（T20）。
 ///
@@ -69,6 +71,155 @@ pub fn ensure_oauth_channel(
             rusqlite::params![id, name, provider, base_url, crate::vault::now_secs()],
         )?;
         Ok(id)
+    })
+}
+
+/// 一条待落库的模型（**别名 = 上游模型名**；02 §6.2.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogModel {
+    /// 对外别名（= 上游模型 id）。
+    pub alias: String,
+    /// 上游真实模型名（R-1 的替换目标）。
+    pub upstream_id: String,
+    /// 上下文长度（可空）。
+    pub context_len: Option<i64>,
+}
+
+/// 模型目录同步结果（落 `model` 表）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSyncReport {
+    /// 新增的别名。
+    pub added: Vec<String>,
+    /// 已存在并更新的别名。
+    pub updated: Vec<String>,
+    /// **目录里没有**、被置为禁用的别名。
+    pub disabled: Vec<String>,
+    /// **跳过的别名**（被别的渠道占用 / 用户改过别名）。
+    pub skipped: Vec<String>,
+}
+
+/// 把上游模型目录同步到 `model` 表（02 §6.2.2）。
+///
+/// **口径**：
+/// - **别名 = 上游模型 id**；
+/// - **别名已被别的渠道占用 → 跳过**（不抢、不覆盖）；
+/// - **用户改过别名**（同一 `upstream_id` 挂在别的别名下）→ **跳过**（尊重用户的命名）；
+/// - 目录里**没有**的旧模型 → **置为禁用**（`enabled = 0`），**不物理删除**
+///   （避免连带删掉 `route_member` 的编排关系）。
+pub fn sync_models_from_catalog(
+    store: &Store,
+    channel_id: &str,
+    models: &[CatalogModel],
+) -> Result<ModelSyncReport> {
+    store.with_conn(|conn| {
+        let tx = conn.unchecked_transaction().map_err(StoreError::Sqlite)?;
+        let mut report = ModelSyncReport::default();
+        let mut seen: Vec<String> = Vec::new();
+
+        for model in models {
+            let alias = model.alias.trim();
+            if alias.is_empty() {
+                continue;
+            }
+            let upstream_id = model.upstream_id.trim();
+            if upstream_id.is_empty() {
+                continue;
+            }
+
+            // ① 本渠道下**同一个上游模型**是否已存在（别名可能被用户改过）
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT alias FROM model WHERE channel_id = ?1 AND upstream_id = ?2 LIMIT 1",
+                    rusqlite::params![channel_id, upstream_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?;
+            if let Some(current_alias) = existing {
+                if current_alias != alias {
+                    // 用户改过别名 → **跳过**（尊重用户的命名）
+                    report.skipped.push(alias.to_string());
+                    continue;
+                }
+                tx.execute(
+                    "UPDATE model SET upstream_id = ?2, context_len = ?3, enabled = 1 WHERE alias = ?1",
+                    rusqlite::params![alias, upstream_id, model.context_len],
+                )
+                .map_err(StoreError::Sqlite)?;
+                report.updated.push(alias.to_string());
+                seen.push(alias.to_string());
+                continue;
+            }
+
+            // ② 这个别名**是不是别的渠道的** → 跳过（不抢、不覆盖）
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT channel_id FROM model WHERE alias = ?1 LIMIT 1",
+                    [alias],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?;
+            match owner {
+                Some(existing_channel) if existing_channel != channel_id => {
+                    report.skipped.push(alias.to_string());
+                    continue;
+                }
+                Some(_) => {
+                    tx.execute(
+                        "UPDATE model SET upstream_id = ?2, context_len = ?3, enabled = 1 WHERE alias = ?1",
+                        rusqlite::params![alias, upstream_id, model.context_len],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                    report.updated.push(alias.to_string());
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO model (id, channel_id, upstream_id, alias, context_len, enabled)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                        rusqlite::params![
+                            crate::vault::new_id("m"),
+                            channel_id,
+                            upstream_id,
+                            alias,
+                            model.context_len
+                        ],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                    report.added.push(alias.to_string());
+                }
+            }
+            seen.push(alias.to_string());
+        }
+
+        // ③ 目录里**没有**的旧模型 → 置为禁用（**不物理删除**）
+        let existing: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT alias FROM model WHERE channel_id = ?1 AND enabled = 1")
+                .map_err(StoreError::Sqlite)?;
+            let rows = stmt
+                .query_map([channel_id], |row| row.get::<_, String>(0))
+                .map_err(StoreError::Sqlite)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(StoreError::Sqlite)?);
+            }
+            out
+        };
+        for alias in existing {
+            if !seen.contains(&alias) {
+                tx.execute(
+                    "UPDATE model SET enabled = 0 WHERE channel_id = ?1 AND alias = ?2",
+                    rusqlite::params![channel_id, alias],
+                )
+                .map_err(StoreError::Sqlite)?;
+                report.disabled.push(alias);
+            }
+        }
+
+        tx.commit().map_err(StoreError::Sqlite)?;
+        Ok(report)
     })
 }
 

@@ -3,18 +3,23 @@ import { invoke } from "@tauri-apps/api/core";
 
 import {
   describeCopilotState,
+  describeModel,
+  describeModelSync,
   nextPollDelayMs,
   shouldKeepPolling,
+  type CopilotModelsView,
   type CopilotPollView,
   type CopilotStatus,
   type DeviceFlowView,
 } from "./copilot";
 
 /**
- * GitHub Copilot 授权面板（T20；02 §6.2）。
+ * GitHub Copilot 授权面板（T20/T21；02 §6.2 / §6.2.2）。
  *
- * **只做取凭证**：GitHub 官方 device flow → 用户在浏览器输入短码 → 轮询 →
+ * **T20 只取凭证**：GitHub 官方 device flow → 用户在浏览器输入短码 → 轮询 →
  * 换 Copilot token 存保险库。
+ *
+ * **T21 加模型目录**：拉上游 `/models` → 落 `model` 表（**别名 = 模型 id**）。
  *
  * - `device_code` **不出后端**（IPC 只回 `flow_id` / `user_code` / 验证网址）；
  * - 两个 token **只进保险库**，面板只显示「授权了没 / 到期时间」；
@@ -26,6 +31,7 @@ export default function CopilotPanel() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [models, setModels] = useState<CopilotModelsView | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -109,6 +115,20 @@ export default function CopilotPanel() {
     }
   };
 
+  const handleRefreshModels = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const view = await invoke<CopilotModelsView>("copilot_models_refresh");
+      setModels(view);
+      setMessage(`模型目录已刷新：${describeModelSync(view)}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section className="card">
       <h2>GitHub Copilot 授权（T20）</h2>
@@ -149,6 +169,41 @@ export default function CopilotPanel() {
         ToS，账号可能受限。本卡只做「取凭证」，渠道默认关闭；启用前需在设置里确认 ToS
         （该确认属 T24）。Copilot token 约 25~30 分钟有效，过期自动重取。
       </p>
+
+      <h3>模型目录（T21）</h3>
+      <p className="muted">
+        拉上游 <code>/models</code> 写入本应用的模型表（<strong>别名 = 模型 id</strong>）。
+        只收录走 <code>/chat/completions</code> 的模型；别名已被别的渠道占用的会跳过，
+        上游已下架的模型会被禁用（不会物理删除）。
+      </p>
+      <div className="row-inline">
+        <button type="button" disabled={busy} onClick={() => void handleRefreshModels()}>
+          刷新模型目录
+        </button>
+      </div>
+
+      {models && models.models.length > 0 && (
+        <table className="usage-table">
+          <thead>
+            <tr>
+              <th>别名</th>
+              <th>展示名</th>
+              <th>能力</th>
+            </tr>
+          </thead>
+          <tbody>
+            {models.models.map((model) => (
+              <tr key={model.id}>
+                <td>
+                  <code>{model.id}</code>
+                </td>
+                <td>{model.name}</td>
+                <td className="muted">{describeModel(model)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
 
       {message && <p className="ok">{message}</p>}
       {error && <p className="error">{error}</p>}

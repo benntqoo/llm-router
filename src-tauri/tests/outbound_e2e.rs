@@ -7,11 +7,41 @@
 //! 本文件走**真实 `channel` 表 → 预设合并 → 出站报文**的完整链路，
 //! 验证数据库里的一行渠道配置能产出正确的上游 HTTP 请求。
 
+use std::sync::Arc;
+
 use axum::http::{HeaderMap, HeaderValue, Method};
 use llm_router_lib::providers::adapter::{CallContext, OpenAIRequest};
-use llm_router_lib::providers::{adapter_for, config_from_row, ChannelRow};
+use llm_router_lib::providers::copilot::CopilotSession;
+use llm_router_lib::providers::oauth::copilot::{Endpoints, TokenCache};
+use llm_router_lib::providers::{adapter_for, config_from_row, AdapterDeps, ChannelRow};
 use llm_router_lib::store::Store;
 use llm_router_lib::vault::crypto::SecretBytes;
+use llm_router_lib::vault::Vault;
+
+/// 造一份适配器依赖（**真保险库**）。
+///
+/// 本文件只测 **API Key 型**渠道，Copilot 那部分只是**占位**（端点指向一个
+/// 永不连接的本地地址，**不会**被打到）。
+fn deps(store: &Arc<Store>, dir: &tempfile::TempDir) -> AdapterDeps {
+    // 每次用**不同**的保险库文件名（同一路径开两次会撞文件锁）
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let vault = Arc::new(std::sync::RwLock::new(
+        Vault::open(
+            Arc::clone(store),
+            dir.path().join(format!("vault-{seq}.bin")),
+            None,
+        )
+        .expect("打开保险库"),
+    ));
+    AdapterDeps {
+        copilot: CopilotSession::testing(
+            vault,
+            Endpoints::local("http://127.0.0.1:1"),
+            Arc::new(TokenCache::new()),
+        ),
+    }
+}
 
 /// 写入一条渠道行并回读（模拟 T8/T9 的渠道管理 + DB 往返）。
 fn insert_channel(store: &Store, id: &str, name: &str, provider: &str, meta_json: Option<&str>) {
@@ -80,6 +110,7 @@ fn inbound_headers() -> HeaderMap {
 /// 构造出站调用（走适配器注册表）。
 async fn complete(
     store: &Store,
+    deps: &AdapterDeps,
     channel_id: &str,
     upstream_model: &str,
     body: serde_json::Value,
@@ -87,7 +118,7 @@ async fn complete(
 ) -> llm_router_lib::providers::adapter::OutgoingCall {
     let row = load_channel(store, channel_id);
     let config = config_from_row(&row).expect("构造渠道配置");
-    let adapter = adapter_for(&row.provider).expect("应找到适配器");
+    let adapter = adapter_for(&row.provider, deps).expect("应找到适配器");
     let ctx = CallContext {
         channel: config,
         upstream_model: upstream_model.to_string(),
@@ -109,7 +140,7 @@ async fn complete(
 #[tokio::test]
 async fn acceptance_minimax_cn_url_follows_section_4_2() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let store = Store::open(dir.path().join("store.db")).expect("打开库");
+    let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     insert_channel(
         &store,
         "ch-mm-cn",
@@ -121,6 +152,7 @@ async fn acceptance_minimax_cn_url_follows_section_4_2() {
 
     let call = complete(
         &store,
+        &deps(&store, &dir),
         "ch-mm-cn",
         "MiniMax-Text-01",
         serde_json::json!({"model": "mm-alias", "messages": [{"role": "user", "content": "hi"}]}),
@@ -166,7 +198,7 @@ async fn acceptance_minimax_cn_url_follows_section_4_2() {
 #[tokio::test]
 async fn acceptance_minimax_intl_url_has_no_group_id() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let store = Store::open(dir.path().join("store.db")).expect("打开库");
+    let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     // 国际站：即使 meta 里写了 group_id，也不拼（预设 supports_groupid_query=false）
     insert_channel(
         &store,
@@ -179,6 +211,7 @@ async fn acceptance_minimax_intl_url_has_no_group_id() {
 
     let call = complete(
         &store,
+        &deps(&store, &dir),
         "ch-mm-intl",
         "MiniMax-Text-01",
         serde_json::json!({"model": "mm-intl-alias", "messages": []}),
@@ -196,12 +229,13 @@ async fn acceptance_minimax_intl_url_has_no_group_id() {
 #[tokio::test]
 async fn acceptance_glm_non_standard_path() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let store = Store::open(dir.path().join("store.db")).expect("打开库");
+    let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     insert_channel(&store, "ch-glm", "GLM 官方", "glm", None);
     insert_model(&store, "ch-glm", "glm-alias", "glm-4-plus");
 
     let call = complete(
         &store,
+        &deps(&store, &dir),
         "ch-glm",
         "glm-4-plus",
         serde_json::json!({"model": "glm-alias", "messages": []}),
@@ -215,12 +249,13 @@ async fn acceptance_glm_non_standard_path() {
 #[tokio::test]
 async fn acceptance_dashscope_compatible_mode_path() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let store = Store::open(dir.path().join("store.db")).expect("打开库");
+    let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     insert_channel(&store, "ch-dq", "阿里百炼", "dashscope", None);
     insert_model(&store, "ch-dq", "dq-alias", "qwen-max");
 
     let call = complete(
         &store,
+        &deps(&store, &dir),
         "ch-dq",
         "qwen-max",
         serde_json::json!({"model": "dq-alias", "messages": []}),
@@ -240,7 +275,7 @@ async fn acceptance_dashscope_compatible_mode_path() {
 #[tokio::test]
 async fn acceptance_group_id_never_leaks_into_body_or_headers() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let store = Store::open(dir.path().join("store.db")).expect("打开库");
+    let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     insert_channel(
         &store,
         "ch-mm-cn2",
@@ -251,6 +286,7 @@ async fn acceptance_group_id_never_leaks_into_body_or_headers() {
 
     let call = complete(
         &store,
+        &deps(&store, &dir),
         "ch-mm-cn2",
         "MiniMax-Text-01",
         serde_json::json!({"model": "mm-alias", "messages": []}),
@@ -276,7 +312,7 @@ async fn acceptance_group_id_never_leaks_into_body_or_headers() {
 async fn acceptance_outgoing_request_line_matches_target_url() {
     // 把出站调用渲染成 HTTP 请求行，确认路径与 query 与 §4.2 口径一致
     let dir = tempfile::tempdir().expect("临时目录");
-    let store = Store::open(dir.path().join("store.db")).expect("打开库");
+    let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
     insert_channel(
         &store,
         "ch-mm-cn3",
@@ -287,6 +323,7 @@ async fn acceptance_outgoing_request_line_matches_target_url() {
 
     let call = complete(
         &store,
+        &deps(&store, &dir),
         "ch-mm-cn3",
         "MiniMax-Text-01",
         serde_json::json!({"model": "mm-alias", "messages": []}),

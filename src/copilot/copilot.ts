@@ -79,3 +79,59 @@ export function formatExpiry(expiresAt: number | null): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
+
+/** 模型目录里的一条模型（后端 `CopilotModelView`；**别名 = id**）。 */
+export type CopilotModel = {
+  id: string;
+  name: string;
+  contextLen: number | null;
+  supportsToolCalls: boolean | null;
+  supportsVision: boolean | null;
+};
+
+/** 模型目录刷新结果（后端 `CopilotModelsView`）。 */
+export type CopilotModelsView = {
+  models: CopilotModel[];
+  added: number;
+  updated: number;
+  disabled: number;
+  skipped: string[];
+};
+
+/**
+ * 模型目录刷新结果 → 人话。
+ *
+ * **为什么把「跳过」也说清**：被跳过的别名是**别的渠道占着**（或用户改过别名），
+ * 用户需要知道**为什么这个模型没进来**，否则会以为刷新失败。
+ */
+export function describeModelSync(view: CopilotModelsView): string {
+  const parts = [`共 ${view.models.length} 个模型`];
+  if (view.added > 0) {
+    parts.push(`新增 ${view.added}`);
+  }
+  if (view.updated > 0) {
+    parts.push(`更新 ${view.updated}`);
+  }
+  if (view.disabled > 0) {
+    parts.push(`禁用 ${view.disabled}（上游已没有）`);
+  }
+  if (view.skipped.length > 0) {
+    parts.push(`跳过 ${view.skipped.length}（别名已被占用：${view.skipped.join("、")}）`);
+  }
+  return parts.join("，");
+}
+
+/** 一个模型的中文说明（上下文长度 / 能力）。 */
+export function describeModel(model: CopilotModel): string {
+  const bits: string[] = [];
+  if (model.contextLen) {
+    bits.push(`上下文 ${Math.round(model.contextLen / 1000)}K`);
+  }
+  if (model.supportsToolCalls) {
+    bits.push("工具调用");
+  }
+  if (model.supportsVision) {
+    bits.push("图片输入");
+  }
+  return bits.length > 0 ? bits.join(" / ") : "—";
+}

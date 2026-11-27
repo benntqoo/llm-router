@@ -172,11 +172,8 @@ async fn retry_copilot_token(state: &AppState, endpoints: &Endpoints) {
         },
         Err(err) => fail(format!("列渠道失败：{err}")),
     };
-    let vault = match state.vault.read() {
-        Ok(vault) => vault,
-        Err(err) => fail(format!("读保险库失败：{err}")),
-    };
-    match copilot::ensure_token(endpoints, &vault, &channel_id, copilot::cache()).await {
+    // 注意：**不持读锁跨 await**（`RwLockReadGuard` 不是 `Send`）→ 传 `Arc` 句柄
+    match copilot::ensure_token(endpoints, &state.vault, &channel_id, copilot::cache()).await {
         Ok(token) => println!(
             "已用入库的 GitHub token 换到 Copilot token（到期时刻 {}）",
             token.expires_at

@@ -57,6 +57,8 @@ pub struct Forwarder {
     pub usage_sink: Arc<dyn UsageSink>,
     /// token 估算器（上游没回 usage 时用；T12 换 tiktoken-rs）。
     pub estimator: Arc<dyn TokenEstimator>,
+    /// 适配器构造依赖（**OAuth 型渠道的凭证供给**；02 §6.2.2）。
+    pub adapter_deps: providers::AdapterDeps,
 }
 
 impl std::fmt::Debug for Forwarder {
@@ -76,6 +78,11 @@ impl Forwarder {
         usage_sink: Arc<dyn UsageSink>,
         estimator: Arc<dyn TokenEstimator>,
     ) -> Self {
+        // OAuth 型渠道的会话：**生产默认**（真实 GitHub 端点 + 全局 token 缓存）。
+        // 测试用 `.with_adapter_deps(...)` 换成**本地 mock 端点 + 独立缓存**。
+        let adapter_deps = providers::AdapterDeps {
+            copilot: providers::copilot::CopilotSession::production(Arc::clone(&vault)),
+        };
         Forwarder {
             client,
             circuit,
@@ -84,7 +91,14 @@ impl Forwarder {
             store,
             usage_sink,
             estimator,
+            adapter_deps,
         }
+    }
+
+    /// 换掉适配器依赖（**测试用**：把 OAuth 端点指向本地 mock）。
+    pub fn with_adapter_deps(mut self, deps: providers::AdapterDeps) -> Self {
+        self.adapter_deps = deps;
+        self
     }
 
     /// 按候选链转发一次调用。
@@ -124,50 +138,71 @@ impl Forwarder {
                 continue;
             }
 
-            // 没有适配器的 provider（OAuth / 登录态型尚未实现）直接跳过
-            let Some(adapter) = providers::adapter_for(&candidate.provider) else {
+            // 没有适配器的 provider（登录态型尚未实现）直接跳过
+            let Some(adapter) = providers::adapter_for(&candidate.provider, &self.adapter_deps)
+            else {
                 retried.push(format!("{}（该渠道类型尚未接入，已跳过）", candidate.channel_name));
                 continue;
             };
 
             // 凭证解密（一次候选只解一次）
-            let credential = match &candidate.credential_id {
-                Some(id) => {
-                    let guard = self.vault.read().unwrap_or_else(|e| e.into_inner());
-                    match guard.get_credential(id) {
-                        Ok(bytes) => Some(bytes),
-                        Err(err) => {
-                            last_error = Some(
-                                GatewayError::new(
-                                    ErrorKind::ApiError,
-                                    format!("凭证 {id} 解密失败: {err}"),
-                                )
-                                .with_channel(candidate.channel_name.clone()),
-                            );
-                            retried.push(candidate.channel_name.clone());
-                            break;
+            //
+            // **OAuth 型渠道不在这里解密**（02 §6.2.2）：它们的凭证**由 adapter 自己供给**
+            // （Copilot token 由 adapter 出站前 `ensure_token()` 取）。
+            // 理由：GitHub token 与 Copilot token **不能互换**——沿用「按 kind 选一条」
+            // 的旧口径，token 过期时会**误取 GitHub token** 当 Bearer → 必然 401。
+            let credential = if is_oauth_kind(&candidate.channel_kind) {
+                None
+            } else {
+                match &candidate.credential_id {
+                    Some(id) => {
+                        let guard = self.vault.read().unwrap_or_else(|e| e.into_inner());
+                        match guard.get_credential(id) {
+                            Ok(bytes) => Some(bytes),
+                            Err(err) => {
+                                last_error = Some(
+                                    GatewayError::new(
+                                        ErrorKind::ApiError,
+                                        format!("凭证 {id} 解密失败: {err}"),
+                                    )
+                                    .with_channel(candidate.channel_name.clone()),
+                                );
+                                retried.push(candidate.channel_name.clone());
+                                break;
+                            }
                         }
                     }
-                }
-                None => {
-                    last_error = Some(
-                        GatewayError::new(
-                            ErrorKind::ApiError,
-                            format!("渠道 {} 没有可用凭证", candidate.channel_name),
-                        )
-                        .with_channel(candidate.channel_name.clone()),
-                    );
-                    retried.push(candidate.channel_name.clone());
-                    break;
+                    None => {
+                        last_error = Some(
+                            GatewayError::new(
+                                ErrorKind::ApiError,
+                                format!("渠道 {} 没有可用凭证", candidate.channel_name),
+                            )
+                            .with_channel(candidate.channel_name.clone()),
+                        );
+                        retried.push(candidate.channel_name.clone());
+                        break;
+                    }
                 }
             };
 
             let mut attempt = 0u8;
             loop {
                 attempt += 1;
-                let (call, injection_enabled) = self
+                // 出站调用构造失败（凭证不可用 / 渠道配置错误）→ **这个候选发不出去**，
+                // 换下一个候选（而不是整条链直接失败）——OAuth 型渠道的凭证取不到时
+                // 应当能退到别的渠道（02 §6.2.2）。
+                let (call, injection_enabled) = match self
                     .build_call(candidate, adapter.as_ref(), request, inbound_headers, credential.clone())
-                    .await?;
+                    .await
+                {
+                    Ok(built) => built,
+                    Err(err) => {
+                        retried.push(candidate.channel_name.clone());
+                        last_error = Some(err.with_channel(candidate.channel_name.clone()));
+                        break;
+                    }
+                };
 
                 let attempt_started = Instant::now();
                 let send = self.client.send(&call, request.stream).await;
@@ -521,6 +556,14 @@ impl Forwarder {
             error_kind: None,
         });
     }
+}
+
+/// 渠道是不是 **OAuth 型**（凭证由 adapter 自己供给，网关不解密）。
+///
+/// 02 §6.2.2：OAuth 型渠道的凭证供给与刷新**归 adapter 管**——网关只解 API Key 型凭证。
+pub fn is_oauth_kind(kind: &str) -> bool {
+    crate::providers::adapter::ChannelKind::parse(kind)
+        == Some(crate::providers::adapter::ChannelKind::OAuth)
 }
 
 /// 把值转成 HTTP 头安全的 ASCII。

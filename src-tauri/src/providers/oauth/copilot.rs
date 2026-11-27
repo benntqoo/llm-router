@@ -21,7 +21,7 @@
 //! （AGENT.md §5.7）。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use serde::Serialize;
 
@@ -534,13 +534,14 @@ pub struct TokenCache {
     inner: Mutex<Option<CopilotToken>>,
 }
 
-static CACHE: OnceLock<TokenCache> = OnceLock::new();
+static CACHE: OnceLock<Arc<TokenCache>> = OnceLock::new();
 
-/// 全局 token 缓存。
-pub fn cache() -> &'static TokenCache {
-    CACHE.get_or_init(|| TokenCache {
-        inner: Mutex::new(None),
-    })
+/// 全局 token 缓存（**进程内共享**）。
+///
+/// 用 `Arc` 包一层：出站适配器（T21）要**持有**这个缓存（跨请求复用，
+/// 否则每次出站都得重换 token），而单测要**独立实例**（并行用例互不污染）。
+pub fn cache() -> &'static Arc<TokenCache> {
+    CACHE.get_or_init(|| Arc::new(TokenCache::new()))
 }
 
 impl TokenCache {
@@ -628,9 +629,14 @@ pub fn disconnect(vault: &Vault, channel_id: &str) -> Result<(), String> {
 ///
 /// `cache` **显式传入**（生产传全局 `cache()`）——单测要**独立实例**，否则
 /// 并行跑的用例会互相污染缓存、测不出「到底有没有重取」。
+///
+/// **为什么收 `&Arc<RwLock<Vault>>` 而不是 `&Vault`**：`std::sync::RwLockReadGuard`
+/// **不是 `Send`** → 调用方若在 `await` 期间持有读锁，这个 future 就失去 `Send`
+/// （`#[async_trait]` 要求 `Send`）→ 编译不过。故保险库的读写**只在同步段里**做，
+/// **读锁用完立刻放**，绝不跨 `await`。
 pub async fn ensure_token(
     endpoints: &Endpoints,
-    vault: &Vault,
+    vault: &Arc<RwLock<Vault>>,
     channel_id: &str,
     cache: &TokenCache,
 ) -> Result<CopilotToken, String> {
@@ -640,11 +646,21 @@ pub async fn ensure_token(
             return Ok(token);
         }
     }
-    let gh_token = load_github_token(vault, channel_id)?.ok_or_else(|| {
-        "还没有 GitHub token——先做一次设备授权".to_string()
-    })?;
+    // ── 同步段：取 GitHub token（读锁用完即放）
+    let gh_token = {
+        let guard = vault.read().unwrap_or_else(|err| err.into_inner());
+        load_github_token(&guard, channel_id)?
+    }
+    .ok_or_else(|| "还没有 GitHub token——先做一次设备授权".to_string())?;
+
+    // ── 异步段：换 Copilot token（**不持锁**）
     let token = fetch_copilot_token(endpoints, &gh_token).await?;
-    store_copilot_token(vault, channel_id, &token)?;
+
+    // ── 同步段：回写保险库 + 缓存
+    {
+        let guard = vault.read().unwrap_or_else(|err| err.into_inner());
+        store_copilot_token(&guard, channel_id, &token)?;
+    }
     cache.put(token.clone());
     Ok(token)
 }

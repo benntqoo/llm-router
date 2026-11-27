@@ -3,9 +3,12 @@ import { test } from "node:test";
 
 import {
   describeCopilotState,
+  describeModel,
+  describeModelSync,
   formatExpiry,
   nextPollDelayMs,
   shouldKeepPolling,
+  type CopilotModelsView,
   type CopilotStatus,
 } from "./copilot.ts";
 
@@ -57,4 +60,64 @@ test("过期时刻格式化，缺失时返回空串", () => {
   assert.equal(formatExpiry(null), "");
   assert.equal(formatExpiry(0), "");
   assert.notEqual(formatExpiry(1795765650), "");
+});
+
+test("模型目录刷新结果说清新增 / 更新 / 禁用 / 跳过", () => {
+  const view: CopilotModelsView = {
+    models: [
+      {
+        id: "gpt-5-mini",
+        name: "GPT-5 mini",
+        contextLen: 264000,
+        supportsToolCalls: true,
+        supportsVision: false,
+      },
+    ],
+    added: 3,
+    updated: 2,
+    disabled: 1,
+    skipped: ["gpt-4o"],
+  };
+  const text = describeModelSync(view);
+  assert.match(text, /共 1 个模型/);
+  assert.match(text, /新增 3/);
+  assert.match(text, /更新 2/);
+  assert.match(text, /禁用 1/);
+  // 被跳过的原因要说清（别名被别的渠道占用）
+  assert.match(text, /跳过 1/);
+  assert.match(text, /gpt-4o/);
+});
+
+test("计数为 0 时不啰嗦", () => {
+  const text = describeModelSync({
+    models: [],
+    added: 0,
+    updated: 0,
+    disabled: 0,
+    skipped: [],
+  });
+  assert.equal(text, "共 0 个模型");
+});
+
+test("模型能力说明区分有与没有", () => {
+  assert.match(
+    describeModel({
+      id: "gpt-5-mini",
+      name: "GPT-5 mini",
+      contextLen: 264000,
+      supportsToolCalls: true,
+      supportsVision: false,
+    }),
+    /上下文 264K/,
+  );
+  assert.match(
+    describeModel({
+      id: "m",
+      name: "m",
+      contextLen: null,
+      supportsToolCalls: false,
+      supportsVision: false,
+    }),
+    /—/,
+  );
 });

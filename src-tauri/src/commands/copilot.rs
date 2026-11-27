@@ -5,13 +5,16 @@
 //! **密文红线**：`device_code` 与两个 token **都不出后端**——
 //! IPC 只回 `flow_id` / `user_code` / `verification_uri` / 状态 / 过期时间。
 
+use std::sync::Arc;
+
 use serde::Serialize;
 use tauri::State;
 
+use crate::providers::copilot::CopilotSession;
 use crate::providers::oauth::copilot::{
     self, DeviceFlowView, Endpoints, PollOutcome, DEFAULT_API_BASE,
 };
-use crate::store::channels::{ensure_oauth_channel, OAUTH_PROVIDER};
+use crate::store::channels::{ensure_oauth_channel, CatalogModel, OAUTH_PROVIDER};
 use crate::AppState;
 
 /// Copilot 渠道名（**唯一**）。
@@ -153,6 +156,87 @@ pub async fn copilot_authorize_poll_of(
             })
         }
     }
+}
+
+/// 模型目录中的一条模型（IPC 视图；**不含任何凭据**）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotModelView {
+    /// 上游模型 id（**兼**对外别名）。
+    pub id: String,
+    /// 展示名。
+    pub name: String,
+    /// 上下文长度（上游没给就是 `None`）。
+    pub context_len: Option<i64>,
+    /// 是否支持工具调用。
+    pub supports_tool_calls: Option<bool>,
+    /// 是否支持图片输入。
+    pub supports_vision: Option<bool>,
+}
+
+/// 模型目录刷新结果（IPC 视图）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotModelsView {
+    /// 收录到的模型（**别名 = id**）。
+    pub models: Vec<CopilotModelView>,
+    /// 新增条数。
+    pub added: usize,
+    /// 更新条数。
+    pub updated: usize,
+    /// 被禁用条数（**目录里没有**的旧模型——置为禁用，不物理删除）。
+    pub disabled: usize,
+    /// **跳过**的别名（被别的渠道占用 / 用户改过别名）。
+    pub skipped: Vec<String>,
+}
+
+/// 刷新 Copilot 的模型目录（拉上游 `/models` → 落 `model` 表）。
+///
+/// **只收录 `policy.state != disabled` 且 `supported_endpoints` 含 `chat` 的模型**
+/// （02 §6.2.2）——codex 类只支持 `/responses`，v1 **不做协议转换**。
+#[tauri::command]
+pub async fn copilot_models_refresh(
+    state: State<'_, AppState>,
+) -> Result<CopilotModelsView, String> {
+    let session = CopilotSession::production(Arc::clone(&state.vault));
+    copilot_models_refresh_of(&state, &session).await
+}
+
+/// 刷新模型目录（可测版本：会话可注入 → 测试打本地 mock，**不出网**）。
+pub async fn copilot_models_refresh_of(
+    state: &AppState,
+    session: &CopilotSession,
+) -> Result<CopilotModelsView, String> {
+    let Some((channel_id, _enabled, _base_url)) = find_copilot_channel(state)? else {
+        return Err("还没有 Copilot 渠道——先做一次设备授权".to_string());
+    };
+    let models = crate::providers::copilot::fetch_models(session, &channel_id).await?;
+    let entries: Vec<CatalogModel> = models
+        .iter()
+        .map(|model| CatalogModel {
+            alias: model.id.clone(),
+            upstream_id: model.id.clone(),
+            context_len: model.context_len,
+        })
+        .collect();
+    let report = crate::store::channels::sync_models_from_catalog(&state.store, &channel_id, &entries)
+        .map_err(|err| err.to_string())?;
+    Ok(CopilotModelsView {
+        models: models
+            .iter()
+            .map(|model| CopilotModelView {
+                id: model.id.clone(),
+                name: model.name.clone(),
+                context_len: model.context_len,
+                supports_tool_calls: model.supports_tool_calls,
+                supports_vision: model.supports_vision,
+            })
+            .collect(),
+        added: report.added.len(),
+        updated: report.updated.len(),
+        disabled: report.disabled.len(),
+        skipped: report.skipped,
+    })
 }
 
 /// 查授权状态（**只有布尔与过期时间，没有 token**）。
@@ -531,21 +615,24 @@ mod tests {
             copilot::DEFAULT_API_BASE,
         )
         .expect("建 Copilot 渠道行");
-        let vault = state.vault.read().expect("读保险库");
-        copilot::store_github_token(&vault, &channel_id, "MOCK-GH-TOKEN").expect("存 GitHub token");
+        {
+            let vault = state.vault.read().expect("读保险库");
+            copilot::store_github_token(&vault, &channel_id, "MOCK-GH-TOKEN")
+                .expect("存 GitHub token");
+        }
 
         // **独立缓存实例**（生产用全局那个）→ 不受并行用例干扰
         let cache = copilot::TokenCache::new();
 
         // 缓存空 → 用保险库里的 GitHub token 换
-        let token = copilot::ensure_token(&endpoints, &vault, &channel_id, &cache)
+        let token = copilot::ensure_token(&endpoints, &state.vault, &channel_id, &cache)
             .await
             .expect("换取 Copilot token");
         assert_eq!(mock.copilot_token_calls(), 1);
         assert_eq!(token.token, "MOCK-COPILOT-TOKEN");
 
         // 缓存新鲜 → 直接用，**不再打上游**
-        let again = copilot::ensure_token(&endpoints, &vault, &channel_id, &cache)
+        let again = copilot::ensure_token(&endpoints, &state.vault, &channel_id, &cache)
             .await
             .expect("命中缓存");
         assert_eq!(mock.copilot_token_calls(), 1, "缓存新鲜就不该再打上游");
@@ -557,7 +644,7 @@ mod tests {
             expires_at: crate::vault::now_secs() + 100,
             api_base: copilot::DEFAULT_API_BASE.to_string(),
         });
-        let refreshed = copilot::ensure_token(&endpoints, &vault, &channel_id, &cache)
+        let refreshed = copilot::ensure_token(&endpoints, &state.vault, &channel_id, &cache)
             .await
             .expect("临近过期应当重取");
         assert_eq!(mock.copilot_token_calls(), 2, "临近过期应当重取");

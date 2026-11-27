@@ -209,6 +209,7 @@ pub fn run() {
             commands::copilot::copilot_authorize_poll,
             commands::copilot::copilot_status,
             commands::copilot::copilot_disconnect,
+            commands::copilot::copilot_models_refresh,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

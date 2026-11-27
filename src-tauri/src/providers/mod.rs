@@ -5,10 +5,12 @@
 //! - [`openai_compat`]：唯一通用实现，完成 R-1~R-8 改写
 //! - [`presets`]：纯数据预设（02 §6.1 的 7 个 API Key profile）
 //! - [`oauth`]：OAuth 型渠道的**凭证获取**（T20：GitHub Copilot；只取凭证，不出站）
+//! - [`copilot`]：Copilot **出站适配**（T21：R-6 伪装头 + Copilot token 供给 + 模型目录）
 //!
 //! v1 入站仅 OpenAI 协议，出站亦为 OpenAI 兼容改写；**v1 是改写器不是转换器**。
 
 pub mod adapter;
+pub mod copilot;
 pub mod oauth;
 pub mod openai_compat;
 pub mod presets;
@@ -16,6 +18,7 @@ pub mod presets;
 use serde_json::Value;
 
 use crate::providers::adapter::{AdapterError, AuthStyle, ChannelConfig, ChannelKind, ProviderAdapter};
+use crate::providers::copilot::CopilotSession;
 use crate::providers::openai_compat::OpenAiCompatAdapter;
 
 /// 渠道表的一行（`channel` 表，02 §9）。
@@ -38,12 +41,29 @@ pub struct ChannelRow {
 /// 自定义渠道的默认 chat 路径（无预设时的兜底）。
 pub const DEFAULT_CHAT_PATH: &str = "/v1/chat/completions";
 
+/// 适配器构造依赖（**目前只有 OAuth 型渠道需要**：凭证供给 + 端点 + 缓存）。
+///
+/// **为什么要有它**：OAuth 型渠道的凭证**由 adapter 自己供给**（02 §6.2.2）→
+/// adapter 得拿到**保险库**（取 / 刷凭证）、**OAuth 端点**与 **token 缓存**。
+///
+/// - **生产**：真实 GitHub 端点 + **全局** token 缓存（跨请求复用）；
+/// - **测试**：本地 mock 端点 + **独立**缓存（不出网，并行用例互不污染）。
+#[derive(Clone)]
+pub struct AdapterDeps {
+    /// Copilot 会话（OAuth 型渠道的凭证供给）。
+    pub copilot: CopilotSession,
+}
+
 /// 按 `provider` 取适配器。
 ///
 /// - 7 个 v1 预设 → 通用 OpenAI 兼容适配器
 /// - `custom` → 同样是通用适配器（自定义渠道即"填表"出来的 OpenAI 兼容渠道）
-/// - 其余（如 `copilot` / `workbuddy`）→ `None`（各自实现 trait，不在 M1 范围）
-pub fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
+/// - `copilot` → **Copilot 专用适配器**（T21：R-6 伪装头 + Copilot token 供给）
+/// - 其余（如 `workbuddy`）→ `None`（各自实现 trait，不在 M1 范围）
+pub fn adapter_for(
+    provider: &str,
+    deps: &AdapterDeps,
+) -> Option<Box<dyn ProviderAdapter>> {
     match presets::find(provider) {
         Some(preset) => Some(Box::new(OpenAiCompatAdapter::new(
             preset.provider,
@@ -53,13 +73,19 @@ pub fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
             "custom",
             ChannelKind::ApiKey,
         ))),
+        None if provider == copilot::PROVIDER => Some(Box::new(copilot::CopilotAdapter::new(
+            deps.copilot.clone(),
+        ))),
         None => None,
     }
 }
 
 /// 按渠道行取适配器（自定义渠道按行上的 `kind` 推断）。
-pub fn adapter_for_row(row: &ChannelRow) -> Option<Box<dyn ProviderAdapter>> {
-    if let Some(adapter) = adapter_for(&row.provider) {
+pub fn adapter_for_row(
+    row: &ChannelRow,
+    deps: &AdapterDeps,
+) -> Option<Box<dyn ProviderAdapter>> {
+    if let Some(adapter) = adapter_for(&row.provider, deps) {
         return Some(adapter);
     }
     // 未知 provider：只有在能识别为 API Key 型时才退回通用适配器
@@ -79,6 +105,9 @@ pub fn adapter_for_row(row: &ChannelRow) -> Option<Box<dyn ProviderAdapter>> {
 pub fn config_from_row(row: &ChannelRow) -> Result<ChannelConfig, AdapterError> {
     let mut config = match presets::find(&row.provider) {
         Some(preset) => preset.to_config(&row.id),
+        // Copilot（OAuth 型）：**不进预设表**（预设是 7 个 API Key profile），
+        // 走专属配置（`/chat/completions` + R-6 四项固定头）。
+        None if row.provider == copilot::PROVIDER => copilot::config_from_row(row),
         None => ChannelConfig {
             channel_id: row.id.clone(),
             provider: row.provider.clone(),
@@ -212,6 +241,29 @@ fn apply_meta_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::providers::copilot::CopilotSession;
+    use crate::providers::oauth::copilot::{Endpoints, TokenCache};
+    use crate::store::Store;
+    use crate::vault::Vault;
+
+    /// 一份可用的适配器依赖（**真保险库 + 本地 mock 端点 + 独立缓存**）。
+    fn deps() -> (tempfile::TempDir, AdapterDeps) {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let store = Arc::new(Store::open(dir.path().join("store.db")).expect("打开库"));
+        let vault = Arc::new(std::sync::RwLock::new(
+            Vault::open(Arc::clone(&store), dir.path().join("vault.bin"), None).expect("打开保险库"),
+        ));
+        let deps = AdapterDeps {
+            copilot: CopilotSession::testing(
+                vault,
+                Endpoints::local("http://127.0.0.1:1"),
+                Arc::new(TokenCache::new()),
+            ),
+        };
+        (dir, deps)
+    }
 
     fn row(provider: &str) -> ChannelRow {
         ChannelRow {
@@ -226,8 +278,9 @@ mod tests {
 
     #[test]
     fn adapter_registry_covers_all_presets() {
+        let (_dir, deps) = deps();
         for preset in presets::all() {
-            let adapter = adapter_for(preset.provider).expect("预设应有适配器");
+            let adapter = adapter_for(preset.provider, &deps).expect("预设应有适配器");
             assert_eq!(adapter.provider(), preset.provider);
             assert_eq!(adapter.kind(), preset.kind);
         }
@@ -235,24 +288,35 @@ mod tests {
 
     #[test]
     fn adapter_registry_handles_custom_and_rejects_unknown() {
-        assert!(adapter_for("custom").is_some());
-        assert!(adapter_for("copilot").is_none(), "Copilot 需各自实现 trait（M1 不含）");
-        assert!(adapter_for("not-exist").is_none());
+        let (_dir, deps) = deps();
+        assert!(adapter_for("custom", &deps).is_some());
+        assert!(adapter_for("not-exist", &deps).is_none());
+    }
+
+    #[test]
+    fn copilot_gets_its_own_adapter() {
+        // T21：Copilot **不再**被跳过（此前 `adapter_for("copilot")` 恒为 None）
+        let (_dir, deps) = deps();
+        let adapter = adapter_for(copilot::PROVIDER, &deps).expect("Copilot 应有适配器");
+        assert_eq!(adapter.provider(), copilot::PROVIDER);
+        assert_eq!(adapter.kind(), ChannelKind::OAuth);
     }
 
     #[test]
     fn adapter_for_row_falls_back_to_generic_for_api_key_kind() {
+        let (_dir, deps) = deps();
         let mut r = row("my-own-proxy");
         r.kind = "api_key".to_string();
-        let adapter = adapter_for_row(&r).expect("API Key 型未知 provider 应退回通用适配器");
+        let adapter = adapter_for_row(&r, &deps).expect("API Key 型未知 provider 应退回通用适配器");
         assert_eq!(adapter.provider(), "custom");
     }
 
     #[test]
     fn adapter_for_row_rejects_non_api_key_unknown_provider() {
-        let mut r = row("copilot");
-        r.kind = "oauth".to_string();
-        assert!(adapter_for_row(&r).is_none());
+        let (_dir, deps) = deps();
+        let mut r = row("workbuddy");
+        r.kind = "session".to_string();
+        assert!(adapter_for_row(&r, &deps).is_none());
     }
 
     #[test]
@@ -284,6 +348,26 @@ mod tests {
         assert_eq!(config.base_url, "https://proxy.example.com");
         assert_eq!(config.chat_path, DEFAULT_CHAT_PATH);
         assert!(config.inject_stream_usage);
+    }
+
+    #[test]
+    fn config_from_row_copilot_uses_the_copilot_specifics() {
+        // T21：Copilot **不进预设表**，但走专属配置（路径不带 `/v1` + R-6 四项固定头）
+        let mut r = row(copilot::PROVIDER);
+        r.kind = "oauth".to_string();
+        r.base_url = "https://api.individual.githubcopilot.com".to_string();
+        let config = config_from_row(&r).expect("构造配置");
+        assert_eq!(config.provider, copilot::PROVIDER);
+        assert_eq!(config.kind, ChannelKind::OAuth);
+        assert_eq!(config.auth_style, AuthStyle::Bearer);
+        assert_eq!(config.chat_path, "/chat/completions");
+        assert_eq!(config.base_url, "https://api.individual.githubcopilot.com");
+        assert!(config.inject_stream_usage);
+        assert_eq!(
+            config.extra_headers,
+            copilot::r6_headers(),
+            "R-6 四项固定头必须在配置里"
+        );
     }
 
     #[test]
