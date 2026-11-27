@@ -20,11 +20,13 @@
 | 浏览器辅轨（Playwright + 系统 Chrome + 持久化 profile）可用 | ✅ 已验证 | §4.2 ⑤⑥ |
 | 登录态明文零落盘（库 / WAL / SHM / 保险库四层） | ✅ 已验证 | §4.2 ③ |
 | 积分三处落点（返回值 / `reward_json` / `account.quota_json`） | ✅ 已验证（mock 上游） | §4.1 e2e |
-| 积分回写对**真实站点** | ❌ **未验证**（无登录态） | §5 |
-| 两站**真签到成功** + 魔粒字段路径 + 签到入口 DOM | ❌ **未验证**（无登录态） | §5 |
+| 积分回写对**真实站点** | ❌ **未验证**（真机当天已领过 → 本次无新增积分） | §5 |
+| MiniMax Code **真签到成功** + 签到入口定位 + 每日积分口径 | ✅ **已验证** | §4.2 ⑦⑧⑨ |
+| ModelScope **真签到成功** + 魔粒字段路径 | ❌ **未验证**（缺网页会话 Cookie） | §5 |
 
 **一句话**：链路、断言、分类、密文边界、辅轨、积分回写**全部打通并实测**；
-剩下的是「拿真实登录态跑一次真签到」——这一步**需要头头提供登录态**（§6 提问）。
+**MiniMax Code 的成功路径已跑通**（登录 → 打开签到面板 → 判「今天已领」→ 落库 `ok=1`，4307 ms）；
+剩下的是 **ModelScope 的成功路径**——只差头头的**网页会话 Cookie**（§6 提问）。
 
 ---
 
@@ -55,7 +57,7 @@
 |---|---|---|
 | `sidecar/index.mjs` | **新** | 正式辅轨：`health` / `login` / `checkin` 三个动作，**stdout 只吐一行 JSON**，用完即退 |
 | `sidecar/package.json` | **新** | `playwright@1.58.0` 依赖（`node_modules` 被 gitignore 覆盖） |
-| `sidecar/probe-*.mjs` | 新（探测用） | 接口面 / 页面结构探测脚本，**不是**运行时代码的一部分 |
+| `sidecar/probe-*.mjs` | 新（探测用） | 接口面 / 页面结构探测脚本，**不是**运行时代码的一部分；第二轮新增 `probe-signedin.mjs`（登录态页面结构 + `status` 响应体）、`probe-signin-entry.mjs`（**逐个点候选触发点找签到入口**）、`probe-signin-panel.mjs`（**走一遍真实签到流程** + 抓 `status`/`claim` 响应体） |
 
 **前端**
 
@@ -161,7 +163,61 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 **截图**：`docs/reviews/app-ui-t18-plugins.png`（插件区 + 调度表 + 登录态 + 执行记录）、
 `docs/reviews/app-ui-t18-sidecar-login.png`（辅轨弹出的真实站点浏览器窗口）。
 
-### 4.3 真机揪出并修掉的 4 个 bug
+**⑦ MiniMax Code 登录交接成功（第二轮，2026-11-27）**
+
+- 站点**短信/验证码登录被频控**——点「获取验证码」直接报**「操作频繁」**，短信发不出去（站点防刷策略，不是我们的 bug）；
+- 辅轨改为**自动打开登录弹窗 + 自动切「账号密码登录」**（**只铺路**：不代填密码、**不绕人机验证**，撞 AGENT.md §5.7），日志：
+
+  ```
+  [sidecar] 浏览器已启动：chrome（headless=false）
+  [sidecar] 已打开登录弹窗（「登录」）
+  [sidecar] 已点击：「账号密码登录」
+  [sidecar] 登录方式已切到账号密码（「账号密码登录」）——避开短信通道的频控
+  [sidecar] 检测到登录成功（user_id=479049039077470200）   ← 判据 A：硬信号
+  {"ok":true,"loggedIn":true,"code":null,"message":"登录完成，登录态已存进本地浏览器 profile"}
+  ```
+
+- **登录态落进应用自己那份 profile**：`%APPDATA%\llm-router\browser-profile`（与 Rust 侧 `LLMR_BROWSER_PROFILE` 同一份 → 应用侧立刻可用；实测 Chrome 进程参数 `--user-data-dir=C:\Users\Ben\AppData\Roaming\llm-router\browser-profile`，父进程 = 辅轨 Node 进程）。
+- **登录超时 5min → 15min**（真人要输密码 + 过人机验证；`LLMR_LOGIN_TIMEOUT_MS` 可覆盖）。
+
+**⑧ 签到入口定位（第二轮）**
+
+- **入口不在首页**：登录态首页**一个「签到」字都没有**（`keywordHits` 为空），页面加载时只打 `/signin/config` + `/signin/status`；
+- 逐个点候选触发点（用户头像下拉 / 侧栏「更多」）后命中：**用户头像下拉菜单**里有 `设置 / 用量 / **每日签到** / 问题反馈 / 联系我们 / 了解更多 / 退出登录`；
+- 触发器是 `.ant-dropdown-trigger`，**页面上有两个**——第一个是头像（有文字），第二个是「添加附件或技能」（**没文字**）→ **只认有文字的那个**（这是个坑）。
+
+**⑨ 真签到成功（第二轮，端到端）**
+
+- 应用里点 MiniMax Code 行的「立即执行」→ Rust → Node 辅轨 → Playwright → 系统 Chrome → 真实 `agent.minimax.cn`：
+
+  ```
+  [sidecar] 浏览器已启动：chrome（headless=true）
+  [sidecar] 抓到 status 响应：HTTP 200
+  [sidecar] 已打开用户头像下拉菜单
+  [sidecar] 已点击：「每日签到」
+  {"ok":true,"alreadyClaimed":true,"points":null,"day":7,"code":null,"message":"今天已经领过了（连签第 7 天，当日积分 1000）"}
+  ```
+
+- 应用 UI：**「[MiniMax Code（网页版）] 签到成功（success）：MiniMax Code 今天已经领过了（连签第 7 天）　耗时 4307 ms」**；
+- 落库：`checkin_result` **id=9 `ok=1`** `message=MiniMax Code 今天已经领过了（连签第 7 天）` `reward_json=NULL`（**已领过 → 本次无新增积分 → 不回写额度池**，与 §2 的「合并写只记本次拿到多少」口径一致；`account.quota_json` 保持 `{}`）；
+- **真机当天已经领过**（面板里今天的按钮是**禁用态**的「今日已签到」）→ 走的是**幂等路径**，`/signin/claim` **没有被触发**（claim 响应体仍未实测，见 §5）；
+- **`/signin/status` 的真实响应体**（登录态实测）：
+
+  ```json
+  {"data":{"scene":3,"days":[
+    {"day_no":1,"points":400,"status":3,"is_today":false,"bonus_points":0},
+    {"day_no":4,"points":1000,"status":3,"is_today":false,"bonus_points":0},
+    {"day_no":7,"points":1000,"status":3,"is_today":true,"bonus_points":0}]},
+   "base_resp":{"status_code":0,"status_msg":"ok"}}
+  ```
+
+  → **`status == 3` = 已领取**；**今天那一条 = `is_today == true`**；**每日 400、第 4/7 天各 1000**（**与 03 任务卡的口径对上，实测值**）；当天为**连签第 7 天**。
+
+- 截图：`docs/reviews/app-ui-t18-signin-success.png`（成功提示 + 最近执行记录 + 调度表「最近：成功」）。
+
+### 4.3 真机揪出并修掉的 8 个 bug
+
+**第一轮（失败路径阶段）**
 
 | # | 现象 | 根因 | 修法 | 回归 |
 |---|---|---|---|---|
@@ -170,18 +226,28 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 | ③ | `login` 动作**页面还没渲染完就报「登录完成」**（假阳性） | `DOMContentLoaded` 时 React 还没渲染出按钮 → 「登录按钮数 == 0」被误判成已登录 | 等 `networkidle` + **连续两次读到 0** + 最短停留 5 s | 真机复测：未登录时不再误报成功 |
 | ④ | `checkin` 动作在页面未渲染时可能误判登录态 | 同上（1.5 s 固定等待不可靠） | 共用 `waitForRender()` | 真机复测：稳定报 `not_logged_in` |
 
+**第二轮（成功路径阶段，2026-11-27）**
+
+| # | 现象 | 根因 | 修法 | 回归 |
+|---|---|---|---|---|
+| ⑤ | 登录卡在短信验证码上——点「获取验证码」报**「操作频繁」**，短信发不出去 | 站点对**短信/验证码登录**有频控（不是我们的 bug） | 辅轨 `login` 动作**自动打开登录弹窗 + 自动切「账号密码登录」**（**只铺路**，不代填密码、不绕人机验证）；并扫「操作频繁」类文案，命中就**立刻返回**别让人白等 | 真机：登录成功（`user_id` 硬信号命中） |
+| ⑥ | 登录成功判据只有「按钮消失」一条，**判据不稳** | 登录可能开新标签页，只看首屏会把「原页按钮还在」误当没登录 | 收敛成**三条独立判据**：A 硬信号（页面 API 请求里 `user_id > 0`）/ B 整个上下文无「登录」按钮（连续两次 + 停留 ≥5 s）/ C 出现签到入口 | 真机：A 命中即判成功 |
+| ⑦ | 签到永远找不到入口 → `no_signin_entry` | 辅轨**在首页找签到文案**，而入口在**用户头像下拉**里（首页一个字都没有） | 改为**先开签到面板再判状态**：开用户菜单 → 点「每日签到」；`.ant-dropdown-trigger` **只认有文字的那个** | 真机：面板打开，判「今日已签到」 |
+| ⑧ | 积分/天数从 `/signin/status` 里提不出来 | `extract_reward` 只认**平铺字段**，认不出 `data.days[]`（每条含 `day_no`/`points`/`status`/`is_today`） | 补 `days[]` 形状：**今天那一条 = `is_today == true`** | 真机：day=7、当日 1000 分 |
+| ⑨ | 业务成功判据漏了 MiniMax 约定 | 只看 `success`/`code`，**没看 `base_resp.status_code == 0`**（AGENT.md §6 已知坑 1：HTTP 200 也可能是业务失败） | `detect_success` / `detect_already_claimed` 补 `base_resp` 分支；**带了 `base_resp` 就只认它** | 与真实响应形状对齐 |
+
 ---
 
-## 5. 未验证项（**需头头登录态**）
+## 5. 未验证项
 
 | # | 未验证项 | 需要什么 | 解锁后要回填什么 |
 |---|---|---|---|
 | ① | ModelScope **真签到成功** | 一次 `modelscope.cn` 登录态的 **Cookie 请求头** | 成功响应体形状 + **魔粒字段路径**（当前是候选路径 `data.points`/`data.balance`/`data.magicubes`/`data.total`/`points`/`balance`，站点配置 `reward.path` 可覆盖） |
-| ② | MiniMax Code **真签到成功** | 在弹出的浏览器里登录一次（登录态存进 profile） | **签到入口的 DOM 选择器**（当前是文案候选：每日签到/立即签到/去签到/签到/领取奖励/每日奖励/领积分/立即领取/领取）+ `/signin/claim` 响应体形状 |
-| ③ | 积分回写对**真实站点** | ①②任一成功即可 | `account.quota_json` 的真实 `points` 值 + `updated_at` |
-| ④ | MiniMax Code **连签天数 / 每日 400 积分**（任务卡写的「第 4/7 天各 1000」） | ② | 与任务卡数字对账（**任务卡那句是未实测的口径**） |
+| ② | MiniMax Code **`/signin/claim` 真正领取的响应体** | 一个**还没领过**的当天 | claim 响应体形状（积分/天数字段名）+ **领取按钮的真实文案**（现在是候选：`立即签到`/`去签到`/`签到领取`/`领取奖励`/`立即领取`/`领取`） |
+| ③ | 积分回写对**真实站点** | ①或②任一**真正拿到积分**即可 | `account.quota_json` 的真实 `points` 值 + `updated_at`（当前真机那次回写为 0——已领过 → 本次无新增积分，`quota_json` 保持 `{}`） |
+| ④ | MiniMax Code **签到按钮禁用态之外的状态枚举** | 一个还没领过的当天 | `status` 字段其余取值（现在只实测到 `3` = 已领取） |
 
-> 02 §7.4 §5 的「未验证项」清单与本表一致；②的 DOM 选择器与①的字段路径在实测后**收敛成一条**并回填 02。
+> 02 §7.4 §5 的「未验证项」清单与本表一致。**已收敛**：签到入口 DOM（→ 用户头像下拉「每日签到」）、每日积分与连签天数（→ 每日 400、第 4/7 天各 1000，实测第 7 天）。
 
 ---
 
@@ -195,6 +261,8 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 6. **浏览器 profile 里的凭证由浏览器自己加密保管**（DPAPI/Keychain），**应用不读、不导、不入库、不进 IPC**（AGENT.md §5.3 约束的是我们的存储路径）。
 7. **不做任何指纹伪装**（AGENT.md §5.7）——辅轨不加反检测开关、不改 UA、不隐藏自动化特征；**不绕过验证码**（撞到验证码 = 失败并通知）。
 8. **站点删除不清理内置站点的凭据**——`checkin_delete_site` 只在 `config_json` 是 HAR 模板时清理凭据；内置站点的凭据留在保险库（**下次建同名站点会复用渠道**）。**已记 backlog**。
+9. **探测脚本不许用临时 profile 反复打线上站点**——真机踩过：临时 profile 每次都像「新设备」，直接把站点的**短信通道打限流**（「操作频繁」）。**正式辅轨一律用持久化 profile**；探测脚本只在必要时用一次，且**输出要脱敏**（用户下拉里有账号 id 与手机号，不能原样打进日志）。
+10. **登录态是「浏览器的」不是「应用的」**——辅轨型站点的登录态存在**浏览器 profile** 里（浏览器自己加密保管），**应用读不到**，所以调度表「登录态」列只能显示「在浏览器里登录一次即可」；它**不反映当前是否真登录着**（要真知道只能开浏览器探一次，代价是每次多一个浏览器进程 + 与正在跑的签到抢 profile 锁）。
 
 ---
 
@@ -206,5 +274,6 @@ account: acct_default_ch_379eefca7099c2edfc6bb96a4f47c705  channel=ch_379eefca�
 | `npm run build` | 通过（32 modules，gzip 62.73 kB） |
 | 前端单测 | checkin **29/29**；全部 **44/44** |
 | 编译告警 | `cargo check --all-targets` **0 warning** |
+| `node --check sidecar/index.mjs` | 通过 |
 
 提交号见 HANDOFF §8 账本行。
