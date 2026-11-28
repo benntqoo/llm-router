@@ -4,6 +4,7 @@
 
 pub mod channel;
 pub mod checkin;
+pub mod checkin_catalog;
 pub mod circuit;
 pub mod client_key;
 pub mod copilot;

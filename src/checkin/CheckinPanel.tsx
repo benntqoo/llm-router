@@ -34,6 +34,7 @@ import {
   webhookUrlToSend,
   WEBHOOK_KINDS,
 } from "./notify";
+import CatalogPanel from "./CatalogPanel";
 import type {
   BuiltinSite,
   ChannelOption,
@@ -609,6 +610,8 @@ export default function CheckinPanel() {
           </tbody>
         </table>
       )}
+
+      <CatalogPanel sites={sites} onChanged={() => void refreshSites()} />
 
       <h3>站点调度</h3>
       {sites.length === 0 ? (

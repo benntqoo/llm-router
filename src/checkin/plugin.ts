@@ -86,6 +86,8 @@ export function pluginLabel(pluginId: string): string {
       return "ModelScope（魔搭）";
     case "minimax_code":
       return "MiniMax Code（网页版）";
+    case "spec":
+      return "声明式站点（T25）";
     default:
       return pluginId;
   }

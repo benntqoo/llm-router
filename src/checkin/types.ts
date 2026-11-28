@@ -89,6 +89,86 @@ export type SiteSummary = {
   credentialHint: string | null;
   /** 该站点归属账号的积分快照。 */
   reward: RewardSnapshot | null;
+  /** 声明式站点的定义摘要（T25；`plugin = "spec"` 时才有）。 */
+  spec: SpecSummary | null;
+};
+
+/** 声明式站点的定义摘要（**不含任何凭据**）。 */
+export type SpecSummary = {
+  id: string;
+  method: string;
+  url: string;
+  /** 「本次拿到」的字段路径（配了才有）。 */
+  rewardPath: string | null;
+  /** 「当前余额」的字段路径（配了才有）。 */
+  balancePath: string | null;
+};
+
+/** 声明式站点的一个请求头。 */
+export type SpecHeader = { name: string; value: string };
+
+/** 声明式站点的一个查询参数。 */
+export type SpecParam = { name: string; value: string };
+
+/** 声明式站点的一条 JSON 路径断言。 */
+export type SpecJsonPath = { path: string; equals?: unknown };
+
+/**
+ * 声明式站点（**spec**）。
+ *
+ * 与后端 `checkin::spec::SpecSite` 一一对应（02 §7.6.1）。
+ * 占位符只有两个：`{{token}}`（登录态，取自加密保险库）与 `{{today}}`（当天日期）。
+ */
+export type SpecSite = {
+  id: string;
+  name: string;
+  method?: string;
+  url: string;
+  headers?: SpecHeader[];
+  query?: SpecParam[];
+  body?: { mimeType?: string; text?: string };
+  /** 登录态凭据 id（**只是 id，不是密文**）。 */
+  credentialId?: string;
+  assert?: { status?: number; jsonPaths?: SpecJsonPath[] };
+  /** 「本次拿到」的字段路径。 */
+  reward?: { path: string; unit?: string };
+  /** 「当前余额」的查询规则。 */
+  balance?: {
+    method?: string;
+    url: string;
+    path: string;
+    unit?: string;
+    headers?: SpecHeader[];
+    query?: SpecParam[];
+  };
+  schedule?: string;
+};
+
+/** 内置目录里的一条（`kind` = `builtin` 代码插件 / `template` 声明式模板）。 */
+export type CatalogEntry = {
+  id: string;
+  name: string;
+  kind: string;
+  summary: string;
+  credentialHint: string;
+  defaultSchedule: string;
+  /** 声明式模板的完整定义（`kind = template` 时才有）。 */
+  spec?: SpecSite;
+};
+
+/** 一次目录导入的结果（**非法条目带原因，不静默丢弃**）。 */
+export type CatalogImportSummary = {
+  imported: SiteSummary[];
+  errors: { name: string; id: string; reason: string }[];
+};
+
+/** 余额查询的结果（**「当前余额」，不是「本次拿到」**）。 */
+export type BalanceSummary = {
+  siteId: string;
+  siteName: string;
+  amount: number;
+  unit: string;
+  message: string;
 };
 
 /** 账号额度快照里的签到积分（**「本次拿到了多少」，不是账户余额真值**）。 */

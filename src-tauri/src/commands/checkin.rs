@@ -79,6 +79,24 @@ pub struct SiteSummary {
     pub credential_hint: Option<String>,
     /// 该站点归属账号的积分快照（02 §7.4 §4）。
     pub reward: Option<crate::store::account::RewardSnapshot>,
+    /// 声明式站点的定义摘要（T25；`plugin = "spec"` 时才有）。
+    pub spec: Option<SpecSummary>,
+}
+
+/// 声明式站点的定义摘要（给 UI 展示；**不含任何凭据**）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecSummary {
+    /// spec id（站点的身份）。
+    pub id: String,
+    /// 请求方法。
+    pub method: String,
+    /// 签到接口地址。
+    pub url: String,
+    /// 「本次拿到」的字段路径（配了才有）。
+    pub reward_path: Option<String>,
+    /// 「当前余额」的字段路径（配了才有）。
+    pub balance_path: Option<String>,
 }
 
 /// 一次执行的摘要（IPC 返回）。
@@ -596,11 +614,20 @@ pub fn checkin_set_credential_of(
     };
 
     match which {
-        "cookie" => config.credential_id = Some(credential_id),
-        _ => config.token_credential_id = Some(credential_id),
+        "cookie" => config.credential_id = Some(credential_id.clone()),
+        _ => config.token_credential_id = Some(credential_id.clone()),
     }
     let mut updated = row.clone();
-    updated.config_json = Some(config.to_json());
+    updated.config_json = Some(if row.plugin == crate::checkin::spec::PLUGIN_SPEC {
+        // **声明式站点（T25）**：只换登录态，**`spec` 定义必须原样保留**——
+        // 直接写 `config.to_json()` 会把定义整个抹掉（`PluginSiteConfig` 里没有这个字段）。
+        let mut spec_config = crate::checkin::spec::parse_site_config(&row)?;
+        // 声明式站点只有一个凭据槽（`{{token}}`），两种登录态都放这儿
+        spec_config.credential_id = Some(credential_id.clone());
+        spec_config.to_json()
+    } else {
+        config.to_json()
+    });
     state
         .store
         .with_conn(|conn| checkin::upsert_site(conn, &updated))
@@ -608,12 +635,18 @@ pub fn checkin_set_credential_of(
 
     // 旧的那条凭据**在站点行更新成功之后**再删（与 T15 重录模板同一路子）——
     // 不删会在保险库里留一条没人引用的孤儿凭据。
-    let previous = match which {
-        "cookie" => old_config.credential_id,
-        _ => old_config.token_credential_id,
+    let previous = if row.plugin == crate::checkin::spec::PLUGIN_SPEC {
+        // **声明式站点只有一个凭据槽**（`{{token}}`）：旧的那条就是它
+        old_config.credential_id
+    } else {
+        match which {
+            "cookie" => old_config.credential_id,
+            _ => old_config.token_credential_id,
+        }
     };
     if let Some(previous) = previous {
-        let still_used = config.credential_id.as_deref() == Some(previous.as_str())
+        let still_used = previous == credential_id
+            || config.credential_id.as_deref() == Some(previous.as_str())
             || config.token_credential_id.as_deref() == Some(previous.as_str());
         if !still_used {
             let vault = state.vault.read().map_err(|e| e.to_string())?;
@@ -735,7 +768,7 @@ fn resolve_channel(state: &AppState, input: &SaveTemplateInput) -> Result<String
 }
 
 /// 站点行 → 展示摘要（含调度信息）。
-fn summarize(state: &AppState, row: &SiteRow) -> Result<SiteSummary, String> {
+pub(crate) fn summarize(state: &AppState, row: &SiteRow) -> Result<SiteSummary, String> {
     let template = row
         .config_json
         .as_deref()
@@ -780,6 +813,24 @@ fn summarize(state: &AppState, row: &SiteRow) -> Result<SiteSummary, String> {
         .as_deref()
         .and_then(|account_id| crate::store::account::read_reward(&state.store, account_id));
 
+    // 声明式站点的定义摘要（T25）
+    let spec_summary = if row.plugin == crate::checkin::spec::PLUGIN_SPEC {
+        crate::checkin::spec::parse_site_config(row)
+            .ok()
+            .map(|config| {
+                let spec = config.effective_spec();
+                SpecSummary {
+                    id: spec.id.clone(),
+                    method: spec.method(),
+                    url: spec.url.clone(),
+                    reward_path: spec.reward.as_ref().map(|reward| reward.path.clone()),
+                    balance_path: spec.balance.as_ref().map(|balance| balance.path.clone()),
+                }
+            })
+    } else {
+        None
+    };
+
     Ok(SiteSummary {
         id: row.id.clone(),
         name: row.name.clone(),
@@ -798,6 +849,7 @@ fn summarize(state: &AppState, row: &SiteRow) -> Result<SiteSummary, String> {
         needs_sidecar: plugin.as_ref().map(|p| p.needs_sidecar()).unwrap_or(false),
         credential_hint: plugin.as_ref().map(|p| p.credential_hint().to_string()),
         reward,
+        spec: spec_summary,
     })
 }
 

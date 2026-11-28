@@ -14,6 +14,7 @@ use crate::checkin::har::SiteTemplate;
 use crate::checkin::replay::{
     ReplayClass, ReplayEngine, ReplayOutcome, ResolveError, SecretResolver,
 };
+use crate::checkin::spec::PLUGIN_SPEC;
 use crate::store::checkin::{self, SiteRow, PLUGIN_HAR};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -227,7 +228,12 @@ async fn execute(
         };
     }
 
-    // 2) 内置站点插件 → `checkin::sites::*`
+    // 2) 声明式站点（T25；02 §7.6.5）→ 编译成现有模板 → **现有重放引擎**
+    if site.plugin == PLUGIN_SPEC {
+        return run_spec(vault, engine, site).await;
+    }
+
+    // 3) 内置站点插件 → `checkin::sites::*`
     match crate::checkin::plugin::builtin(&site.plugin) {
         Some(plugin) => {
             let config = crate::checkin::plugin::parse_config(site);
@@ -256,6 +262,59 @@ async fn execute(
             body_preview: None,
             reward: None,
         },
+    }
+}
+
+/// 执行一次**声明式站点**签到（T25；02 §7.6.5）。
+///
+/// **复用已验证的重放引擎**：spec → `SiteTemplate` → `inject` → `replay`；
+/// 唯一多出来的是**从响应体里按路径取积分**（取不到不算失败）。
+async fn run_spec(
+    vault: &Arc<RwLock<Vault>>,
+    engine: &ReplayEngine,
+    site: &SiteRow,
+) -> ReplayOutcome {
+    let config = match crate::checkin::spec::parse_site_config(site) {
+        Ok(config) => config,
+        Err(message) => return spec_failure(message),
+    };
+    let spec = config.effective_spec();
+    // `{{today}}` 在**执行时**取值 → 跨天自动变，不用重录
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let template = match spec.to_template(&today) {
+        Ok(template) => template,
+        Err(message) => return spec_failure(message),
+    };
+
+    let resolver = VaultResolver::new(Arc::clone(vault));
+    let (mut outcome, body) = engine.replay_with_body(&template, &resolver).await;
+
+    // 积分：只在**签到成功**时取；取不到就当「本次没有积分」（**不判失败**）
+    if outcome.ok {
+        if let (Some(reward), Some(body)) = (spec.reward.as_ref(), body.as_ref()) {
+            if let Some(amount) = crate::checkin::spec::extract_amount(&reward.path, body) {
+                outcome.reward = Some(crate::checkin::reward::Reward::new(
+                    amount,
+                    &spec.reward_unit(),
+                    serde_json::json!({ "amount": amount }),
+                ));
+            }
+        }
+    }
+    outcome
+}
+
+/// 声明式站点的失败出口（**归类 `template_invalid`**：定义本身有问题，不是网络问题）。
+fn spec_failure(message: String) -> ReplayOutcome {
+    ReplayOutcome {
+        ok: false,
+        class: ReplayClass::TemplateInvalid,
+        message,
+        status: None,
+        elapsed_ms: 0,
+        retryable: false,
+        body_preview: None,
+        reward: None,
     }
 }
 

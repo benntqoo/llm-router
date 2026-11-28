@@ -226,34 +226,81 @@ impl ReplayEngine {
         template: &SiteTemplate,
         resolver: &dyn SecretResolver,
     ) -> ReplayOutcome {
+        self.replay_inner(template, resolver).await.0
+    }
+
+    /// 重放一次并**同时交出响应体**（供声明式站点提取积分/余额）。
+    ///
+    /// **响应体只在内存里**：不进 `checkin_result`、不进 IPC、不回显。
+    /// 分类与断言语义与 [`ReplayEngine::replay`] **完全一致**（T25 只是多交一份响应体）。
+    pub async fn replay_with_body(
+        &self,
+        template: &SiteTemplate,
+        resolver: &dyn SecretResolver,
+    ) -> (ReplayOutcome, Option<serde_json::Value>) {
+        self.replay_inner(template, resolver).await
+    }
+
+    /// 重放的内部实现。
+    async fn replay_inner(
+        &self,
+        template: &SiteTemplate,
+        resolver: &dyn SecretResolver,
+    ) -> (ReplayOutcome, Option<serde_json::Value>) {
         let started = Instant::now();
         let request = match inject(template, resolver) {
             Ok(request) => request,
-            Err(failure) => return ReplayOutcome::failure(failure, started.elapsed().as_millis() as u64),
+            Err(failure) => {
+                return (
+                    ReplayOutcome::failure(failure, started.elapsed().as_millis() as u64),
+                    None,
+                )
+            }
         };
 
+        let (status, body) = match self.send(&request, started).await {
+            Ok(pair) => pair,
+            Err(outcome) => return (outcome, None),
+        };
+
+        let mut outcome = evaluate(template, status, &body);
+        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+        if !outcome.ok {
+            outcome.body_preview = preview(&body);
+        }
+        // 解析出的响应体（**只在内存里**；不是 JSON 就给 `None`）
+        let body_json = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        (outcome, body_json)
+    }
+
+    /// 发出注入后的请求并读回响应体（**失败一律归类成 `ReplayOutcome`**）。
+    async fn send(
+        &self,
+        request: &InjectedRequest,
+        started: Instant,
+    ) -> Result<(u16, Vec<u8>), ReplayOutcome> {
         let method = match reqwest::Method::from_bytes(request.method.as_bytes()) {
             Ok(method) => method,
             Err(_) => {
-                return ReplayOutcome::failure(
+                return Err(ReplayOutcome::failure(
                     ReplayFailure::new(
                         ReplayClass::TemplateInvalid,
                         format!("模板里的请求方法不合法: {}", request.method),
                     ),
                     started.elapsed().as_millis() as u64,
-                )
+                ))
             }
         };
         let url = match reqwest::Url::parse(&request.url) {
             Ok(url) => url,
             Err(err) => {
-                return ReplayOutcome::failure(
+                return Err(ReplayOutcome::failure(
                     ReplayFailure::new(
                         ReplayClass::TemplateInvalid,
                         format!("模板里的 URL 不合法: {}（{err}）", request.url),
                     ),
                     started.elapsed().as_millis() as u64,
-                )
+                ))
             }
         };
 
@@ -262,25 +309,25 @@ impl ReplayEngine {
             let header_name = match reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
                 Ok(name) => name,
                 Err(_) => {
-                    return ReplayOutcome::failure(
+                    return Err(ReplayOutcome::failure(
                         ReplayFailure::new(
                             ReplayClass::TemplateInvalid,
                             format!("模板里的请求头名不合法: {name}"),
                         ),
                         started.elapsed().as_millis() as u64,
-                    )
+                    ))
                 }
             };
             let header_value = match reqwest::header::HeaderValue::from_str(value) {
                 Ok(value) => value,
                 Err(_) => {
-                    return ReplayOutcome::failure(
+                    return Err(ReplayOutcome::failure(
                         ReplayFailure::new(
                             ReplayClass::TemplateInvalid,
                             format!("模板里的请求头值不合法: {name}"),
                         ),
                         started.elapsed().as_millis() as u64,
-                    )
+                    ))
                 }
             };
             builder = builder.header(header_name, header_value);
@@ -303,10 +350,10 @@ impl ReplayEngine {
                 } else {
                     format!("网络失败：{err}")
                 };
-                return ReplayOutcome::failure(
+                return Err(ReplayOutcome::failure(
                     ReplayFailure::retryable(ReplayClass::NetworkError, message),
                     started.elapsed().as_millis() as u64,
-                );
+                ));
             }
         };
 
@@ -314,7 +361,7 @@ impl ReplayEngine {
         let raw_body = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                return ReplayOutcome {
+                return Err(ReplayOutcome {
                     ok: false,
                     class: ReplayClass::NetworkError,
                     message: format!("网络失败：读上游响应体失败（{err}）"),
@@ -323,7 +370,7 @@ impl ReplayEngine {
                     retryable: true,
                     body_preview: None,
                     reward: None,
-                };
+                });
             }
         };
         let body: Vec<u8> = raw_body
@@ -331,13 +378,7 @@ impl ReplayEngine {
             .copied()
             .take(MAX_ASSERT_BODY_BYTES)
             .collect();
-
-        let mut outcome = evaluate(template, status, &body);
-        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
-        if !outcome.ok {
-            outcome.body_preview = preview(&body);
-        }
-        outcome
+        Ok((status, body))
     }
 }
 

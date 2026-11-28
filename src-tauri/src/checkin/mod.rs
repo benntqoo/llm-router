@@ -7,6 +7,7 @@
 //! **结果通知**（T19）在调度层之上：`checkin::notify` 覆盖全部执行路径。
 
 pub mod cli;
+pub mod catalog;
 pub mod cron;
 pub mod har;
 pub mod notify;
@@ -16,5 +17,6 @@ pub mod reward;
 pub mod scheduler;
 pub mod sidecar;
 pub mod sites;
+pub mod spec;
 pub mod system;
 pub mod system_notify;
