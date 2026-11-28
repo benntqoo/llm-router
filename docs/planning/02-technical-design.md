@@ -896,6 +896,31 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
    否则会出现"渠道显示密钥已录入，保险库却显示 0 条凭据"的自相矛盾。
    实现上用轻量事件总线（`src/panels/bus.ts`）+ 定时轮询兜底，不引第三方依赖。
 
+### 6.7 应用内 UI 功能分组与导航（T26 落地）
+
+**问题（2026-11-28 头头指出）**：8 个面板在 `src/App.tsx` 单页平铺（渠道 / Copilot / 保险库 / Client Key / 模型目录 / 熔断 / 用量 / 签到），
+首屏被三张说明卡片占掉，找功能靠纵向滚动，无位置感。
+
+**口径（头头 2026-11-28 拍板：4 组方案）**：
+
+| tab | 归入面板 | 语义 |
+|---|---|---|
+| **接入** | 渠道 · 模型目录 · Copilot 反代 | 「把渠道/上游接进来」 |
+| **凭证** | 加密保险库 · Client Key | 「保管密钥与本地口令」 |
+| **运维** | 熔断状态 · 用量统计 | 「运行期的健康与花费」 |
+| **签到与积分** | 签到面板（T15–T19） | 「自动签到与积分」 |
+
+**四条实现口径**：
+
+1. **分组定义是纯数据**：放在 `src/tabs.ts`（`TABS: TabDef[]`，含 `id` / `label` / `hint` / 面板列表），
+   **可单测**（`node --test`），不与 React 组件耦合。
+2. **一次只渲染当前 tab 的面板**（**不做「全渲染 + CSS 隐藏」**）→ 首屏 DOM 显著变小，签到面板那 39 KB 的区块不再拖累其它页。
+3. **网关状态常驻顶栏**（运行状态点 + 监听地址 + `base_url`）——**切到任何 tab 都能一眼看到「网关在不在跑」**；
+   「快速开始（从零接入三步）」移入**「接入」组首卡**（它讲的就是配渠道）；「当前范围」移到底部**折叠区**（历史说明，不是操作入口）。
+4. **选中项持久化**：`localStorage` 键 `llm-router.activeTab` → 重开应用回到原地；**未知值回落到默认 tab（接入）**。
+
+**边界**：不加路由库（单页 tab 用 `useState` 即可）；不引第三方依赖；**不改任何面板内部逻辑**（只改「谁被渲染」）。
+
 ---
 
 ## 7. 自动签到框架
@@ -1274,6 +1299,98 @@ Windows 的 toast 有**两层**独立的拦截，任一层挡住都会**静默�
   - 这个开关是**全局**的：它关着时**别的应用的 toast 同样被拦**（本机另一个应用的通知也记着同一条 `Id=3150`）→ 所以「PowerShell 原生 toast 也不显示」**不是** AUMID 问题，别再往那条路查。
 - **投递成功的判据**（比「API 返回成功」可靠）：事件日志出现 `Id=3153 Toast … is delivered to <AUMID> on session N`，且通知库 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表里有对应 payload（被丢弃的 toast **从不入库**）。
 
+### 7.6 站点目录与声明式站点（T25 落地）
+
+**问题（2026-11-28 头头指出）**：「很多 agent harness 都可以有签到领积分」——
+但**新增一家平台的边际成本**现状偏高：内置插件要写 Rust + 发版；HAR 模板要抓包 + 逐条标变量 + 手改断言（**无断言编辑 UI**，T16/T17 留档已知限制）。
+
+**结论（头头 2026-11-28 拍板）**：**框架不缺，缺的是「轻量接入通道」**——
+引擎层（注入 / 重放 / 断言 / 8 类分类）、调度层（cron + 系统兜底）、通知层**都已是通用且已验证**；
+因此**新增「声明式站点（spec）+ 站点目录（catalog）」**：新增一家平台 = 填一份 JSON（或导入一个目录文件），**不改一行 Rust、不发版**。
+提案与影响面见 `docs/reviews/proposal-t25-t26.md`。
+
+#### 7.6.1 spec 数据模型
+
+```jsonc
+{
+  "id": "my-platform",              // 目录内唯一 id（导入时按它去重）
+  "name": "我的平台",                // UI 展示名
+  "method": "POST",                 // 默认 GET
+  "url": "https://example.com/api/checkin",
+  "headers": [ { "name": "Authorization", "value": "Bearer {{token}}" } ],
+  "query":   [ { "name": "day", "value": "{{today}}" } ],
+  "body":    { "mimeType": "application/json", "text": "{\"type\":\"daily\"}" },
+  "credentialId": "cred_xxx",       // 敏感值来源 = 保险库里的凭据 id（真实值不出模板）
+  "assert":  { "status": 200, "jsonPaths": [ { "path": "data.ok", "equals": true } ] },
+  "reward":  { "path": "data.credits", "unit": "point" },       // 可选：本次拿到多少
+  "balance": { "method": "GET", "url": "https://example.com/api/balance",
+               "path": "data.balance", "unit": "point" }          // 可选：当前余额
+}
+```
+
+**校验规则（导入与保存都跑）**：
+
+| 字段 | 规则 |
+|---|---|
+| `id` | 非空、只允许 `[a-z0-9_-]`、≤64 字符、**目录内唯一** |
+| `name` | 非空、≤64 字符 |
+| `url` | **必须是 http/https 的绝对 URL**（禁 `file:` / `javascript:` 等） |
+| `method` | 缺省 `GET`；非空时按大写归一 |
+| `credentialId` | 可选；**给了就必须能在保险库里取到值**（取不到 → `credential_missing`，**不发请求**） |
+| `assert.status` | 可选；给了就是**期望状态码**（不是录制值） |
+| `assert.jsonPaths` | 可选；点号路径 + 数组下标，`equals` 缺省 = 「存在即通过」 |
+| `reward.path` / `balance.path` | 可选；点号路径，**取不到 → 没有积分**（**不判签到失败**） |
+
+**占位符只有两种**（刻意不做表达式引擎，避免把 spec 变成脚本）：
+
+| 占位符 | 类别 | 取值 |
+|---|---|---|
+| `{{token}}` | **敏感** | 保险库 `credentialId` 指向的凭据真实值（**只进请求，不进模板、不回显**） |
+| `{{today}}` | 非敏感 | 当天日期 `YYYY-MM-DD`（`chrono::Local`）——跨天自动变，不用重录 |
+
+#### 7.6.2 编译成现有模板（零新引擎）
+
+spec → **`SiteTemplate`**（02 §7.1.1 的同一套结构）→ 交给**已验证的重放引擎**（§7.1.3）执行：
+
+- `variables`：`token`（`sensitive = true` + `credentialId`）、`today`（`default = <当天日期>`）。
+- `request`：method / url / headers / query / postData **一一映射**。
+- `assert`：`status` + `jsonPaths` **直接映射**（§7.1.1 §3 的 `TemplateAssert`）。
+- 于是**注入、占位符替换、断言、8 类分类、重试语义、结果落库**——**全部沿用现有实现，一行不改**。
+- 唯一新增：**编译后的模板 + 积分/余额路径提取**。
+
+#### 7.6.3 目录（catalog）
+
+- **目录文件**：`{ "version": 1, "sites": [ spec, … ] }`。
+- **导入**：逐条校验 → **逐条建站**；**非法条目带原因返回**（**不静默丢弃**）；建站后 **`enabled = 0`**（与 §7.3「站点插件默认全关」一致）；
+  **同名 id 视为更新**（幂等：同一份目录导入两次 → 站点数不变）。
+- **导出**：把自建站点导出成目录文件——**只含 `credentialId`（id，不是密文），不含任何真实凭据** → 可分享给别的 harness 用户。
+- **内置目录**：首版只收**已实测**的条目（ModelScope / MiniMax Code 走**代码插件**，以「内置条目」形式列出，用户不必重填）+ 一个**空白模板**（通用 HTTP 签到，填 URL 即可）。
+  **不虚构 endpoint**：任何「听说的」平台（智谱 / 硅基流动 / 讯飞等）**不进内置目录**，等实测后再收（进 backlog）。
+
+#### 7.6.4 积分：本次拿到 vs 当前余额
+
+| 概念 | 口径 | 落点 |
+|---|---|---|
+| **本次拿到** | 这一次签到**入账了多少**（`Reward{amount, unit, raw}`，`raw` 只留数值/布尔——§7.4 §4 密文边界不变） | `checkin_result.reward_json` + `account.quota_json` 合并写 |
+| **当前余额** | 平台账户**现在有多少**（`spec.balance` 声明式查询） | **只回前端展示**，**不落 `quota_json`**（不与 §8.2 限额自学习字段打架） |
+
+- **UI 文案严格区分**：「本次拿到 400 积分」 vs 「当前余额 1,200 积分」——**「本次拿到」四个字不省，「余额」不用于前者**。
+- **取不到余额不算失败**（余额接口挂了不影响签到结论）。
+
+#### 7.6.5 分派与落库
+
+- `checkin_site.plugin = "spec"`（新增取值）→ `scheduler::execute` 分派时走**第三支**：编译 → 引擎 → 取 `reward`。
+- **不改 schema**：复用 `checkin_site`（`plugin` / `config_json` / `schedule` / `enabled` 四个字段够用）。
+- 站点归属渠道与账号口径**沿用 T18**（占位渠道 `provider = custom` → 默认账号 `acct_default_<channel_id>`），
+  积分回写 `quota_json` 的**合并写**语义不变。
+
+#### 7.6.6 边界（明确不做）
+
+- **不做**验证码绕过 / 指纹伪造 / 签名伪造（AGENT.md §5.7）——撞上验证码 = 失败并通知（与 §7.3 一致）。
+- **不做**任意表达式 / 脚本化 spec（占位符只有 `{{token}}` 与 `{{today}}`）。
+- **不内置未实测的 endpoint**。
+- **不改重放引擎的分类与断言语义**、**不改 schema**、不引第三方依赖。
+- 不做多账号切换器、不做代理池、不做「签到后自动下单/兑换」等业务动作（**只签到与查余额**）。
 
 ---
 
@@ -1663,3 +1780,5 @@ python scripts/security_check.py `
 | v0.30 | 2026-11-27 | M4 **T21 真机实测修订（模型目录口径按真实响应订正）**：① **§6.2.2「模型目录口径」按真机响应重写**——真实上游的 `supported_endpoints` 给的是**路径**（`/chat/completions`、`/responses`、`/responses/ws:`、`/v1/decisions`），**不是**社区 schema 里的短名（`chat`）→ v0.29 写的「含 `chat` 才收录」在真实数据上**等于没过滤**，实测把 `text-embedding-3-small` 等 3 个 **embeddings** 模型与一批只支持 `/responses` 的模型一起收了进来；② **收录规则补第二条**：`capabilities.type` **存在且不是 `chat`** → 不收录（真实取值有 `chat` / `embeddings` / `decisions`）；③ **端点判定两种形状都认**（路径含 `chat/completions` **或**短名等于 `chat`）——路径与短名各留一条单测；④ **实测数据**：账号 `api.individual.githubcopilot.com` 的 `/models` 原始 **39 条 → 收录 19 条**（`policy.state=disabled` 8 条、`capabilities.type != chat` 3 条、只支持 `/responses` 9 条被排除）；⑤ **真机四证**：R-6 四头 + `x-request-id` 经真实上游**实测通过**（上游正常回话，无头缺失/鉴权错误）、**经真网关流式对话成功**（`gpt-4o-mini-2024-07-18`，6~12 帧真实内容）、`usage_log` 落库 `status=success`（`tokens=13/22`、`estimated=0`、耗时 2999~3575 ms）、**四层零明文**（官方执行器明文命中 0 条 + `ghu_`/`eyJ`/`Bearer` 形态扫描 0 命中）；⑥ **订正后的落库语义**经真机验证：上轮误收的 3 个 embedding 模型在重新同步时**被置为禁用而非物理删除**（`model` 表 22 行 / 启用 19 行）；⑦ **新增落库口径**：`supported_endpoints` 缺失的老模型（`gpt-4o` 家族）**按 chat 收**（`capabilities.type=chat`，真机实测能对话）；⑧ **不改协议面**：R-6 取值 / 出站 URL / 凭证供给口径 / 边界**全部不动**，只修收录规则 |
 | v0.31 | 2026-11-28 | M4 **T22 WorkBuddy 协议确认（卡片补全 + 出站口径实测）**：① **方法调整**——WorkBuddy 是 **Electron 桌面端**（本机 `D:\IDE\WorkBuddy`，`version` = `37.10.3-43`，`app.asar` 182 MB / 9894 文件），**发行版代码即协议真值源** → 改为「**发行版静态取证为主 + 可选 CDP 复核**」（`~/.workbuddy/app/session/DevToolsActivePort` 实测存在，端口 `9222`），**不打扰用户桌面端**；② **新增 §6.3.1「WorkBuddy 协议记录（T22 实测）」**（上游 host / 端点 / 鉴权头清单 / 指纹与签名结论 / 登录态字段 / 可实现性判定 / 未验证项，**全部只记字段名不记值**）；③ **协议侧结论：chat 请求无动态签名、无设备指纹绑定**——`device-id` 不上请求、`X-Machine-Id` 只用于 `/v2/feedback`、**qimei36 是注入 sidecar 的环境变量不是 HTTP 头**、`X-Device-Token` 只用于签到、`x-workbuddy-mcp-context`（HMAC-SHA256）是本地代理会话信封且转发前被剥离 → **不触发 03 §5 降级触发条件**（「抓包显示请求含动态签名」**实测不成立**），且**无需实现任何指纹伪造**（§5.7 无冲突面）；④ **出站口径**：产品域名 `https://copilot.tencent.com`，chat 端点 `POST /v2/chat/completions`，鉴权 `Authorization: Bearer <accessToken>`（**最后写入、覆盖入站值**）+ `X-User-Id` + 产品头 + 会话头 + 链路头；**转发前剥离** `authorization` / `x-workbuddy-mcp-context` / `origin` / `host` 等；**401 → `refreshSession()` → 重放一次**（与 Copilot 同构）；⑤ **登录态实测推翻旧口径**：登录态**不在** `~/.workbuddy/app/users/<hash>/`（本机实测**为空**），真实位置 = `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（**普通 JSON + 字段级 AES-256-GCM**，敏感字段为 `{"$wbEncrypted":1,"envelope":…}`）；加密链 = 构建期 `atRestSecretKey` → `sha256` 得 protector key（`9127dea1b44020a7`）→ 解 `~/.workbuddy/keyblob` 得 master key（`fca8d6b22ed65a97`）→ 解字段信封；**构建期密钥不在磁盘、不在 asar**，由**定制 Electron** 的 `electron.workbuddyStorage.loggerGet()` 在运行时提供（代码里**无 DPAPI** 调用）；⑥ **可实现性判定**：**协议侧可转发、凭证侧是卡点** → T23 的凭证获取方式（用户显式提供 / 逆向定制运行时 / 降级档「保活+额度+模型目录」）**列为提案待头头拍板**，本卡**不自行决定**、**不擅自改写 §6.3 既有条款**（P1~P4 四条修订建议见 §6.3「设计变更提案」）；⑦ **模型目录来源**：免鉴权普通文件 `…\app.asar.unpacked\cli\product.cloudhosted.json`（22 个模型，字段 `id`/`name`/`credits`/`vendor`/`supportsToolCall`/`supportsImages`/`maxInputTokens`/`maxOutputTokens`/`supportsReasoning`/`tags`/`relatedModels`）；⑧ **未验证**：请求体/响应体 JSON schema（daemon **字节级透传** body，由 CLI 运行时构造 → 与「v1 入站仅 OpenAI chat」的兼容性未实测）、**真实 chat 端到端**（WorkBuddy 未运行，本轮无活体抓包）、`/v2/user/cloudagent/quota` 响应形状 |
 | v0.32 | 2026-11-28 | M4 **T22 付费前提与账号实况（头头口述 + 本机补证）**：① **新增 §6.3.1 §5.1「付费前提」**——头头口径：**没有付费之前，无法在 WorkBuddy 建立 token**；② **本机补证（只读、未解密任何信封）**：账号 `type="personal"` / `loginChannels=["openplatform"]`；会话**活的**（`lastRefreshTime` = 2026-11-28 09:49:26，本次核查前 1 分钟；`expiresAt` 2026-12-26 / `refreshExpiresAt` 2026-12-28；`tokenType="Bearer"`；`domain="copilot.tencent.com"`）；`~/.workbuddy/workbuddy.db` → `session_usage` **46 行**带 `credit_json`（各模型 credits 消耗）→ **额度确实在被消耗**；③ **付费结构**：订阅包字段 `PackageCode`/`PackageName`/`DeductionEndTime`/`CycleEndTime`/`AutoRenewFlag` + 额度字段 `usageTotal`/`usageUsed`/`usageLeft`；档位映射 `free`/`freeMon`/`freeMonIntl`/`gift` → `isPro=false,isTria=false`，`proTrialMon`/`proTrialYear` → `isTria=true`，`proMon`/`proMonPlus`/`proYear` → `isPro=true`（另有 `youth`/`advanced`/`flagship`/`buddyOneVip`）；客户端开关 `subscription-gate@workbuddy-builtin=true`、`weixinpay@workbuddy-builtin=true`，`productFeatures.DisableCreditsEntry=true`；④ **两条硬事实（发行版代码，不是推测）**：**WorkBuddy 没有面向第三方的官方 API Key**——asar 的 `/v2/api-keys` 只服务于 `connect_cloud_service` 工具（请求体 `{name:"workbuddy-connect-cloud-service", expire_in_seconds:900, temporary:true}` → 返回 `{code:0,data:{key:"ck_t_…",expires_at}}`，**15 分钟临时 key**，供 `miora_*` 多模态生成与 `neodata-financial-search` 等云服务 skill 用），**不能**当反代凭证；**唯一长期凭证就是会话 `accessToken`**（被 at-rest 加密 → 取它只剩 P4-b 逆向一条路）；⑤ **排期结论**：付费前 **P4-a 与 P4-b 都不产生可交付物**（逆向出来的是**自己账号额度**下的会话 token，无官方授权通道、逼近 §5.7 边界、且把个人额度分给 harness **违反平台 ToS**（§11 风险 1））→ **M4 判据②「WorkBuddy 登录态可作为上游完成对话」在付费前不可达** → **T23 延后到付费后**，付费后**第一件事是查有没有官方 API Key / 开发者通道**（发行版另有 `open.workbuddy.cn` / `api.skillhub.cn` / `open-test.workbuddy.cn` 等域，**待查**），**而不是默认走逆向**；付费前能做的只有**免鉴权**两件（`GET /v3/config` 保活 + `product.cloudhosted.json` 模型目录 22 模型）→ 对应 03 §5 降级档的「保活 + 模型目录」，**「额度查看」需鉴权 → 付费前也不可达**；⑥ **T24（ToS 弹窗 + 启用开关）可只做 Copilot 那半边**，WorkBuddy 的开关等有合规凭证再做 → M4 判据③ 对 Copilot 先闭环 |
+| v0.33 | 2026-11-28 | **T26 UI 功能分组（头头 2026-11-28 拍板）**：**新增 §6.7「应用内 UI 功能分组与导航」**——① **问题**：8 个面板在 `src/App.tsx` 单页平铺，首屏被三张说明卡片占掉，找功能靠纵向滚动；② **分组（4 组）**：**接入**（渠道 · 模型目录 · Copilot 反代）｜**凭证**（加密保险库 · Client Key）｜**运维**（熔断状态 · 用量统计）｜**签到与积分**（签到面板）——**Copilot 归「接入」**，WorkBuddy 落地后并入同组、**不新增 tab**；③ **四条实现口径**：分组定义放 `src/tabs.ts`（**纯数据、可单测**）｜**一次只渲染当前 tab 的面板**（不做「全渲染 + CSS 隐藏」→ 首屏 DOM 变小，39 KB 的签到区块不再拖累其它页）｜**网关状态常驻顶栏**（切任何 tab 都看得见「网关在不在跑」），「快速开始」移入「接入」组首卡、「当前范围」移到底部折叠区｜**选中项持久化**（`localStorage` 键 `llm-router.activeTab`，未知值回落默认 tab）；④ **边界**：不加路由库、不引第三方依赖、**不改任何面板内部逻辑**（只改「谁被渲染」） |
+| v0.34 | 2026-11-28 | **T25 签到通用化（头头 2026-11-28 拍板）**：**新增 §7.6「站点目录与声明式站点」**——① **问题**：诉求「很多 agent harness 都可以有签到领积分」的真问题是**新增一家平台的边际成本**（内置插件要写 Rust + 发版；HAR 模板要抓包 + 逐条标变量 + 手改断言，**无断言编辑 UI**）；**框架本身不缺**（引擎 / 调度 / 通知已通用且已验证）→ 新增**「轻量接入通道」**；② **spec 数据模型**（`id` / `name` / `method` / `url` / `headers` / `query` / `body` / `credentialId` / `assert{status,jsonPaths}` / `reward{path,unit}` / `balance{method,url,path,unit}`）+ **校验规则**（id 限 `[a-z0-9_-]` 且目录内唯一、**url 必须 http/https 绝对 URL**、method 缺省 GET、assert.status 是**期望值**而非录制值、reward/balance 取不到**不判签到失败**）；③ **占位符只有两种**——`{{token}}`（敏感，取保险库 `credentialId` 指向的真实值，**只进请求不进模板不回显**）与 `{{today}}`（非敏感，`chrono::Local` 当天日期，跨天自动变）；**刻意不做表达式引擎**（避免把 spec 变成脚本）；④ **编译成现有 `SiteTemplate`** → 交给**已验证的重放引擎**执行——注入 / 占位符替换 / 断言 / 8 类分类 / 重试语义 / 结果落库**全部沿用现有实现，一行不改**（唯一新增 = 编译 + 积分/余额路径提取）；⑤ **目录（catalog）**：文件 = `{version, sites[]}`；导入**逐条校验、非法条目带原因返回不静默丢弃**、建站后 **`enabled = 0`**、**同名 id 视为更新**（幂等）；导出**只含 `credentialId`（id 不是密文）**→ 可分享；**内置目录只收已实测条目**（ModelScope / MiniMax Code 走代码插件）+ 一个**空白模板**，**不虚构 endpoint**；⑥ **积分两概念严格区分**：**本次拿到**（`Reward`，落 `checkin_result.reward_json` + `account.quota_json` 合并写）vs **当前余额**（`spec.balance` 查询，**只回前端展示、不落 `quota_json`**，不与 §8.2 限额自学习字段打架）；UI 文案「本次拿到 N 积分」/「当前余额 N 积分」**不混用**；⑦ **分派与落库**：`checkin_site.plugin = "spec"` → `scheduler::execute` 第三支；**不改 schema**（复用 `checkin_site` 四字段）；站点归属渠道与账号口径**沿用 T18**（占位渠道 → 默认账号 `acct_default_<channel_id>`）；⑧ **边界**：**不做**验证码绕过 / 指纹伪造 / 签名伪造（§5.7）、**不做**表达式 spec、**不内置未实测 endpoint**、不改引擎分类与断言语义、不引第三方依赖、不做多账号切换与「签到后兑换」类业务动作 |
