@@ -921,6 +921,68 @@ pi 默认工具是 `read` / `bash` / `edit` / `write`；**流式**下的 `delta.
 
 **边界**：不加路由库（单页 tab 用 `useState` 即可）；不引第三方依赖；**不改任何面板内部逻辑**（只改「谁被渲染」）。
 
+### 6.8 合规确认与渠道启用开关（T24 落地，Copilot 半边）
+
+**问题**：AGENT.md §5.5 规定「Copilot / WorkBuddy 反代默认关闭，首次启用强制 ToS 确认弹窗」，
+但 T20 / T21 只做了「取凭证 + 模型目录」，**启用入口一直空着** → 渠道恒为 `enabled = 0`，
+模型**不会**出现在 `GET /v1/models`（§6.2.2 的边界条款），M4 判据③ 对 Copilot 无法闭环。
+
+#### 6.8.1 受限渠道（restricted provider）
+
+| provider | 状态 | ToS 声明 |
+|---|---|---|
+| `copilot` | **本期落地**（T24 Copilot 半边） | 见 §6.8.2 |
+| `workbuddy` | **后置**（T23 延后到付费后，见 §6.3.1 §5.1） | 届时补 |
+
+清单是**纯数据**（`providers::compliance::RESTRICTED_PROVIDERS`）→ 后置 WorkBuddy 只加一行 + 一段声明。
+
+**三条硬口径**：
+
+1. **默认关闭**：受限渠道创建即 `enabled = 0`（`ensure_oauth_channel` 已如此，`save_channel` 路径同）。
+2. **首次启用强制确认**：该渠道**没有**有效的 ToS 确认记录 → **后端拒绝启用**。
+3. **关闭永远不需要确认**（安全方向不该设门槛）。
+
+#### 6.8.2 ToS 声明原文（必须逐字进弹窗）
+
+> 将 Copilot 额度用于第三方客户端违反 GitHub Copilot ToS，账号可能受限。用户显式确认后才启用。
+
+（与 §6.2「合规声明」同源。声明带**版本号**，**改文案就要重新确认** —— 旧确认不再算数。）
+
+#### 6.8.3 确认记录存哪
+
+**`channel.meta_json` 里两个字段**（**不改 schema、不加迁移**）：
+
+| 字段 | 含义 |
+|---|---|
+| `tos_accepted_at` | 用户显式确认的时刻（Unix 秒） |
+| `tos_statement_version` | 当时确认的**声明版本**（如 `copilot-tos-2026-11-28`） |
+
+- **服务端管理的字段**：`save_channel` 写 `meta_json` 时**保留旧值**，前端**不能**设置或清除 →
+  绕过 UI 直接调 IPC 也绕不过「启用前必须已确认」这条校验。
+- 记录**跟着渠道走** → 删渠道自动清干净，不在全局设置里留残渣。
+- **声明版本不匹配 = 没确认过** → 声明改版后要重新确认。
+
+#### 6.8.4 后端强制点（合规不靠前端）
+
+| 入口 | 行为 |
+|---|---|
+| `channel_save`（通用渠道表单勾「启用」也会走到） | 受限渠道 `enabled = 1` 且未确认 → **拒绝** |
+| `channel_set_enabled`（新增 IPC） | 同上 |
+| `copilot_tos_accept`（新增 IPC） | **只记录确认，不启用**（确认与启用分两步，便于审计「什么时候确认的」） |
+
+错误信息必须**指路**（「请先在『GitHub Copilot 授权』面板确认 ToS」）→ 不能只说「失败」。
+
+#### 6.8.5 前端交互
+
+- **Copilot 面板**新增「渠道启用（T24）」区块：一个开关 + 状态说明。
+- 点开启 → 若未确认 → **弹模态框**：声明原文 + 「我已阅读并确认」复选框 + 「确认并启用」/「取消」。
+  - 取消 / 关掉弹窗 → **渠道保持关闭**，**不记录任何东西**。
+  - 确认 → 先 `copilot_tos_accept`（记录）→ 再 `channel_set_enabled(true)`（启用）。
+- **通用渠道面板**：受限渠道行提示「需先在『GitHub Copilot 授权』面板确认 ToS」；
+  在那里勾启用会被后端拒绝 → 错误直指 Copilot 面板。
+
+**边界**：不引第三方依赖（模态框自己写）；**不新增数据库迁移**；**WorkBuddy 半边不做**（等合规凭证）。
+
 ---
 
 ## 7. 自动签到框架
@@ -1782,3 +1844,4 @@ python scripts/security_check.py `
 | v0.32 | 2026-11-28 | M4 **T22 付费前提与账号实况（头头口述 + 本机补证）**：① **新增 §6.3.1 §5.1「付费前提」**——头头口径：**没有付费之前，无法在 WorkBuddy 建立 token**；② **本机补证（只读、未解密任何信封）**：账号 `type="personal"` / `loginChannels=["openplatform"]`；会话**活的**（`lastRefreshTime` = 2026-11-28 09:49:26，本次核查前 1 分钟；`expiresAt` 2026-12-26 / `refreshExpiresAt` 2026-12-28；`tokenType="Bearer"`；`domain="copilot.tencent.com"`）；`~/.workbuddy/workbuddy.db` → `session_usage` **46 行**带 `credit_json`（各模型 credits 消耗）→ **额度确实在被消耗**；③ **付费结构**：订阅包字段 `PackageCode`/`PackageName`/`DeductionEndTime`/`CycleEndTime`/`AutoRenewFlag` + 额度字段 `usageTotal`/`usageUsed`/`usageLeft`；档位映射 `free`/`freeMon`/`freeMonIntl`/`gift` → `isPro=false,isTria=false`，`proTrialMon`/`proTrialYear` → `isTria=true`，`proMon`/`proMonPlus`/`proYear` → `isPro=true`（另有 `youth`/`advanced`/`flagship`/`buddyOneVip`）；客户端开关 `subscription-gate@workbuddy-builtin=true`、`weixinpay@workbuddy-builtin=true`，`productFeatures.DisableCreditsEntry=true`；④ **两条硬事实（发行版代码，不是推测）**：**WorkBuddy 没有面向第三方的官方 API Key**——asar 的 `/v2/api-keys` 只服务于 `connect_cloud_service` 工具（请求体 `{name:"workbuddy-connect-cloud-service", expire_in_seconds:900, temporary:true}` → 返回 `{code:0,data:{key:"ck_t_…",expires_at}}`，**15 分钟临时 key**，供 `miora_*` 多模态生成与 `neodata-financial-search` 等云服务 skill 用），**不能**当反代凭证；**唯一长期凭证就是会话 `accessToken`**（被 at-rest 加密 → 取它只剩 P4-b 逆向一条路）；⑤ **排期结论**：付费前 **P4-a 与 P4-b 都不产生可交付物**（逆向出来的是**自己账号额度**下的会话 token，无官方授权通道、逼近 §5.7 边界、且把个人额度分给 harness **违反平台 ToS**（§11 风险 1））→ **M4 判据②「WorkBuddy 登录态可作为上游完成对话」在付费前不可达** → **T23 延后到付费后**，付费后**第一件事是查有没有官方 API Key / 开发者通道**（发行版另有 `open.workbuddy.cn` / `api.skillhub.cn` / `open-test.workbuddy.cn` 等域，**待查**），**而不是默认走逆向**；付费前能做的只有**免鉴权**两件（`GET /v3/config` 保活 + `product.cloudhosted.json` 模型目录 22 模型）→ 对应 03 §5 降级档的「保活 + 模型目录」，**「额度查看」需鉴权 → 付费前也不可达**；⑥ **T24（ToS 弹窗 + 启用开关）可只做 Copilot 那半边**，WorkBuddy 的开关等有合规凭证再做 → M4 判据③ 对 Copilot 先闭环 |
 | v0.33 | 2026-11-28 | **T26 UI 功能分组（头头 2026-11-28 拍板）**：**新增 §6.7「应用内 UI 功能分组与导航」**——① **问题**：8 个面板在 `src/App.tsx` 单页平铺，首屏被三张说明卡片占掉，找功能靠纵向滚动；② **分组（4 组）**：**接入**（渠道 · 模型目录 · Copilot 反代）｜**凭证**（加密保险库 · Client Key）｜**运维**（熔断状态 · 用量统计）｜**签到与积分**（签到面板）——**Copilot 归「接入」**，WorkBuddy 落地后并入同组、**不新增 tab**；③ **四条实现口径**：分组定义放 `src/tabs.ts`（**纯数据、可单测**）｜**一次只渲染当前 tab 的面板**（不做「全渲染 + CSS 隐藏」→ 首屏 DOM 变小，39 KB 的签到区块不再拖累其它页）｜**网关状态常驻顶栏**（切任何 tab 都看得见「网关在不在跑」），「快速开始」移入「接入」组首卡、「当前范围」移到底部折叠区｜**选中项持久化**（`localStorage` 键 `llm-router.activeTab`，未知值回落默认 tab）；④ **边界**：不加路由库、不引第三方依赖、**不改任何面板内部逻辑**（只改「谁被渲染」） |
 | v0.34 | 2026-11-28 | **T25 签到通用化（头头 2026-11-28 拍板）**：**新增 §7.6「站点目录与声明式站点」**——① **问题**：诉求「很多 agent harness 都可以有签到领积分」的真问题是**新增一家平台的边际成本**（内置插件要写 Rust + 发版；HAR 模板要抓包 + 逐条标变量 + 手改断言，**无断言编辑 UI**）；**框架本身不缺**（引擎 / 调度 / 通知已通用且已验证）→ 新增**「轻量接入通道」**；② **spec 数据模型**（`id` / `name` / `method` / `url` / `headers` / `query` / `body` / `credentialId` / `assert{status,jsonPaths}` / `reward{path,unit}` / `balance{method,url,path,unit}`）+ **校验规则**（id 限 `[a-z0-9_-]` 且目录内唯一、**url 必须 http/https 绝对 URL**、method 缺省 GET、assert.status 是**期望值**而非录制值、reward/balance 取不到**不判签到失败**）；③ **占位符只有两种**——`{{token}}`（敏感，取保险库 `credentialId` 指向的真实值，**只进请求不进模板不回显**）与 `{{today}}`（非敏感，`chrono::Local` 当天日期，跨天自动变）；**刻意不做表达式引擎**（避免把 spec 变成脚本）；④ **编译成现有 `SiteTemplate`** → 交给**已验证的重放引擎**执行——注入 / 占位符替换 / 断言 / 8 类分类 / 重试语义 / 结果落库**全部沿用现有实现，一行不改**（唯一新增 = 编译 + 积分/余额路径提取）；⑤ **目录（catalog）**：文件 = `{version, sites[]}`；导入**逐条校验、非法条目带原因返回不静默丢弃**、建站后 **`enabled = 0`**、**同名 id 视为更新**（幂等）；导出**只含 `credentialId`（id 不是密文）**→ 可分享；**内置目录只收已实测条目**（ModelScope / MiniMax Code 走代码插件）+ 一个**空白模板**，**不虚构 endpoint**；⑥ **积分两概念严格区分**：**本次拿到**（`Reward`，落 `checkin_result.reward_json` + `account.quota_json` 合并写）vs **当前余额**（`spec.balance` 查询，**只回前端展示、不落 `quota_json`**，不与 §8.2 限额自学习字段打架）；UI 文案「本次拿到 N 积分」/「当前余额 N 积分」**不混用**；⑦ **分派与落库**：`checkin_site.plugin = "spec"` → `scheduler::execute` 第三支；**不改 schema**（复用 `checkin_site` 四字段）；站点归属渠道与账号口径**沿用 T18**（占位渠道 → 默认账号 `acct_default_<channel_id>`）；⑧ **边界**：**不做**验证码绕过 / 指纹伪造 / 签名伪造（§5.7）、**不做**表达式 spec、**不内置未实测 endpoint**、不改引擎分类与断言语义、不引第三方依赖、不做多账号切换与「签到后兑换」类业务动作 |
+| v0.35 | 2026-11-28 | **T24 合规确认与渠道启用开关（头头 2026-11-28 拍板「做 Copilot 半边」）**：**新增 §6.8「合规确认与渠道启用开关」**——① **问题**：AGENT.md §5.5 要求「Copilot / WorkBuddy 反代默认关闭 + 首次启用强制 ToS 确认弹窗」，但 T20 / T21 只做了「取凭证 + 模型目录」，**启用入口一直空着** → 渠道恒为 `enabled = 0`、模型**永不**出现在 `GET /v1/models`，**M4 判据③ 对 Copilot 无法闭环**；② **受限渠道清单是纯数据**（`providers::compliance::RESTRICTED_PROVIDERS`，本期只有 `copilot`）→ WorkBuddy 半边后置时只加一行 + 一段声明（**不重写本节**）；③ **三条硬口径**：**默认关闭**（创建即 `enabled = 0`）｜**首次启用强制确认**（没有有效确认记录 → **后端拒绝启用**）｜**关闭永远不需要确认**（安全方向不设门槛）；④ **确认记录存在 `channel.meta_json`**（**不改 schema、不加迁移**）：`tos_accepted_at`（Unix 秒）+ `tos_statement_version`（声明版本，如 `copilot-tos-2026-11-28`）——**服务端管理的字段**，`save_channel` 写 `meta_json` 时**保留旧值**，**前端不能设置或清除**；记录**跟着渠道走**（删渠道自动清干净）；**声明版本不匹配 = 没确认过**（改文案要重新确认）；⑤ **后端强制点**（合规不靠前端）：`channel_save`（通用渠道表单勾「启用」也会走到）｜`channel_set_enabled`（新增 IPC）｜`copilot_tos_accept`（新增 IPC，**只记录确认、不启用** → 确认与启用分两步便于审计）；错误信息必须**指路**（「请先在『GitHub Copilot 授权』面板确认 ToS」）；⑥ **前端交互**：Copilot 面板新增「渠道启用（T24）」区块（开关 + 状态说明），点开启若未确认 → **弹模态框**（声明原文逐字 + 「我已阅读并确认」复选框 + 「确认并启用」/「取消」），**取消则渠道保持关闭且不记录任何东西**；通用渠道面板对受限渠道显示「需先在 Copilot 面板确认 ToS」提示；⑦ **边界**：不引第三方依赖（模态框自己写）、**不新增数据库迁移**、**WorkBuddy 半边不做**（等合规凭证） |
