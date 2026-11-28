@@ -605,6 +605,139 @@ OS 原生保护（DPAPI CurrentUser / macOS Keychain）
 4. 失效判定：401/403 → 标记账号 `expired`，UI 提示"请在 WorkBuddy 桌面端重新登录"。
 5. 读取登录态文件**只读**，绝不改写 WorkBuddy 自身数据（区别于 TraeWorkAssistant 的登录态切换/指纹伪造——v1 不做切换器，只做"读当前登录态 + 转发"）。
 
+> **T22 实测修订（2026-11-28，详见 §6.3.1）**：上面 1/2/3 三条与**实测不符**，已列入下方「设计变更提案」，**待头头批准后才改写本节**——按 §12 的「提案 → 头头批准 → 更新 02 → 才可动代码」顺序，本卡**只记录事实、不擅自改口径**。
+
+**设计变更提案（2026-11-28，T22 产出，待头头批准）**
+
+| # | 现有条款 | 实测结论 | 建议修订 |
+|---|---|---|---|
+| P1 | ①「扫描 `app/users/` 取当前登录态」 | 登录态**不在** `app/users/<hash>/`（本机实测该目录**为空**）；真实位置见 §6.3.1 §4 | 改为「读 `<sharedDataPath>/auth/<authentication.id>.info` 的 `auth.accessToken` 字段」 |
+| P2 | ②「转发时携带**复写后的 device-id**」 | **device-id 不参与 chat 请求**（§6.3.1 §3） | **删除该条**——多账号隔离改用「独立 token + 独立 `X-User-Id`」，**不复写用户本机 device-id**（也免了 §5.7 指纹伪造的嫌疑） |
+| P3 | ③「上游 endpoint = WorkBuddy 自家 API host（未验证）」 | = `https://copilot.tencent.com`，chat 端点 `POST /v2/chat/completions`（§6.3.1 §1） | 写死为常量 + 出站口径（头清单见 §6.3.1 §2） |
+| P4 | ⑤「读取登录态文件只读」 | 文件**字段级 AES-256-GCM 加密**，主密钥在 `~/.workbuddy/keyblob`，**构建期密钥只在定制 Electron 运行时内**（§6.3.1 §4） | **新增一条硬约束**：凭证获取方式**待头头拍板**（用户显式提供 / 逆向定制运行时 / 降级档），**本卡不自行决定** |
+
+### 6.3.1 WorkBuddy 协议记录（T22 实测）
+
+> **取证方式**：WorkBuddy 是 **Electron 桌面端**（本机安装于 `D:\IDE\WorkBuddy`，`version` = `37.10.3-43`，`app.asar` 182 MB / 9894 个文件）。**发行版代码即协议真值源** → 本节证据全部取自 `app.asar` 内模块（给到模块名 + 常量/函数名），并与本机运行日志 `~/.workbuddy/logs/main.log` 交叉验证。**全程只读**，未写回 WorkBuddy 任何文件；**本文不含任何 token / cookie / device-id 明文值**。
+
+#### §1 上游 host 与端点
+
+| 项 | 值 | 证据 |
+|---|---|---|
+| 产品域名 | `https://copilot.tencent.com` | asar `main/server.js` 常量 `LF="https://copilot.tencent.com/v2/chat/completions"`；`product.cloudhosted.json` → `links.officialWebsite="https://copilot.tencent.com/cli"` |
+| 站点 / 配置域 | `https://www.workbuddy.cn` | `product.internal.json` / `product.ioa.json` → `endpoint`；main.log 实测 44 次 `https://www.workbuddy.cn/v3/config` |
+| **chat 端点** | **`POST /v2/chat/completions`** | asar `main/auth-liveness.js` 路由表：`{id:"chat.stream", routeId:"core-api", method:"POST", pathPattern:"/v2/chat/completions", replayClass:"forbidden", maxEndpointAttempts:2, commitPoint:"first-valid-token"}` |
+| 公开配置 | `GET /v3/config` | **实测 HTTP 200，无需鉴权**（返回 `{code:0, data:{agent,models,mcp,codebase,features}}`） |
+| 模型目录 | `…\resources\app.asar.unpacked\cli\product.cloudhosted.json` | **免鉴权普通 JSON**，22 个模型；字段 `id` / `name` / `credits` / `vendor` / `maxOutputTokens` / `maxInputTokens` / `supportsToolCall` / `supportsImages` / `maxAllowedSize` / `supportsReasoning` / `onlyReasoning` / `tags` / `relatedModels` |
+| 额度 | `GET /v2/user/cloudagent/quota` | asar `main/authority-snapshot.js` 路由清单（**响应形状未实测**） |
+
+模型目录抽样（`product.cloudhosted.json`，22 条）：
+`default`（x2.00 credits）/ `auto` / `glm-5.1` / `glm-5.0` / `glm-5.0-turbo` / `glm-5v-turbo` / `glm-4.7` / `glm-4.6` / `glm-4.6v` / `deepseek-v4-pro` / `deepseek-v3-2-volc` / `deepseek-v3.1` / `deepseek-v3-0324` / `kimi-k2.6` / `kimi-k2.5` / `kimi-k2-thinking` / `hunyuan-chat` / `hunyuan-2.0-instruct` / `hunyuan-image-v3.0` / `minimax-m2.5` / `minimax-m2.7` / `deepseek-v4-pro-exclusive`。
+
+#### §2 鉴权头（`main/server.js` → `VlmUpstream.send` / `buildVlmGatewayHeaders` / `applyGatewayHeaders` / `applyTraceHeaders`）
+
+**必填**
+
+| 头 | 值 |
+|---|---|
+| `Authorization` | `Bearer <accessToken>` —— **最后写入**，覆盖此前任何值 |
+| `X-User-Id` | `<account.uid>` |
+
+**产品头**（`buildVlmGatewayHeaders`）
+
+`X-Product: SaaS` / `X-IDE-Type: WorkBuddy` / `X-IDE-Name: WorkBuddy` / `X-IDE-Version: <appVersion>` / `X-Private-Data: true` / `User-Agent: WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`
+（`User-Agent` 的这一串格式经 main.log 实测交叉验证：`"user-agent":"WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/2.165.0"`）
+
+**会话头**（`applyGatewayHeaders`）
+
+`X-Conversation-ID` / `X-Conversation-Request-ID` / `acp-connection-id` / `X-Conversation-Message-ID`（UUID）/ `X-Request-ID`（UUID）/ `X-Agent-Intent: craft` / `X-Agent-Purpose: conversation` / `x-codebuddy-request: 1` / `x-requested-with: XMLHttpRequest` / `Accept: application/json` / `Content-Type: application/json`
+
+**链路头**（`applyTraceHeaders`）
+
+`traceparent: 00-<32hex>-<16hex>-01` / `b3: <32hex>-<16hex>-1-<16hex>` / `X-B3-TraceId` / `X-B3-ParentSpanId` / `X-B3-SpanId` / `X-B3-Sampled: 1` / `X-Trace-ID`
+
+**条件头**：`X-Enterprise-Id` + `X-Tenant-Id`（企业版）/ `X-Domain`（`auth.domain`）/ `X-Department-Info` / `X-Refresh-Token`
+
+**转发前剥离的头**（集合 `zF`，逐字取自代码）：
+`connection` `keep-alive` `te` `trailer` `trailers` `transfer-encoding` `upgrade` `proxy-authorization` `proxy-connection` `host` `content-length` `expect` `accept-encoding` **`authorization`** **`x-workbuddy-mcp-context`** `origin`
+→ **入站来的 `Authorization` 会被剥掉，再由上游自己的 token 重新注入**（与 Copilot 的凭证供给口径同构）。
+
+**token 失效语义**：`401` → 调 `refreshSession()` → **重放一次**（`retryAfterRefresh`；上游 401 时先把响应体缓存下来再重放）。与 T21 的 Copilot「过期前 300 s 自动续」是同一类语义。
+
+#### §3 device-id / 设备指纹 / 签名 —— **不参与 chat 请求**
+
+| 东西 | 真实用途 | 证据 |
+|---|---|---|
+| `~/.workbuddy/device-id`（36B UUID）、`device-id.machine` | **不上 chat 请求**；二者属 `WORKBUDDY_PLATFORM_OWNED_FILES`（平台自管文件） | asar `main/server.js` |
+| `X-Machine-Id` | **只用于 `POST /v2/feedback`** | asar `main/facade.js`（`{"X-Machine-Id":…,"X-User-Id":…,"Authorization":…}` + `/v2/feedback`） |
+| **qimei36**（腾讯 QIMEI 设备指纹，`@tencent/qimei-node` + `qimei.dll`，`WORKBUDDY_QIMEI_APP_KEY`） | **注入 sidecar / CLI 进程的「环境变量」**，**不是 HTTP 头** | asar `main/sidecar-manager.js`：`let o=(await this.dependencies.getQimei36?.())?.trim(); let s=o?{[Te]:o}:{}` → 并入 child env |
+| `X-Device-Token` / `X-Device-Token-Error`（Turing 设备令牌，`TuringShieldSDK.dll`） | **只用于签到类请求**（`getCheckinRequestHeaders`） | asar `main/account.js` + `main/authority-snapshot.js` |
+| `x-workbuddy-mcp-context`（HMAC-SHA256 签名信封） | **本地 VLM 代理的会话信封**，转发前被剥离 | asar `main/server.js` → `VlmContextEnvelope.sign()` / `zF` |
+
+**结论**
+1. **chat 请求无动态签名、无设备指纹绑定** → **不触发 03 §5 的降级触发条件**（「抓包显示请求含动态签名」**实测不成立**）。
+2. **不需要、也不允许**为此实现任何指纹伪造 / 签名伪造（§5.7 无冲突面）。
+
+#### §4 登录态：字段名与位置（**只记字段名，不记值**）
+
+| 项 | 实测 |
+|---|---|
+| 文件 | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（10137 B） |
+| 路径规则 | `<sharedDataPath>/auth/<authentication.id>.info`（`main/file-authentication-storage.js` → `getAuthSavePath()`）；`sharedDataPath` = `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public`；`authentication.id` = `workbuddy-desktop` |
+| **不是** | `~/.workbuddy/app/users/<64位hex>/` —— 本机实测该目录**为空**（§6.3 旧口径 P1） |
+| 格式 | **普通 JSON**；敏感字段为**字段级加密** `{"$wbEncrypted":1,"envelope":"<base64>"}` |
+
+字段清单（顶层 `account` / `auth` / `accounts` / `allAccounts`）：
+
+| 字段 | 形态 |
+|---|---|
+| `account.uid` | 明文 UUID（36） |
+| `account.uin` | 明文串（12） |
+| `account.uniqueUserId` | 明文串（45） |
+| `account.type` / `account.idp` / `account.accountType` | 明文串 |
+| `account.loginChannels` | 数组（n=1，元素为 12 字符串） |
+| `account.deployStatus` | 对象（`statusCode` / `statusMsg` / `detailMsg`） |
+| `account.sso` | 对象（`domain` / `domainModifiedTimes`） |
+| `account.nickname` / `account.phoneNumber` | **加密信封** |
+| `auth.accessToken` | **加密信封** |
+| `auth.refreshToken` | **加密信封** |
+| `auth.tokenType` | 明文串（6） |
+| `auth.expiresIn` / `auth.refreshExpiresIn` | 数字（实测 2419200 / 2591999） |
+| `auth.expiresAt` / `auth.refreshExpiresAt` / `auth.lastRefreshTime` | 毫秒时间戳 |
+| `auth.domain` | 明文串（19） |
+| `auth.sessionState` | 明文 UUID |
+
+**加密链（逐跳）**
+
+```
+atRestSecretKey（构建期密钥，base64 32B）
+  └─ sha256(该字符串的 UTF-8 字节) = protector key（keyId 9127dea1b44020a7）
+       └─ 解 ~/.workbuddy/keyblob → master key（32B，keyId fca8d6b22ed65a97）
+            └─ AES-256-GCM 解字段信封 {suite,keyId,nonce,authTag,ciphertext}
+                 └─ accessToken / refreshToken 明文
+```
+
+- 信封算法：**AES-256-GCM**（`AtRestCrypto`，AAD 前缀 `WB-AAD\0` / 包裹前缀 `WB-WRAP\0`）。
+- `~/.workbuddy/keyblob` = `{version:1, keyId:"fca8d6b22ed65a97", slots:[{type:"static-v1", protectorKeyId:"9127dea1b44020a7", wrapped:"<base64>"}]}`。
+- **构建期密钥不在磁盘、不在 asar** —— 由**定制 Electron** 的 `electron.workbuddyStorage.loggerGet()` 在运行时提供（`main/index.js` → `loadMainCredentialProtectionBootstrap(policy, provider, {configDir})`）。代码里**没有** DPAPI / `CryptProtectData` 调用（asar 全量扫描 0 命中）。
+
+#### §5 可实现性判定（T23 的输入）
+
+| 侧 | 结论 |
+|---|---|
+| **协议侧** | **可转发** —— 无签名、无指纹绑定；端点 / 头清单 / 401 自动续 全部明确 |
+| **凭证侧** | **卡点** —— 要拿到 `accessToken`，必须复现上面整条 at-rest 解密链，而**构建期密钥只在定制 Electron 运行时内** → 需要逆向定制 Electron 才能取到 |
+| **请求体侧** | **未验证** —— daemon 对 body 是**字节级透传**（`new Uint8Array(e.body)`），body 由 CLI / agent 运行时构造 → 与「v1 入站仅 OpenAI chat」（§5.6）的**兼容性未实测** |
+
+→ **建议（待头头批准）**：T23 的凭证获取方式三选一 —— ① **用户显式提供 token**（UI 粘贴 → 进保险库，最省事、不碰厂商保护）；② 逆向定制 Electron 取构建期密钥（成本高、逼近 §5.7 边界）；③ **降级档**（只做「保活 + 额度查看 + 模型目录」，转发延至 v2，03 §5 预案已列，工期减 3–5d）。
+
+#### §6 本节未验证项（不猜）
+
+- **请求体 / 响应体的 JSON schema**（是否 OpenAI `chat/completions` 兼容、`tools` / `stream` / `usage` 形状）—— daemon 只透传，需真发一次才能定。
+- **真实 chat 请求端到端**（WorkBuddy 当前**未运行** → 本轮未做活体抓包；且需先解决凭证）。
+- `/v2/user/cloudagent/quota` 的**响应形状**（额度查看降级档要用）。
+- `X-Device-Token`（Turing）在**非签到**场景是否也会被附带（代码里只见到签到路径调用点）。
+
 ### 6.4 trait 契约
 
 ```rust
@@ -1501,3 +1634,4 @@ python scripts/security_check.py `
 | v0.28 | 2026-11-27 | M4 **T20 网络层容错（判据⑤ 真机授权受阻后的根因与修法）**：① **新增 §6.2.1「网络层容错」**——本机到 `github.com` **时好时坏**，且**失败模式因请求方法而异**：`GET /login/device` 能通的 IP，`POST /login/oauth/access_token` 可能 0/N（实测 `20.205.243.166` POST 3/3，`20.200.245.247` / `20.26.156.215` / `140.82.112.3` / `140.82.114.4` 虽 GET 3~5/5 但 **POST 0/3**）；② **两条已证伪的绕法**（别再走）：**`api.github.com` 的 IP 配 SNI=`github.com`** → 5/5 秒回但 **HTTP 400**（后端不认）；**动态 DNS 发现候选 IP** → 系统 DNS 连续 16 次解析**全是同一个 A 记录**（ISP 侧有缓存，不轮询）；③ **修法口径**：**候选 IP 池 + 每次重试轮换**（钉死单个 IP 会把 900 s 设备码寿命全耗在一条坏路径上——实测钉 `20.27.177.113` 后连续 40 次轮询全超时、设备码到期作废）+ **池尾保留一个走普通 DNS 的 client 兜底** + **超时收紧到 connect 3 s / 总 8 s**（GitHub OAuth 正常 < 2 s）+ **只重试网络层错误**、HTTP 状态码交给轮询状态机 + **环境变量 `LLMR_GITHUB_IPS`（逗号分隔）可覆盖内置池**（边缘 IP 会变）；④ **不改协议面**：端点 / client_id / scope / 状态机 / 存储口径 / 边界**全部不动**，只动传输层容错 |
 | v0.29 | 2026-11-27 | M4 **T21 Copilot 出站适配（卡片补全 + R-6 取值固化）**：① **新增 §6.2.2 出站适配口径**——**R-6 四项固定头 + 一项动态头**（`copilot-integration-id: vscode-chat` / `editor-version: vscode/1.104.1` / `editor-plugin-version: copilot-chat/0.26.7` / `user-agent: GitHubCopilotChat/0.26.7` / `x-request-id: <UUID v4，每次请求不同>`），取值与来源逐条列出；**取值分歧已裁决**（`editor-version`：liter-llm `vscode/1.95.0` / npm `vscode/1.104.1` / ericc-ch 动态探测兜底 `1.104.3` / copilot-to-api 按客户端写 `Neovim/0.6.1` → **头是按客户端变的**；本卡取 npm 那个，**且是常量**——版本串变了改常量即可，不用动协议）；② **明确不发的头**（边界，不是遗漏）：**`machine-id`**（**设备指纹** → 撞 §5.7；liter-llm 与 npm 参考实现都不发）、`openai-intent` / `openai-organization` / `x-github-api-version` / `x-vscode-user-agent-library-version`（R-6 只认 §4.1 明列的四项，§5.6 改写器不是转换器）；③ **出站 URL 与鉴权**：`POST {endpoints.api}/chat/completions`（**不带 `/v1`**）+ `Authorization: Bearer <Copilot token>`（**不是 GitHub token**）+ R-4 注入 `stream_options.include_usage`；④ **凭证供给口径（本卡最关键的一条）**：**OAuth 型渠道的凭证由 adapter 自己供给，网关不解密**——GitHub token（`ghu_`，长期）与 Copilot token（~30 min）**不能互换**，沿用网关「按 `credential.kind` 选一条」的旧口径会在 token 过期时**误取 GitHub token** 当 Bearer → 必然 401；`CopilotAdapter::complete()` 出站前调 `ensure_token()`（过期前 300 s 自动重取）；`refresh()` 因**拿不到渠道上下文**保持 no-op 并写明理由；注入方式 = `AdapterDeps`（vault + Copilot 端点 + token 缓存）→ 网关 `Forwarder` 持有 → **生产真实端点 + 全局缓存 / 测试本地 mock 端点 + 独立缓存**（不出网、并行用例互不污染）；⑤ **模型目录口径**：`GET {endpoints.api}/models` → `{"data":[…]}`（字段 `id` / `name` / `policy.state` / `supported_endpoints` / `capabilities.*`）→ **别名 = `id`**、**别名被别的渠道占用则跳过**、**目录里没有的旧模型置为禁用**（不物理删除，避免连带删掉 `route_member` 编排）；**只收录 `policy.state != disabled` 且 `supported_endpoints` 含 `chat` 的模型**（codex 类只支持 `/responses` → v1 **不做协议转换**）；⑥ **边界**：**ToS 弹窗与启用开关属 T24**（本卡**不提供**启用入口）、**不实现 `/responses` 与 `/messages`**、`machine-id` 不实现 |
 | v0.30 | 2026-11-27 | M4 **T21 真机实测修订（模型目录口径按真实响应订正）**：① **§6.2.2「模型目录口径」按真机响应重写**——真实上游的 `supported_endpoints` 给的是**路径**（`/chat/completions`、`/responses`、`/responses/ws:`、`/v1/decisions`），**不是**社区 schema 里的短名（`chat`）→ v0.29 写的「含 `chat` 才收录」在真实数据上**等于没过滤**，实测把 `text-embedding-3-small` 等 3 个 **embeddings** 模型与一批只支持 `/responses` 的模型一起收了进来；② **收录规则补第二条**：`capabilities.type` **存在且不是 `chat`** → 不收录（真实取值有 `chat` / `embeddings` / `decisions`）；③ **端点判定两种形状都认**（路径含 `chat/completions` **或**短名等于 `chat`）——路径与短名各留一条单测；④ **实测数据**：账号 `api.individual.githubcopilot.com` 的 `/models` 原始 **39 条 → 收录 19 条**（`policy.state=disabled` 8 条、`capabilities.type != chat` 3 条、只支持 `/responses` 9 条被排除）；⑤ **真机四证**：R-6 四头 + `x-request-id` 经真实上游**实测通过**（上游正常回话，无头缺失/鉴权错误）、**经真网关流式对话成功**（`gpt-4o-mini-2024-07-18`，6~12 帧真实内容）、`usage_log` 落库 `status=success`（`tokens=13/22`、`estimated=0`、耗时 2999~3575 ms）、**四层零明文**（官方执行器明文命中 0 条 + `ghu_`/`eyJ`/`Bearer` 形态扫描 0 命中）；⑥ **订正后的落库语义**经真机验证：上轮误收的 3 个 embedding 模型在重新同步时**被置为禁用而非物理删除**（`model` 表 22 行 / 启用 19 行）；⑦ **新增落库口径**：`supported_endpoints` 缺失的老模型（`gpt-4o` 家族）**按 chat 收**（`capabilities.type=chat`，真机实测能对话）；⑧ **不改协议面**：R-6 取值 / 出站 URL / 凭证供给口径 / 边界**全部不动**，只修收录规则 |
+| v0.31 | 2026-11-28 | M4 **T22 WorkBuddy 协议确认（卡片补全 + 出站口径实测）**：① **方法调整**——WorkBuddy 是 **Electron 桌面端**（本机 `D:\IDE\WorkBuddy`，`version` = `37.10.3-43`，`app.asar` 182 MB / 9894 文件），**发行版代码即协议真值源** → 改为「**发行版静态取证为主 + 可选 CDP 复核**」（`~/.workbuddy/app/session/DevToolsActivePort` 实测存在，端口 `9222`），**不打扰用户桌面端**；② **新增 §6.3.1「WorkBuddy 协议记录（T22 实测）」**（上游 host / 端点 / 鉴权头清单 / 指纹与签名结论 / 登录态字段 / 可实现性判定 / 未验证项，**全部只记字段名不记值**）；③ **协议侧结论：chat 请求无动态签名、无设备指纹绑定**——`device-id` 不上请求、`X-Machine-Id` 只用于 `/v2/feedback`、**qimei36 是注入 sidecar 的环境变量不是 HTTP 头**、`X-Device-Token` 只用于签到、`x-workbuddy-mcp-context`（HMAC-SHA256）是本地代理会话信封且转发前被剥离 → **不触发 03 §5 降级触发条件**（「抓包显示请求含动态签名」**实测不成立**），且**无需实现任何指纹伪造**（§5.7 无冲突面）；④ **出站口径**：产品域名 `https://copilot.tencent.com`，chat 端点 `POST /v2/chat/completions`，鉴权 `Authorization: Bearer <accessToken>`（**最后写入、覆盖入站值**）+ `X-User-Id` + 产品头 + 会话头 + 链路头；**转发前剥离** `authorization` / `x-workbuddy-mcp-context` / `origin` / `host` 等；**401 → `refreshSession()` → 重放一次**（与 Copilot 同构）；⑤ **登录态实测推翻旧口径**：登录态**不在** `~/.workbuddy/app/users/<hash>/`（本机实测**为空**），真实位置 = `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（**普通 JSON + 字段级 AES-256-GCM**，敏感字段为 `{"$wbEncrypted":1,"envelope":…}`）；加密链 = 构建期 `atRestSecretKey` → `sha256` 得 protector key（`9127dea1b44020a7`）→ 解 `~/.workbuddy/keyblob` 得 master key（`fca8d6b22ed65a97`）→ 解字段信封；**构建期密钥不在磁盘、不在 asar**，由**定制 Electron** 的 `electron.workbuddyStorage.loggerGet()` 在运行时提供（代码里**无 DPAPI** 调用）；⑥ **可实现性判定**：**协议侧可转发、凭证侧是卡点** → T23 的凭证获取方式（用户显式提供 / 逆向定制运行时 / 降级档「保活+额度+模型目录」）**列为提案待头头拍板**，本卡**不自行决定**、**不擅自改写 §6.3 既有条款**（P1~P4 四条修订建议见 §6.3「设计变更提案」）；⑦ **模型目录来源**：免鉴权普通文件 `…\app.asar.unpacked\cli\product.cloudhosted.json`（22 个模型，字段 `id`/`name`/`credits`/`vendor`/`supportsToolCall`/`supportsImages`/`maxInputTokens`/`maxOutputTokens`/`supportsReasoning`/`tags`/`relatedModels`）；⑧ **未验证**：请求体/响应体 JSON schema（daemon **字节级透传** body，由 CLI 运行时构造 → 与「v1 入站仅 OpenAI chat」的兼容性未实测）、**真实 chat 端到端**（WorkBuddy 未运行，本轮无活体抓包）、`/v2/user/cloudagent/quota` 响应形状 |
