@@ -66,6 +66,30 @@ pub fn channel_delete_of(state: &AppState, id: &str) -> Result<bool, String> {
     channels::delete_channel(&state.store, id).map_err(|e| e.to_string())
 }
 
+/// 改渠道的启用状态（T24、02 §6.8.4）。
+///
+/// **受限渠道（Copilot）启用前必须已确认 ToS**——**后端强制**，
+/// 前端的确认弹窗只是「知情」环节，**不是唯一防线**。
+///
+/// **关闭永远不需要确认**（安全方向不该设门槛）。
+#[tauri::command]
+pub fn channel_set_enabled(
+    state: State<'_, AppState>,
+    channel_id: String,
+    enabled: bool,
+) -> Result<ChannelSummary, String> {
+    channel_set_enabled_of(&state, &channel_id, enabled)
+}
+
+/// 改启用状态（可测版本）。
+pub fn channel_set_enabled_of(
+    state: &AppState,
+    channel_id: &str,
+    enabled: bool,
+) -> Result<ChannelSummary, String> {
+    channels::set_channel_enabled(&state.store, channel_id, enabled).map_err(|e| e.to_string())
+}
+
 /// 给渠道录入密钥（加密后落库；**不回显明文**）。
 #[tauri::command]
 pub fn channel_put_key(
@@ -179,6 +203,9 @@ pub fn input_from_preset(
             supports_groupid_query: Some(preset.supports_groupid_query),
             inject_stream_usage: Some(preset.inject_stream_usage),
             extra_headers: Default::default(),
+            // T24：ToS 确认记录**不来自表单**（服务端管理，02 §6.8.3）
+            tos_accepted_at: None,
+            tos_statement_version: None,
         },
         models: if models.is_empty() {
             preset

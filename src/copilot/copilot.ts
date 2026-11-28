@@ -20,6 +20,10 @@ export type CopilotStatus = {
   apiBase: string | null;
   channelId: string | null;
   channelEnabled: boolean;
+  /** **ToS 确认时刻**（Unix 秒；`null` = 没确认过）——T24。 */
+  tosAcceptedAt: number | null;
+  /** **是否还需要过一次确认**（后端裁定；T24）。 */
+  tosRequired: boolean;
 };
 
 /** 设备授权会话（后端 `DeviceFlowView`；**不含** `device_code`）。 */
@@ -63,7 +67,7 @@ export function describeCopilotState(status: CopilotStatus): string {
   const until = formatExpiry(status.expiresAt);
   const enabled = status.channelEnabled
     ? "渠道已启用。"
-    : "渠道**默认关闭**（启用与 ToS 确认属 T24）。";
+    : "渠道默认关闭——首次启用要先确认服务条款。";
   return `已授权${until ? `（Copilot token 到期 ${until}）` : ""}。${enabled}`;
 }
 

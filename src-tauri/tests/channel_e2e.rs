@@ -258,6 +258,9 @@ async fn acceptance_custom_channel_forwards_to_upstream() {
             supports_groupid_query: None,
             inject_stream_usage: Some(true),
             extra_headers: Default::default(),
+            // T24：ToS 确认记录**不来自表单**（服务端管理，02 §6.8.3）
+            tos_accepted_at: None,
+            tos_statement_version: None,
         },
         models: vec![ModelInput {
             alias: "my-alias".to_string(),

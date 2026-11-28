@@ -48,6 +48,14 @@ pub struct CopilotStatusView {
     pub channel_id: Option<String>,
     /// 渠道是否已启用（**默认关**；启用开关属 T24）。
     pub channel_enabled: bool,
+    /// **ToS 确认时刻**（Unix 秒；`None` = 还没确认过）。
+    ///
+    /// T24、02 §6.8.3：确认记录存在渠道的 `meta_json` 里，**跟着渠道走**。
+    pub tos_accepted_at: Option<i64>,
+    /// **是否还需要过一次 ToS 确认**（由**后端裁定**：没确认过 **或** 声明版本已改）。
+    ///
+    /// 前端照这个值决定「点开启要不要先弹确认框」→ 版本判断只有一份实现。
+    pub tos_required: bool,
 }
 
 /// 发起设备授权（①）。
@@ -207,7 +215,7 @@ pub async fn copilot_models_refresh_of(
     state: &AppState,
     session: &CopilotSession,
 ) -> Result<CopilotModelsView, String> {
-    let Some((channel_id, _enabled, _base_url)) = find_copilot_channel(state)? else {
+    let Some((channel_id, _enabled, _base_url, _tos, _tos_version)) = find_copilot_channel(state)? else {
         return Err("还没有 Copilot 渠道——先做一次设备授权".to_string());
     };
     let models = crate::providers::copilot::fetch_models(session, &channel_id).await?;
@@ -247,13 +255,17 @@ pub fn copilot_status(state: State<'_, AppState>) -> Result<CopilotStatusView, S
 
 /// 查授权状态（可测版本）。
 pub fn copilot_status_of(state: &AppState) -> Result<CopilotStatusView, String> {
-    let Some((channel_id, enabled, base_url)) = find_copilot_channel(state)? else {
+    let Some((channel_id, enabled, base_url, tos_accepted_at, tos_version)) =
+        find_copilot_channel(state)?
+    else {
         return Ok(CopilotStatusView {
             authorized: false,
             expires_at: None,
             api_base: None,
             channel_id: None,
             channel_enabled: false,
+            tos_accepted_at: None,
+            tos_required: true,
         });
     };
     let vault = state.vault.read().map_err(|err| err.to_string())?;
@@ -269,6 +281,13 @@ pub fn copilot_status_of(state: &AppState) -> Result<CopilotStatusView, String> 
         api_base,
         channel_id: Some(channel_id),
         channel_enabled: enabled,
+        tos_accepted_at,
+        // **后端裁定**「是否还需要确认」：没确认过 **或** 声明版本已改（02 §6.8.3）
+        tos_required: !crate::providers::compliance::acceptance_is_valid(
+            OAUTH_PROVIDER,
+            tos_accepted_at,
+            tos_version.as_deref(),
+        ),
     })
 }
 
@@ -280,7 +299,7 @@ pub fn copilot_disconnect(state: State<'_, AppState>) -> Result<bool, String> {
 
 /// 断开连接（可测版本）。
 pub fn copilot_disconnect_of(state: &AppState) -> Result<bool, String> {
-    let Some((channel_id, _, _)) = find_copilot_channel(state)? else {
+    let Some((channel_id, _, _, _, _)) = find_copilot_channel(state)? else {
         return Ok(false);
     };
     let vault = state.vault.read().map_err(|err| err.to_string())?;
@@ -289,12 +308,59 @@ pub fn copilot_disconnect_of(state: &AppState) -> Result<bool, String> {
 }
 
 /// 找 Copilot 渠道（**没有就返回 None**——不自动建，免得只查状态就产生一行空渠道）。
-fn find_copilot_channel(state: &AppState) -> Result<Option<(String, bool, String)>, String> {
+///
+/// 返回 `(渠道 id, 是否启用, base_url, ToS 确认时刻, 确认时的声明版本)`。
+fn find_copilot_channel(
+    state: &AppState,
+) -> Result<Option<(String, bool, String, Option<i64>, Option<String>)>, String> {
     let rows = crate::store::channels::list_channels(&state.store).map_err(|err| err.to_string())?;
     Ok(rows
         .into_iter()
         .find(|row| row.provider == OAUTH_PROVIDER || row.name == CHANNEL_NAME)
-        .map(|row| (row.id, row.enabled, row.base_url)))
+        .map(|row| {
+            (
+                row.id,
+                row.enabled,
+                row.base_url,
+                row.meta.tos_accepted_at,
+                row.meta.tos_statement_version,
+            )
+        }))
+}
+
+/// 记录一次 ToS 确认（T24、02 §6.8.4）。
+///
+/// **只记录，不启用**——确认与启用分两步（先 `copilot_tos_accept`、再 `channel_set_enabled`），
+/// 便于审计「用户什么时候确认的」。
+#[tauri::command]
+pub fn copilot_tos_accept(state: State<'_, AppState>) -> Result<CopilotTosView, String> {
+    copilot_tos_accept_of(&state)
+}
+
+/// 记录 ToS 确认（可测版本）。
+pub fn copilot_tos_accept_of(state: &AppState) -> Result<CopilotTosView, String> {
+    let Some((channel_id, _, _, _, _)) = find_copilot_channel(state)? else {
+        return Err("还没有 Copilot 渠道——先做一次设备授权".to_string());
+    };
+    let summary = crate::store::channels::accept_channel_tos(&state.store, &channel_id)
+        .map_err(|err| err.to_string())?;
+    Ok(CopilotTosView {
+        channel_id: Some(summary.id),
+        accepted_at: summary.meta.tos_accepted_at,
+        statement_version: summary.meta.tos_statement_version,
+    })
+}
+
+/// ToS 确认结果（IPC 视图；**只有布尔与时间戳，没有别的**）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotTosView {
+    /// 渠道 id。
+    pub channel_id: Option<String>,
+    /// 确认时刻（Unix 秒；`None` = 没确认过）。
+    pub accepted_at: Option<i64>,
+    /// 确认时的声明版本（`None` = 没确认过）。
+    pub statement_version: Option<String>,
 }
 
 #[cfg(test)]

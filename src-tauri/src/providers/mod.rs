@@ -6,10 +6,12 @@
 //! - [`presets`]：纯数据预设（02 §6.1 的 7 个 API Key profile）
 //! - [`oauth`]：OAuth 型渠道的**凭证获取**（T20：GitHub Copilot；只取凭证，不出站）
 //! - [`copilot`]：Copilot **出站适配**（T21：R-6 伪装头 + Copilot token 供给 + 模型目录）
+//! - [`compliance`]：合规确认与受限渠道的**启用闸门**（T24：ToS 声明 + 启用前校验）
 //!
 //! v1 入站仅 OpenAI 协议，出站亦为 OpenAI 兼容改写；**v1 是改写器不是转换器**。
 
 pub mod adapter;
+pub mod compliance;
 pub mod copilot;
 pub mod oauth;
 pub mod openai_compat;

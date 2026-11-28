@@ -5,6 +5,8 @@
 //! - **模型别名全局唯一**（`idx_model_alias`）：别名是路由入口；
 //! - 渠道私有参数（路径模板 / 鉴权样式 / GroupId / include_usage 开关 / 额外头）
 //!   落在 `channel.meta_json`（**整份替换**，不与旧值合并——表单状态即真相）；
+//!   **例外**：`tos_accepted_at` / `tos_statement_version` 是**服务端管理的字段**
+//!   （T24、02 §6.8.3）→ 保存时用库里的旧值覆盖，前端设置/清除都无效；
 //! - **凭证不在这里**：密钥由保险库负责（`credential` 表密文 + `vault.bin` 主密钥，02 §5）。
 //!
 //! 编辑语义：渠道行原地更新；模型按别名 upsert；**表单里删掉的模型置为禁用**
@@ -244,6 +246,13 @@ pub struct ChannelMeta {
     pub inject_stream_usage: Option<bool>,
     /// 额外固定头（R-6）。
     pub extra_headers: BTreeMap<String, String>,
+    /// **ToS 确认时刻**（Unix 秒；`None` = 没确认过）——T24、02 §6.8.3。
+    ///
+    /// **服务端管理的字段**：由 `accept_channel_tos` 写入，
+    /// `save_channel` 写 `meta_json` 时**保留库里的旧值** → 前端设置/清除都无效。
+    pub tos_accepted_at: Option<i64>,
+    /// **确认时的 ToS 声明版本**（T24、02 §6.8.3）——版本对不上 = 没确认过。
+    pub tos_statement_version: Option<String>,
 }
 
 /// 模型摘要。
@@ -409,7 +418,22 @@ pub fn save_channel(store: &Store, input: &ChannelInput) -> Result<ChannelSummar
         .unwrap_or("api_key")
         .to_string();
     let priority = input.priority.unwrap_or(100);
-    let meta_json = serde_json::to_string(&input.meta)
+    // T24（02 §6.8.3）：**ToS 确认记录是服务端管理的字段** —— 前端设置/清除都无效。
+    // 这里用**库里的旧值**覆盖入参里的同名字段（`meta_json` 是整份替换，不合并）。
+    let mut meta = input.meta.clone();
+    let existing_tos = load_tos_acceptance(store, input.id.as_deref())?;
+    meta.tos_accepted_at = existing_tos.0;
+    meta.tos_statement_version = existing_tos.1;
+    // T24（02 §6.8.4）：**受限渠道启用前必须已确认 ToS** —— 后端强制，前端不是唯一防线。
+    if input.enabled {
+        crate::providers::compliance::ensure_can_enable(
+            &provider,
+            meta.tos_accepted_at,
+            meta.tos_statement_version.as_deref(),
+        )
+        .map_err(StoreError::Invalid)?;
+    }
+    let meta_json = serde_json::to_string(&meta)
         .map_err(|e| StoreError::Invalid(format!("渠道参数序列化失败: {e}")))?;
 
     // 渠道名唯一：先自查一遍，给出可读错误，而不是让 UNIQUE 约束把原始 SQL 错误抛给 UI
@@ -574,6 +598,94 @@ pub fn save_channel(store: &Store, input: &ChannelInput) -> Result<ChannelSummar
     })?;
 
     channel_summary(store, &channel_id)
+}
+
+/// 读渠道行上**服务端管理**的 ToS 确认记录（T24、02 §6.8.3）。
+///
+/// 拿不到行 / 行不存在 / `meta_json` 坏了 → **当作没确认过**（保守方向）。
+fn load_tos_acceptance(
+    store: &Store,
+    channel_id: Option<&str>,
+) -> Result<(Option<i64>, Option<String>)> {
+    let Some(id) = channel_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((None, None));
+    };
+    let raw: Option<String> = store.with_conn(|conn| {
+        Ok(conn
+            .query_row("SELECT meta_json FROM channel WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok())
+    })?;
+    let Some(raw) = raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((None, None));
+    };
+    match serde_json::from_str::<ChannelMeta>(raw) {
+        Ok(meta) => Ok((meta.tos_accepted_at, meta.tos_statement_version)),
+        // 坏 JSON：宁可当成没确认过，也不要放行启用
+        Err(_) => Ok((None, None)),
+    }
+}
+
+/// 记录一次 ToS 确认（T24、02 §6.8.4）。
+///
+/// **只记录，不启用** —— 确认与启用分成两步，便于审计「用户什么时候确认的」。
+/// 只有**受限 provider** 需要确认（其它 provider 直接报错，免得留无意义的记录）。
+pub fn accept_channel_tos(store: &Store, channel_id: &str) -> Result<ChannelSummary> {
+    let id = channel_id.trim();
+    if id.is_empty() {
+        return Err(StoreError::Invalid("渠道 id 不能为空".to_string()));
+    }
+    let summary = channel_summary(store, id)?;
+    let version = crate::providers::compliance::version_for(&summary.provider).ok_or_else(|| {
+        StoreError::Invalid(format!(
+            "渠道「{}」不是受限渠道，无需 ToS 确认",
+            summary.name
+        ))
+    })?;
+    let mut meta = summary.meta.clone();
+    meta.tos_accepted_at = Some(crate::vault::now_secs());
+    meta.tos_statement_version = Some(version.to_string());
+    let meta_json = serde_json::to_string(&meta)
+        .map_err(|e| StoreError::Invalid(format!("渠道参数序列化失败: {e}")))?;
+    store.with_conn(|conn| {
+        conn.execute(
+            "UPDATE channel SET meta_json = ?2 WHERE id = ?1",
+            rusqlite::params![id, meta_json],
+        )
+        .map_err(StoreError::Sqlite)?;
+        Ok(())
+    })?;
+    channel_summary(store, id)
+}
+
+/// 改渠道的启用状态（T24、02 §6.8.4）。
+///
+/// **受限渠道启用前必须已有有效的 ToS 确认**（后端强制）；**关闭永远不需要确认**
+/// （安全方向不该设门槛）。
+pub fn set_channel_enabled(store: &Store, channel_id: &str, enabled: bool) -> Result<ChannelSummary> {
+    let id = channel_id.trim();
+    if id.is_empty() {
+        return Err(StoreError::Invalid("渠道 id 不能为空".to_string()));
+    }
+    let summary = channel_summary(store, id)?;
+    if enabled {
+        crate::providers::compliance::ensure_can_enable(
+            &summary.provider,
+            summary.meta.tos_accepted_at,
+            summary.meta.tos_statement_version.as_deref(),
+        )
+        .map_err(StoreError::Invalid)?;
+    }
+    store.with_conn(|conn| {
+        conn.execute(
+            "UPDATE channel SET enabled = ?2 WHERE id = ?1",
+            rusqlite::params![id, enabled],
+        )
+        .map_err(StoreError::Sqlite)?;
+        Ok(())
+    })?;
+    channel_summary(store, id)
 }
 
 /// 列出全部渠道（含模型与"是否已录凭证"）。
@@ -1020,5 +1132,131 @@ mod tests {
             summary.meta.extra_headers.get("x-foo").map(String::as_str),
             Some("bar")
         );
+    }
+
+    // ── T24：合规确认与受限渠道的启用闸门（02 §6.8）────────────────
+
+    /// 一条 Copilot 渠道的入参（**默认关闭**）。
+    fn copilot_input(name: &str) -> ChannelInput {
+        let mut input = input(name, "copilot");
+        input.enabled = false;
+        input
+    }
+
+    #[test]
+    fn a_restricted_channel_cannot_be_saved_as_enabled_without_acceptance() {
+        // **后端强制**：绕过前端直接调 save 也开不了
+        let (_dir, store) = store();
+        let mut input = copilot_input("GitHub Copilot");
+        input.enabled = true;
+        let err = save_channel(&store, &input).expect_err("未确认不该放行");
+        let msg = err.to_string();
+        assert!(msg.contains("尚未确认 ToS"), "{msg}");
+        assert!(msg.contains("GitHub Copilot 授权"), "错误要指路：{msg}");
+    }
+
+    #[test]
+    fn a_restricted_channel_can_be_enabled_after_the_acceptance_is_recorded() {
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &copilot_input("GitHub Copilot")).expect("保存失败");
+        assert!(!summary.enabled, "受限渠道默认关闭");
+
+        let accepted = accept_channel_tos(&store, &summary.id).expect("记录确认失败");
+        assert!(accepted.meta.tos_accepted_at.is_some());
+        assert_eq!(
+            accepted.meta.tos_statement_version.as_deref(),
+            Some(crate::providers::compliance::COPILOT_TOS_VERSION)
+        );
+
+        let enabled = set_channel_enabled(&store, &summary.id, true).expect("启用失败");
+        assert!(enabled.enabled);
+    }
+
+    #[test]
+    fn the_acceptance_record_cannot_be_faked_or_cleared_by_the_caller() {
+        // 前端伪造：入参里塞一个"已确认" → 不认
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &copilot_input("GitHub Copilot")).expect("保存失败");
+        let mut forged = copilot_input("GitHub Copilot");
+        forged.id = Some(summary.id.clone());
+        forged.enabled = true;
+        forged.meta.tos_accepted_at = Some(1_700_000_000);
+        forged.meta.tos_statement_version = Some("copilot-tos-2026-11-28".to_string());
+        let err = save_channel(&store, &forged).expect_err("伪造的确认不该算数");
+        assert!(err.to_string().contains("尚未确认 ToS"), "{err}");
+
+        // 前端清除：已确认后，入参里把字段抹成 null → 库里的旧值要保住
+        accept_channel_tos(&store, &summary.id).expect("记录确认失败");
+        let mut clearing = copilot_input("GitHub Copilot");
+        clearing.id = Some(summary.id.clone());
+        clearing.enabled = true;
+        clearing.meta.tos_accepted_at = None;
+        clearing.meta.tos_statement_version = None;
+        let saved = save_channel(&store, &clearing).expect("保存失败");
+        assert!(
+            saved.meta.tos_accepted_at.is_some(),
+            "保存渠道表单不能抹掉 ToS 确认记录"
+        );
+        assert_eq!(
+            saved.meta.tos_statement_version.as_deref(),
+            Some(crate::providers::compliance::COPILOT_TOS_VERSION)
+        );
+    }
+
+    #[test]
+    fn turning_a_channel_off_never_requires_an_acceptance() {
+        // 安全方向不该设门槛
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &copilot_input("GitHub Copilot")).expect("保存失败");
+        accept_channel_tos(&store, &summary.id).expect("记录确认失败");
+        set_channel_enabled(&store, &summary.id, true).expect("启用失败");
+
+        let off = set_channel_enabled(&store, &summary.id, false).expect("关闭失败");
+        assert!(!off.enabled);
+    }
+
+    #[test]
+    fn deleting_a_channel_takes_its_acceptance_with_it() {
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &copilot_input("GitHub Copilot")).expect("保存失败");
+        accept_channel_tos(&store, &summary.id).expect("记录确认失败");
+        delete_channel(&store, &summary.id).expect("删除失败");
+        assert!(list_channels(&store).expect("列表失败").is_empty());
+    }
+
+    #[test]
+    fn an_unrestricted_channel_is_never_gated() {
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &input("我的渠道", "custom")).expect("保存失败");
+        let enabled = set_channel_enabled(&store, &summary.id, true).expect("启用失败");
+        assert!(enabled.enabled);
+        // 非受限渠道也不该记录 ToS
+        let err = accept_channel_tos(&store, &summary.id).expect_err("不该要确认");
+        assert!(err.to_string().contains("不是受限渠道"), "{err}");
+    }
+
+    #[test]
+    fn a_stale_statement_version_blocks_enabling_again() {
+        let (_dir, store) = store();
+        let summary = save_channel(&store, &copilot_input("GitHub Copilot")).expect("保存失败");
+        accept_channel_tos(&store, &summary.id).expect("记录确认失败");
+
+        // 声明改版：把版本号换成旧的 → 旧确认失效
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE channel SET meta_json = ?2 WHERE id = ?1",
+                    rusqlite::params![
+                        summary.id,
+                        r#"{"tos_accepted_at":1700000000,"tos_statement_version":"copilot-tos-2020-01-01"}"#
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+                Ok(())
+            })
+            .expect("改版本失败");
+
+        let err = set_channel_enabled(&store, &summary.id, true).expect_err("旧版本不该算数");
+        assert!(err.to_string().contains("已更新"), "{err}");
     }
 }

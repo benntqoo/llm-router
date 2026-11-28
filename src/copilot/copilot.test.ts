@@ -35,6 +35,8 @@ test("没授权时说清下一步做什么", () => {
     apiBase: null,
     channelId: null,
     channelEnabled: false,
+    tosAcceptedAt: null,
+    tosRequired: true,
   };
   assert.match(describeCopilotState(none), /设备授权/);
 
@@ -49,6 +51,8 @@ test("已授权时给出到期时间，并说明渠道默认关闭", () => {
     apiBase: "https://api.githubcopilot.com",
     channelId: "ch_1",
     channelEnabled: false,
+    tosAcceptedAt: null,
+    tosRequired: true,
   };
   const text = describeCopilotState(status);
   assert.match(text, /已授权/);

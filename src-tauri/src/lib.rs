@@ -158,6 +158,7 @@ pub fn run() {
             commands::channel::channel_save,
             commands::channel::channel_delete,
             commands::channel::channel_put_key,
+            commands::channel::channel_set_enabled,
             commands::channel::models_preview,
             commands::circuit::circuit_status,
             commands::circuit::circuit_settings_get,
@@ -215,6 +216,7 @@ pub fn run() {
             commands::copilot::copilot_status,
             commands::copilot::copilot_disconnect,
             commands::copilot::copilot_models_refresh,
+            commands::copilot::copilot_tos_accept,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

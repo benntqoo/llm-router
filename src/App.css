@@ -464,3 +464,53 @@ details summary {
   color: #9aa0a6;
   font-size: 13px;
 }
+
+/* ── 模态框（自写；T24 的 ToS 确认框）────────────────────────────── */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 12, 16, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 50;
+}
+
+.modal {
+  background: #1f222a;
+  border: 1px solid #2c303a;
+  border-radius: 12px;
+  padding: 20px 24px;
+  max-width: 520px;
+  width: 100%;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+
+.modal-title {
+  margin: 0 0 12px;
+  font-size: 16px;
+  color: #c8ccd4;
+  font-weight: 600;
+}
+
+.modal-body p {
+  margin: 0 0 12px;
+}
+
+.tos-statement {
+  background: #262a33;
+  border-left: 3px solid #d0873c;
+  border-radius: 6px;
+  padding: 12px 14px;
+  color: #e8eaed;
+  font-size: 14px;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}

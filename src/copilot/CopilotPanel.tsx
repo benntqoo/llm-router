@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+import Modal from "../ui/Modal";
 import {
   describeCopilotState,
   describeModel,
@@ -12,6 +13,13 @@ import {
   type CopilotStatus,
   type DeviceFlowView,
 } from "./copilot";
+import {
+  COPILOT_TOS_STATEMENT,
+  describeEnableEffect,
+  describeEnableState,
+  formatAcceptedAt,
+  needsTosConfirmation,
+} from "./tos";
 
 /**
  * GitHub Copilot 授权面板（T20/T21；02 §6.2 / §6.2.2）。
@@ -32,6 +40,8 @@ export default function CopilotPanel() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [models, setModels] = useState<CopilotModelsView | null>(null);
+  const [tosOpen, setTosOpen] = useState(false);
+  const [tosChecked, setTosChecked] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -129,6 +139,67 @@ export default function CopilotPanel() {
     }
   };
 
+  /**
+   * 启用开关（T24、02 §6.8.5）。
+   *
+   * - **开启**且**还没确认过 ToS** → 先弹确认框（**后端也会拦**，前端弹窗是「知情」环节）；
+   * - **关闭** → 直接关（**安全方向不需要确认**）。
+   */
+  const handleToggleEnabled = async (next: boolean) => {
+    if (!status?.channelId) {
+      setError("还没有 Copilot 渠道——先做一次设备授权");
+      return;
+    }
+    if (next && needsTosConfirmation(status)) {
+      setTosChecked(false);
+      setTosOpen(true);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("channel_set_enabled", {
+        channelId: status.channelId,
+        enabled: next,
+      });
+      setMessage(next ? "渠道已启用" : "渠道已关闭");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * 确认框里点「确认并启用」：**先记录确认、再启用**（02 §6.8.5）。
+   *
+   * 两步分开是故意的——后端把「确认」与「启用」记成两件事，便于审计。
+   */
+  const handleConfirmAndEnable = async () => {
+    if (!status?.channelId) {
+      setTosOpen(false);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("copilot_tos_accept");
+      await invoke("channel_set_enabled", {
+        channelId: status.channelId,
+        enabled: true,
+      });
+      setTosOpen(false);
+      setTosChecked(false);
+      setMessage("已确认服务条款，渠道已启用");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section className="card">
       <h2>GitHub Copilot 授权（T20）</h2>
@@ -164,10 +235,36 @@ export default function CopilotPanel() {
         </button>
       </div>
 
+      <h3>渠道启用（T24）</h3>
+      <p className="muted">
+        Copilot 渠道<strong>默认关闭</strong>。启用后它的模型会出现在 <code>/v1/models</code>，
+        harness 才能用你的 Copilot 额度发起请求。首次启用需要先确认 GitHub Copilot 的服务条款
+        （<strong>后端也会拦</strong>——没确认就开不了）。
+      </p>
+      <div className="row-inline">
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={status?.channelEnabled ?? false}
+            disabled={busy || !status?.channelId}
+            onChange={(e) => void handleToggleEnabled(e.target.checked)}
+          />
+          启用 Copilot 渠道
+        </label>
+        {status && <span className="muted">{describeEnableState(status)}</span>}
+      </div>
+      {!status?.channelId && (
+        <p className="muted">还没有 Copilot 渠道——先在上面做一次设备授权。</p>
+      )}
+      {status?.tosAcceptedAt && (
+        <p className="muted">
+          已于 {formatAcceptedAt(status.tosAcceptedAt)} 确认过服务条款。
+        </p>
+      )}
+
       <p className="muted">
         <strong>合规提示</strong>：把 Copilot 额度用于第三方客户端违反 GitHub Copilot
-        ToS，账号可能受限。本卡只做「取凭证」，渠道默认关闭；启用前需在设置里确认 ToS
-        （该确认属 T24）。Copilot token 约 25~30 分钟有效，过期自动重取。
+        ToS，账号可能受限。Copilot token 约 25~30 分钟有效，过期自动重取。
       </p>
 
       <h3>模型目录（T21）</h3>
@@ -207,6 +304,47 @@ export default function CopilotPanel() {
 
       {message && <p className="ok">{message}</p>}
       {error && <p className="error">{error}</p>}
+
+      {tosOpen && (
+        <Modal
+          title="启用 Copilot 渠道前请确认服务条款"
+          onClose={() => {
+            setTosOpen(false);
+            setTosChecked(false);
+          }}
+          footer={
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setTosOpen(false);
+                  setTosChecked(false);
+                }}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={!tosChecked || busy}
+                onClick={() => void handleConfirmAndEnable()}
+              >
+                确认并启用
+              </button>
+            </>
+          }
+        >
+          <p className="tos-statement">{COPILOT_TOS_STATEMENT}</p>
+          <p className="muted">{describeEnableEffect()}</p>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={tosChecked}
+              onChange={(e) => setTosChecked(e.target.checked)}
+            />
+            我已阅读并确认上述条款
+          </label>
+        </Modal>
+      )}
     </section>
   );
 }
