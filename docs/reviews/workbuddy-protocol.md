@@ -197,6 +197,18 @@ atRestSecretKey（构建期密钥，base64 32B）
 
 **本卡不自行决定**，等头头拍板后再动 §6.3 的 P1~P4 条款、再进 T23。
 
+> **2026-11-28 头头补充口径后，本节结论已收敛（详见 §12）**：**付费前拿不到可用 token** → **P4-a / P4-b 都不产生可交付物** → **T23 延后到付费后**。
+
+---
+
+## 7.1 付费前提下的最终收敛（2026-11-28 补充，见 §12）
+
+| 选项 | 付费前是否可交付 | 结论 |
+|---|---|---|
+| **P4-a 用户显式提供 token** | ❌ | 粘贴来的仍是**自己账号额度**下的会话 token → 同 P4-b 的三个问题（见 §12） |
+| **P4-b 逆向定制 Electron 取构建期密钥** | ❌ | 同上；且付费前**不默认走**这条路 |
+| **P4-c 降级档** | ✅ **部分** | 只有**免鉴权两件**可做：`GET /v3/config`（保活）+ `product.cloudhosted.json`（模型目录 22 个）；**「额度查看」需鉴权 → 付费前也不可达** |
+
 ---
 
 ## 8. 模型目录（免鉴权）
@@ -266,3 +278,48 @@ atRestSecretKey（构建期密钥，base64 32B）
 1. **头头拍板 P4**（凭证策略：用户显式提供 / 逆向定制运行时 / 降级档）→ 据此改写 02 §6.3 的 P1~P4。
 2. **T23 WorkBuddy adapter**：沿用 T21 的凭证供给口径（**adapter 自己供给凭证、网关不解密**）+ `AdapterDeps` 依赖注入（生产真实端点 / 测试本地 mock）。
 3. **T24**：ToS 弹窗 + 启用开关（默认关闭）。
+
+---
+
+## 12. 付费前提（2026-11-28 头头口述 + 本机补证）
+
+> **头头口径：没有付费之前，无法在 WorkBuddy 建立 token。**
+
+### 12.1 本机补证（只读，**未解密任何信封**）
+
+| 项 | 实测 |
+|---|---|
+| 账号 | `account.type = "personal"`；`uniqueUserId = "personal_e236dd98-…"`；`loginChannels = ["openplatform"]` |
+| 会话 | **活的**：`auth.lastRefreshTime` = **2026-11-28 09:49:26**（本次核查前 1 分钟）；`expiresAt` = 2026-12-26；`refreshExpiresAt` = 2026-12-28；`tokenType = "Bearer"`；`auth.domain = "copilot.tencent.com"` |
+| 额度消耗 | `~/.workbuddy/workbuddy.db` → `session_usage` **46 行**，每行带 `credit_json`（各模型 credits 消耗）→ **额度确实在被消耗** |
+| 付费结构 | 订阅包字段 `PackageCode` / `PackageName` / `DeductionEndTime` / `CycleEndTime` / `AutoRenewFlag`；额度字段 `usageTotal` / `usageUsed` / `usageLeft` |
+| 档位映射 | `free` / `freeMon` / `freeMonIntl` / `gift` → `isPro=false, isTria=false`；`proTrialMon` / `proTrialYear` → `isTria=true`；`proMon` / `proMonPlus` / `proYear` → `isPro=true`；另有 `youth` / `advanced` / `flagship` / `buddyOneVip` |
+| 客户端开关 | `subscription-gate@workbuddy-builtin = true`；`weixinpay@workbuddy-builtin = true`；`productFeatures.DisableCreditsEntry = true` |
+
+### 12.2 两条硬事实（发行版代码，不是推测）
+
+1. **WorkBuddy 没有面向第三方的官方 API Key。**
+   asar 里的 `/v2/api-keys` **不是**「给外部开发者签发长期 key」的通道——它只服务于 `connect_cloud_service` 工具：
+   ```
+   POST {endpoint}/v2/api-keys
+   body: { name: "workbuddy-connect-cloud-service", expire_in_seconds: 900, temporary: true }
+   resp: { code: 0, data: { key: "ck_t_…", expires_at } }
+   ```
+   **15 分钟临时 key**，供 `miora_*`（多模态生成）与 `neodata-financial-search` 等云服务 skill 用 → **不能**当反代凭证。
+
+2. **唯一长期凭证就是会话 `accessToken`**，而它被 at-rest 加密（§6）→ 要拿到它**只剩 P4-b 一条路**（逆向定制 Electron）。
+
+### 12.3 结论：排期怎么改
+
+- 付费前：**P4-a 与 P4-b 都不产生可交付物**。理由（三条）：
+  1. 逆向/粘贴来的都是**你自己账号额度**下的会话 token → 把个人账号额度分给 harness 用，**违反平台 ToS**（02 §11 风险 1）；
+  2. **无官方授权通道**（12.2 第 1 条）→ 上游随时可断；
+  3. P4-b 还**逼近 §5.7 边界**（绕过厂商本地保护）。
+  → **现在做这两条都是白工**。
+- 因此 **M4 判据②「WorkBuddy 登录态可作为上游完成对话」在付费前不可达** → **T23 延后到付费后**；付费后**第一件事是查有没有官方 API Key / 开发者通道**（发行版另有 `open.workbuddy.cn` / `api.skillhub.cn` / `open-test.workbuddy.cn` 等域，**待查**），**而不是默认走逆向**。
+- 付费前**能**做的只有**免鉴权**两件：`GET /v3/config`（保活 / 版本配置探测，实测 HTTP 200）+ `product.cloudhosted.json`（模型目录，22 个模型）→ 对应 03 §5 降级档的「保活 + 模型目录」；**「额度查看」需鉴权 → 付费前也不可达**。
+- **T24（ToS 弹窗 + 启用开关）可只做 Copilot 那半边**，WorkBuddy 的开关等有合规凭证再做 → M4 判据③ 对 Copilot 先闭环。
+
+### 12.4 口径落位
+
+02 §6.3.1 **§5.1**（§13 **v0.32**）· 03 T22 卡片「付费前提」条 · HANDOFF §4 第 26 步 / §5 第 10 行 / §8 账本行。
