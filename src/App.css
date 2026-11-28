@@ -409,3 +409,58 @@ code {
 .checkin-url {
   max-width: 380px;
 }
+
+/* ── T26：功能分组（tab）与常驻状态条 ─────────────────────────────── */
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: #9aa0a6;
+  padding-top: 6px;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid #2c303a;
+  padding-bottom: 12px;
+}
+
+.tabs .tab {
+  background: #1f222a;
+  border: 1px solid #2c303a;
+  border-radius: 999px;
+  color: #9aa0a6;
+  padding: 6px 18px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.tabs .tab:hover {
+  border-color: #4caf7d;
+  color: #e8eaed;
+}
+
+.tabs .tab.active {
+  background: #1d3a5f;
+  border-color: #3d6ea8;
+  color: #dce8f7;
+}
+
+details summary {
+  cursor: pointer;
+  color: #9aa0a6;
+  font-size: 13px;
+}
