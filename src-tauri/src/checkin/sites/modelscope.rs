@@ -106,6 +106,18 @@ pub fn bearer_token(secret: &str) -> Option<String> {
 /// 这类**一次性资料奖励**——它们不是「每日签到拿到的那笔」，**不算进奖励**。
 pub const DAILY_RULE_KEY: &str = "daily_active";
 
+/// **今天**（本地时区，`YYYY-MM-DD`）——「当日流水」的判定基准。
+///
+/// **为什么单独抽一个函数**：「当日」这条口径**依赖系统当天**——插件算差值时用它，
+/// **测试夹具造流水时也要用同一个值**。两边一旦各写各的（夹具写死某一天），
+/// **跨天当天 e2e 必挂**：夹具造的流水日期对不上「今天」→ 当日流水匹配不上 →
+/// 差值 = 0 → 判「今天已领过」→ 拿不到积分。
+///
+/// **单一真值**：插件与夹具都调这一个函数 → 永远同一天。
+pub fn today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 /// **签到前后差值**的判定结果（**纯函数**，单测直接打）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiffOutcome {
@@ -514,7 +526,7 @@ impl ModelScopePlugin {
         secret: &str,
     ) -> Option<(i64, Value)> {
         let json = self.transactions_json(ctx, base, cookie, secret).await?;
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = today();
         Some(
             daily_magicubes(&json, &today)
                 .unwrap_or((0, Value::Array(Vec::new()))),

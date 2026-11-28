@@ -117,15 +117,24 @@ async fn transactions_handler(
         )
             .into_response(),
         // 签到后 → 当日 `daily_active` 200 魔粒（+ 两条一次性资料奖励，**不算进签到奖励**）
-        MockMode::Full | MockMode::AlreadyClaimed => (
-            StatusCode::OK,
-            r#"{"data":{"page":1,"page_size":20,"total":3,"records":[
-                {"type":"EARN","rule_key":"daily_active","total_amount":200,"count":1,"expire_days":1,"gmt_created":"2026-11-27"},
-                {"type":"EARN","rule_key":"infocomplement_profile_experience","total_amount":50,"count":1,"gmt_created":"2026-11-27"},
-                {"type":"EARN","rule_key":"infocomplement_email_verification","total_amount":50,"count":1,"gmt_created":"2026-11-27"}
-            ]},"request_id":"r1","success":true}"#,
-        )
-            .into_response(),
+        //
+        // **日期必须用「今天」**（`modelscope::today()`，与插件算差值时同一个函数）：
+        // 夹具若写死某一天，**跨天当天这个用例必挂**——当日流水匹配不上「今天」→
+        // 差值 = 0 → 判「今天已领过」→ 拿不到积分（2026-11-28 真踩到过一次）。
+        MockMode::Full | MockMode::AlreadyClaimed => {
+            let today = llm_router_lib::checkin::sites::modelscope::today();
+            (
+                StatusCode::OK,
+                format!(
+                    r#"{{"data":{{"page":1,"page_size":20,"total":3,"records":[
+                {{"type":"EARN","rule_key":"daily_active","total_amount":200,"count":1,"expire_days":1,"gmt_created":"{today}"}},
+                {{"type":"EARN","rule_key":"infocomplement_profile_experience","total_amount":50,"count":1,"gmt_created":"{today}"}},
+                {{"type":"EARN","rule_key":"infocomplement_email_verification","total_amount":50,"count":1,"gmt_created":"{today}"}}
+            ]}},"request_id":"r1","success":true}}"#
+                ),
+            )
+                .into_response()
+        }
     }
 }
 
